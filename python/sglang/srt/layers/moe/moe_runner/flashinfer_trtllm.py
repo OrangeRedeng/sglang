@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -32,9 +33,14 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+_is_hip = is_hip()
+_is_cuda = is_cuda()
+
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
-else:
+elif _is_cuda or _is_hip::
     from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
 
