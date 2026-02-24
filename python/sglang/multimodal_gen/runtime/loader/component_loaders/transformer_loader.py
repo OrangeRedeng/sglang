@@ -210,18 +210,4 @@ class TransformerLoader(ComponentLoader):
                 f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
             )
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                if _is_npu:
-                    torch.npu.config.allow_internal_format = True
-                quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
-
         return model
