@@ -890,6 +890,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
+            prefix=f"proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(
