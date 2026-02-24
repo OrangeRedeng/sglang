@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+import json
 
 logger = init_logger(__name__)
 
