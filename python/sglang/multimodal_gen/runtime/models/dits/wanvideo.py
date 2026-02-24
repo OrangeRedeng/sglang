@@ -134,7 +134,6 @@ class WanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
-        quant_config: QuantizationConfig = None,
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -250,7 +249,6 @@ class WanI2VCrossAttention(WanSelfAttention):
         window_size=(-1, -1),
         qk_norm=True,
         eps=1e-6,
-        quant_config: QuantizationConfig = None,
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -343,7 +341,6 @@ class WanTransformerBlock(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         attention_type: str = "original",
-        quant_config: QuantizationConfig = None,
         sla_topk: float = 0.1,
         quant_config: QuantizationConfig | None = None,
     ):
@@ -450,7 +447,6 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
-                quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -462,7 +458,6 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
-                quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -600,7 +595,6 @@ class WanTransformerBlock_VSA(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        quant_config: QuantizationConfig = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
@@ -695,7 +689,6 @@ class WanTransformerBlock_VSA(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
-                quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -707,7 +700,6 @@ class WanTransformerBlock_VSA(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
-                quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
                 quant_config=quant_config,
             )
@@ -877,7 +869,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
-                    quant_config=config.quant_config,
                     prefix=f"blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
