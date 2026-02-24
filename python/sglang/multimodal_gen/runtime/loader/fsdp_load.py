@@ -286,7 +286,7 @@ def load_model_from_full_model_state_dict(
             target_dtype = meta_sharded_param.dtype
 
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
@@ -296,7 +296,7 @@ def load_model_from_full_model_state_dict(
             if weight_loader is not None:
                 assert actual_param is not None
                 sharded_tensor = torch.empty_like(
-                    meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
+                    meta_sharded_param, device=device, dtype=target_dtype
                 )
                 # Preserve requires_grad flag to avoid errors with non-floating dtypes
                 requires_grad = getattr(meta_sharded_param, "requires_grad", False)
@@ -324,7 +324,7 @@ def load_model_from_full_model_state_dict(
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
-            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,
