@@ -36,7 +36,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
@@ -135,6 +137,7 @@ class WanSelfAttention(nn.Module):
         quant_config: QuantizationConfig = None,
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -250,6 +253,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         quant_config: QuantizationConfig = None,
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(
             dim,
@@ -258,6 +262,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            quant_config=quant_config,
         )
 
         self.add_k_proj = ColumnParallelLinear(
@@ -340,6 +345,7 @@ class WanTransformerBlock(nn.Module):
         attention_type: str = "original",
         quant_config: QuantizationConfig = None,
         sla_topk: float = 0.1,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -446,6 +452,7 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn2", prefix),
                 quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -457,6 +464,7 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn2", prefix),
                 quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -594,6 +602,7 @@ class WanTransformerBlock_VSA(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: QuantizationConfig = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -688,6 +697,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 prefix=add_prefix("attn2", prefix),
                 quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -699,6 +709,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 prefix=add_prefix("attn2", prefix),
                 quant_config=quant_config,
                 supported_attention_backends=cross_attn_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -814,7 +825,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: WanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -865,6 +881,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     prefix=f"blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -882,6 +899,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
