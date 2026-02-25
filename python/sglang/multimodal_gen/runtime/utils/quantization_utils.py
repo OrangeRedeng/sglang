@@ -1,3 +1,5 @@
+import os
+import glob
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, cast
 from sglang.multimodal_gen.runtime.layers.quantization import (
@@ -145,3 +147,11 @@ def get_quant_config_from_safetensors_metadata(
         return config
     except Exception as _e:
         return None
+
+def get_metadata_from_safetensors_file(file_path: str):
+    try:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata()
+            return metadata
+    except Exception as e:
+        logger.warning(e)
