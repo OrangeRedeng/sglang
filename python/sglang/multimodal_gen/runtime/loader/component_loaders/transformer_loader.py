@@ -80,7 +80,7 @@ class TransformerLoader(ComponentLoader):
         hf_config: Dict[str, List[str]],
         server_args: ServerArgs,
         safetensors_list: list[str],
-        component_model_path: str, 
+        component_model_path: str,
     ) -> Optional[dict]:
         # priority: model config.json → safetensors metadata → nunchaku config
         quant_config = get_quant_config(hf_config, component_model_path)
