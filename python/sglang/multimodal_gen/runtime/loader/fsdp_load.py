@@ -146,7 +146,7 @@ def maybe_load_fsdp_model(
             quant_method, "process_weights_after_loading"
         ):
             if _is_npu:
-                # Activate the NZ format for storing weights, 
+                # Activate the NZ format for storing weights,
                 # which is a specific optimization for Ascend NPU
                 torch.npu.config.allow_internal_format = True
             quant_method.process_weights_after_loading(module)
