@@ -45,9 +45,7 @@ def npu_fused_experts_w4a4(
         )
     )
     expert_tokens = expert_tokens.to(torch.int64)
-    
-    
-    
+
     # gmm1: gate_up_proj
     hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
         hidden_states, dst_type=torch.quint4x2
