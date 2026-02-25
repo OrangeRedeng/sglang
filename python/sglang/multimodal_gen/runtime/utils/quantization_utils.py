@@ -82,8 +82,8 @@ def get_quant_config(
         config_files = glob.glob(os.path.join(hf_folder, "*.json"))
 
         quant_config_files = [
-            f 
-            for f in config_files 
+            f
+            for f in config_files
             if any(f.endswith(x) for x in possible_config_filenames)
         ]
         if len(quant_config_files) == 0:
