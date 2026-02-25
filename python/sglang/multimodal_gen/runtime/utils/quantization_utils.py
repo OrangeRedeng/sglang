@@ -1,6 +1,7 @@
 import os
 import glob
 from pathlib import Path
+from safetensors import safe_open
 from typing import Any, Dict, List, Optional, Union, cast
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
