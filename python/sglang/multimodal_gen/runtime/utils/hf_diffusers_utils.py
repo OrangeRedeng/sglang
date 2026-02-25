@@ -826,12 +826,3 @@ def snapshot_download(
         }
         hf_kwargs.update(kwargs)
         return _hf_snapshot_download(**hf_kwargs)
-
-
-def get_metadata_from_safetensors_file(file_path: str):
-    try:
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            metadata = f.metadata()
-            return metadata
-    except Exception as e:
-        logger.warning(e)
