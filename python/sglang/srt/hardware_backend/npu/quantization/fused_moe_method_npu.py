@@ -31,22 +31,23 @@ def npu_fused_experts_w4a4(
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
-    row_idx_len = num_tokens * top_k
-    row_idx = (
-        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
-    )
-    hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch.ops.npu.npu_moe_init_routing(
-            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+
+    hidden_states, expanded_row_idx, expert_tokens, _ = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode=-1,
         )
     )
-    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
-        expanded_expert_idx, num_experts
-    )
     expert_tokens = expert_tokens.to(torch.int64)
+    
+    
+    
     # gmm1: gate_up_proj
     hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
         hidden_states, dst_type=torch.quint4x2
@@ -61,7 +62,7 @@ def npu_fused_experts_w4a4(
         weight=[w13],
         **scale_args13,
         split_item=2,
-        group_list_type=0,
+        group_list_type=1,
         group_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
@@ -80,7 +81,7 @@ def npu_fused_experts_w4a4(
         weight=[w2],
         **scale_args2,
         split_item=2,
-        group_list_type=0,
+        group_list_type=1,
         group_type=0,
         group_list=expert_tokens,
         output_dtype=original_dtype,
@@ -94,6 +95,7 @@ def npu_fused_experts_w4a4(
         scales=topk_weights,
         expanded_src_to_dst_row=expanded_row_idx,
         export_for_source_row=topk_ids,
+        drop_pad_mode=2,
     )
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
