@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
-
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -419,4 +418,3 @@ def load_model_from_full_model_state_dict(
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor
     return model.load_state_dict(sharded_sd, strict=strict, assign=True)
-
