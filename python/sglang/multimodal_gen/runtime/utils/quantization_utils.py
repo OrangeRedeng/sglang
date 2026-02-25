@@ -31,6 +31,13 @@ def find_quant_modelslim_config(model_config, component_model_path):
     return quant_cfg
 
 
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
 def get_quant_config(
     model_config,
     component_model_path: str,
