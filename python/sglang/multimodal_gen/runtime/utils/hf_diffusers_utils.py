@@ -338,13 +338,6 @@ def get_diffusers_component_config(
     return combined_config
 
 
-def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
-    for prefix, new_prefix in prefix_mapping.items():
-        if key.startswith(prefix):
-            key = key.replace(prefix, new_prefix, 1)
-    return key
-
-
 # Models don't use the same configuration key for determining the maximum
 # context length.  Store them here so we can sanely check them.
 # NOTE: The ordering here is important. Some models have two of these and we
