@@ -27,8 +27,8 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
-    get_quant_config, 
-    get_quant_config_from_safetensors_metadata
+    get_quant_config,
+    get_quant_config_from_safetensors_metadata,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils import is_npu
