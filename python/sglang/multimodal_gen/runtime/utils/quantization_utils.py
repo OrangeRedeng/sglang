@@ -2,8 +2,10 @@ import glob
 import json
 import os
 from pathlib import Path
-from safetensors import safe_open
 from typing import Dict, List, Optional
+
+from safetensors import safe_open
+
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
