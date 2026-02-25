@@ -26,7 +26,7 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
@@ -38,7 +38,6 @@ from huggingface_hub.errors import (
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
-from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
 
 from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
