@@ -129,7 +129,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         group_list,
         output_dtype,
     ):
-        # FIXME W4A4 MoE only support without deepep
+        # FIXME W4A4 MoE does not work with DeepEP
         raise NotImplementedError(
-            f"W4A4 MoE only support without deepep for now, please disable --moe-a2a-backend deepep"
+            f"DeepEP currently does not support quantization in int4, please disable --moe-a2a-backend deepep"
         )
