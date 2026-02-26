@@ -111,6 +111,17 @@ def get_quant_config(
             return quant_cls.from_config(config)
 
 
+def handle_fp8_metadata_format(quant_config_dict):
+    layers = quant_config_dict.get("layers", {})
+    if any(
+        isinstance(v, dict) and "float8" in v.get("format", "")
+        for v in layers.values()
+    ):
+        quant_config_dict["quant_method"] = "fp8"
+        quant_config_dict["activation_scheme"] = "dynamic"
+    return quant_config_dict
+
+
 def get_quant_config_from_safetensors_metadata(
     file_path: str,
 ) -> Optional[QuantizationConfig]:
@@ -135,13 +146,7 @@ def get_quant_config_from_safetensors_metadata(
         and "format_version" in quant_config_dict
         and "layers" in quant_config_dict
     ):
-        layers = quant_config_dict.get("layers", {})
-        if any(
-            isinstance(v, dict) and "float8" in v.get("format", "")
-            for v in layers.values()
-        ):
-            quant_config_dict["quant_method"] = "fp8"
-            quant_config_dict["activation_scheme"] = "dynamic"
+        quant_config_dict = handle_fp8_metadata_format(quant_config_dict)
 
     quant_method = quant_config_dict.get("quant_method")
     if not quant_method:
