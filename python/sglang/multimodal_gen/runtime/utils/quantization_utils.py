@@ -114,8 +114,7 @@ def get_quant_config(
 def handle_fp8_metadata_format(quant_config_dict):
     layers = quant_config_dict.get("layers", {})
     if any(
-        isinstance(v, dict) and "float8" in v.get("format", "")
-        for v in layers.values()
+        isinstance(v, dict) and "float8" in v.get("format", "") for v in layers.values()
     ):
         quant_config_dict["quant_method"] = "fp8"
         quant_config_dict["activation_scheme"] = "dynamic"
