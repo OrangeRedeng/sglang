@@ -277,6 +277,8 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
+    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
@@ -488,6 +490,9 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+
+    # Elastic EP Backup Port
+    SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
 
 envs = Envs()
