@@ -41,6 +41,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             tp_size=2,
         ),
         T2I_sampling_params,
+    ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_2_t2v_14b_w8a8_2npu",
