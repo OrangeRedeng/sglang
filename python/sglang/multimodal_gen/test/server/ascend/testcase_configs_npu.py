@@ -51,7 +51,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             custom_validator="video",
             num_gpus=8,
             tp_size=4,
-            sp_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
