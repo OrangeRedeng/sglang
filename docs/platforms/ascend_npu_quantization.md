@@ -20,7 +20,7 @@ Compressed-tensors (LLM Compressor) on Ascend support:
 - [x] [W8A8 dynamic linear](https://github.com/sgl-project/sglang/pull/14504)
 - [x] [W8A8 dynamic MOE](https://github.com/sgl-project/sglang/pull/14504)
 
-Diffusion model quantization [modelslim](https://github.com/sgl-project/sglang/pull/17996) on Ascend support:
+Diffusion model [modelslim](https://github.com/sgl-project/sglang/pull/17996) quantization on Ascend support:
 - [x] W4A4 dynamic linear
 - [x] W8A8 static linear
 - [x] W8A8 dynamic linear
