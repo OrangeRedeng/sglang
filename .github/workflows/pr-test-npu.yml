@@ -321,7 +321,7 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
-          
+
   multimodal-gen-test-8-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
@@ -360,4 +360,3 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu
-
