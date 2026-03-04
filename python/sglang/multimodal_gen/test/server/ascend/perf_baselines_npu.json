@@ -267,6 +267,6 @@
                 "expected_e2e_ms": 43515.34,
                 "expected_avg_denoise_ms": 773.88,
                 "expected_median_denoise_ms": 762.8
-            }
         }
+    }
 }
