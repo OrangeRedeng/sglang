@@ -12,8 +12,8 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
