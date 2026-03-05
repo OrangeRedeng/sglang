@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 
 logger = init_logger(__name__)
 
@@ -107,15 +108,15 @@ def _build_parallelism_config(
     ulysses_size = None
     ring_size = None
     if sp_group is not None:
-        ulysses_size = getattr(sp_group, "ulysses_world_size", None)
-        ring_size = getattr(sp_group, "ring_world_size", None)
+        ulysses_size = get_sp_group().ulysses_world_size
+        ring_size = get_sp_group().ring_world_size
 
     tp_size = None
     if tp_group is not None:
         tp_size = dist.get_world_size(tp_group)
 
     return ParallelismConfig(
-        backend=ParallelismBackend.NATIVE_PYTORCH,
+        backend=ParallelismBackend.AUTO,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         tp_size=tp_size,
