@@ -12,7 +12,12 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
+    get_tp_world_size,
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -108,12 +113,12 @@ def _build_parallelism_config(
     ulysses_size = None
     ring_size = None
     if sp_group is not None:
-        ulysses_size = get_sp_group().ulysses_world_size
-        ring_size = get_sp_group().ring_world_size
+        ulysses_size = get_ulysses_parallel_world_size()
+        ring_size = get_ring_parallel_world_size()
 
     tp_size = None
     if tp_group is not None:
-        tp_size = dist.get_world_size(tp_group)
+        tp_size = get_tp_world_size()
 
     return ParallelismConfig(
         backend=ParallelismBackend.AUTO,
