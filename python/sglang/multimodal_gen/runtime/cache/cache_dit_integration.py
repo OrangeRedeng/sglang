@@ -13,8 +13,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_tp_world_size,
     get_ring_parallel_world_size,
+    get_tp_world_size,
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
