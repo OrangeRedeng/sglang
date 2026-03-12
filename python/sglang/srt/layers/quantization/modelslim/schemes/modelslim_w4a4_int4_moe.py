@@ -108,6 +108,9 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 
+    def process_weights_after_loading_scale(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading_scale(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
