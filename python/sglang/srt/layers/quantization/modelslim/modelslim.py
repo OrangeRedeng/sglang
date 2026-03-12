@@ -341,6 +341,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
+    def process_weights_after_loading_scale(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading_scale(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
