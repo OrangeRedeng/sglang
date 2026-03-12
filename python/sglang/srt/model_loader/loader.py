@@ -712,7 +712,7 @@ class DefaultModelLoader(BaseModelLoader):
                 try:
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading_scale(module)
-                execpt:
+                except:
                     pass
                 if _is_npu:
                     torch.npu.empty_cache()
