@@ -327,17 +327,6 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
 
-        scale_np = layer.w13_weight_scale.data.cpu().numpy()
-        scale_np.dtype = np.uint32
-        scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-
-        layer.w13_weight_scale = torch.nn.Parameter(
-            scale_uint64_tensor.squeeze(-1), requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
-        )
-
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
