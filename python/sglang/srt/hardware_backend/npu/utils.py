@@ -124,7 +124,7 @@ def npu_format_cast(
         return tensor
 
     if tensor.device == torch.device("cpu"):
-        logger.warning(
+        logger.warning_once(
             "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
             "Please disable offloading, otherwise the performance will be "
             "significantly reduced."
