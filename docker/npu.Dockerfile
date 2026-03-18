@@ -11,7 +11,7 @@ ARG CANN_VERSION
 ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
-ARG PYTORCH_VERSION="2.9.0.post1"
+ARG PYTORCH_VERSION="2.9.0"
 ARG TORCHVISION_VERSION="0.24.0"
 ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.1-pytorch2.9.0/torch_npu-2.9.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.1-pytorch2.9.0/torch_npu-2.9.0.post1-cp311-cp311-manylinux_2_28_x86_64.whl"
