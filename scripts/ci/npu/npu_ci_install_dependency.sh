@@ -3,7 +3,6 @@ set -euo pipefail
 
 PIP_INSTALL="python3 -m pip install --no-cache-dir"
 DEVICE_TYPE=$1
-OPTIONAL_DEPS="${2:-}"
 
 
 # Install the required dependencies in CI.
