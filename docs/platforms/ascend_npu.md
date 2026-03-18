@@ -18,9 +18,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-beta.1-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-beta.1-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
