@@ -48,4 +48,5 @@ Compressed-tensors (LLM Compressor) on Ascend support:
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [GGUF on Ascend support](https://github.com/sgl-project/sglang/pull/17883)
-- in progress
+
+in progress
