@@ -875,6 +875,24 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
         return self.kernel.apply(layer, dispatch_output)
 
+    def apply_without_routing_weights(
+            self,
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        ):
+            return self.kernel.apply_without_routing_weights(
+                layer,
+                hidden_states,
+                hidden_states_scale,
+                group_list_type,
+                group_list,
+                output_dtype,
+            )
+
 
 # Register fake implementations for torch.compile support
 if _is_cuda:
