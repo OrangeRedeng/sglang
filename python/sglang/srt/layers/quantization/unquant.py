@@ -613,7 +613,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-<<<<<<< HEAD
         backend = self.runner.runner_backend
         quant_info = TorchNpuKernelsQuantInfo(
             w13_weight=layer.w13_weight,
@@ -623,7 +622,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             activation=self.moe_runner_config.activation,
         )
         return self.runner.run(dispatch_output, quant_info)
-=======
+'''
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -703,7 +702,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
->>>>>>> sglang
+'''
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
