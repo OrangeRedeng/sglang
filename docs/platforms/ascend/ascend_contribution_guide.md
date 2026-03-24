@@ -109,6 +109,15 @@ cool-down-minutes:
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
 
 
+## How to add CI Tests on Ascend NPU
+
+Follow these steps:
+1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
+2. Add CI test according to [Test and Continuous Integration (CI) System in SGLang](/test/README.md) guide.
+3. Make sure your model is pre-downloaded on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}". Use docker "/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}" path in your test script. 
+
+> Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
+
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
