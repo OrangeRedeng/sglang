@@ -525,8 +525,8 @@ msmodelslim quant \
 - **Run quantization**
 ```bash
 python3 -m sglang.launch_server \
-  --model-path $PWD/Qwen3-32B-w8a8 \
-  --port 30000 --host 0.0.0.0
+--model-path $PWD/Qwen3-32B-w8a8 \
+--port 30000 --host 0.0.0.0
 ```
 
 - **Available Quantization Methods**:
