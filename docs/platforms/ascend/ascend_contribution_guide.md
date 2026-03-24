@@ -116,7 +116,7 @@ Add CI test according to [Test and Continuous Integration (CI) System in SGLang]
 If you need to use model which is not in ```python/sglang/test/ascend/test_ascend_utils.py`` list. Follow these steps:
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
 2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
-If this is not the case, use folloing command on CI server:
+If this is not the case, use following command on CI server:
   ```bash
   modelscope download
   --model {your_model_repo}/{your_model}
