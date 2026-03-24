@@ -114,7 +114,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 Follow these steps:
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
 2. Add CI test according to [Test and Continuous Integration (CI) System in SGLang](/test/README.md) guide.
-3. Make sure your model is pre-downloaded on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}". Use docker "/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}" path in your test script. 
+3. Make sure your model is pre-downloaded on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}". Use docker "/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}" path in your test script.
 
 > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
 
