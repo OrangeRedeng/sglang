@@ -495,7 +495,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
     Download the original floating-point weights of the large model. Taking Qwen3-32B as an example, you can go to [Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the huggingface model card).
     > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
-    
+
     _Traditional quantification methods require the preparation of calibration data files (```.jsonl``` formats) for calibration in the quantification process._
     ```bash
     Qwen3-32B/      # floating-point model downloaded from official HF (or modelscope) repo
