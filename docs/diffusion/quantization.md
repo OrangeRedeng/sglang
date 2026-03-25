@@ -184,23 +184,6 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     cd msmodelslim
     bash install.sh
     ```
-    
-- **Auto-Detection and different formats**
-
-    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of `quant_model_description.json` config. 
-    
-    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format, 
-    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
-    
-    ```bash
-    python wan_repack.py \
-      --input-path {path_to_quantized_model} \
-      --output-path {path_to_converted_model}
-    ```
-
-    After that, please copy all files from original `Diffusers` checkpoint (insted of `transormer`/`transormer_2` folders)
-    
-    > Note: SGLang does not support embedding quantization, please disable this option when quantizing using msmodelslim.
 
 - **Multimodal_sd quantization**
 
@@ -220,6 +203,23 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
   ```
   
   For more detailed examples of quantization of models, as well as information about their support, see the [examples]([https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md)) section in ModelSLim repo.
+    
+- **Auto-Detection and different formats**
+
+    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of `quant_model_description.json` config. 
+    
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format, 
+    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
+    
+    ```bash
+    python wan_repack.py \
+      --input-path {path_to_quantized_model} \
+      --output-path {path_to_converted_model}
+    ```
+
+    After that, please copy all files from original `Diffusers` checkpoint (insted of `transormer`/`transormer_2` folders)
+    
+    > Note: SGLang does not support embedding quantization, please disable this option when quantizing using msmodelslim.
   
 - **Usage Example**
 
