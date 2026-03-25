@@ -38,6 +38,18 @@ If you add a new feature or fix a bug, please add corresponding unit tests to en
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
+If you need to use model which is not in ```python/sglang/test/ascend/test_ascend_utils.py`` list. Follow these steps:
+1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
+2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
+If this is not the case, use following command on CI server:
+  ```bash
+  modelscope download
+  --model {your_model_repo}/{your_model}
+  --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
+  ```
+  > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
+4. Add model to ```python/sglang/test/ascend/test_ascend_utils.py``` (use docker ```"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"``` path).
+
 ## Write documentations
 
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
@@ -107,23 +119,6 @@ cool-down-minutes:
 ```
 
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
-
-
-## How to add CI Tests on Ascend NPU
-
-Add CI test according to [Test and Continuous Integration (CI) System in SGLang](/test/README.md) guide.
-
-If you need to use model which is not in ```python/sglang/test/ascend/test_ascend_utils.py`` list. Follow these steps:
-1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
-2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
-If this is not the case, use following command on CI server:
-  ```bash
-  modelscope download
-  --model {your_model_repo}/{your_model}
-  --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
-  ```
-  > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
-4. Add model to ```python/sglang/test/ascend/test_ascend_utils.py``` (use docker ```"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"``` path).
 
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
