@@ -44,7 +44,8 @@ backend.
 |------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
 | `fp8`            | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path` | ALL                                                          | None                                  | Component-folder and single-file flows are both supported                                                             |
 | `nvfp4-modelopt` | NVFP4 safetensors file, sharded directory, or repo providing transformer weights           | `--transformer-weights-path`                         | FLUX.2                                                       | `comfy-kitchen` optional on Blackwell | Blackwell can use a best-performance kit when available; otherwise SGLang falls back to the generic ModelOpt FP4 path |
-| `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`  | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                           |
+| `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                            |
+| `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `int8` and `int4`                              |
 
 ## NVFP4
 
@@ -171,3 +172,45 @@ sglang generate \
   as `4` or `8`.
 - Current runtime validation only allows Nunchaku on NVIDIA CUDA Ampere (SM8x)
   or SM12x GPUs. Hopper (SM90) is currently rejected.
+
+## [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
+MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
+
+- **Installation**
+
+    ```bash
+    # Clone repo and install msmodelslim:
+    git clone https://gitcode.com/Ascend/msmodelslim.git
+    cd msmodelslim
+    bash install.sh
+    ```
+    
+- **Auto-Detection and different formats**
+
+    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of `quant_model_description.json` config. 
+    
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format, 
+    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
+    
+    ```bash
+    python wan_repack.py \
+      --input-path {path_to_quantized_model} \
+      --output-path {path_to_converted_model}
+    ```
+
+    After that, please copy all files from original `Diffusers` checkpoint (insted of `transormer`/`transormer_2` folders)
+    
+    > Note: SGLang does not support embedding quantization, please disable this option when quantizing using msmodelslim.
+
+- **LLM quantization**
+  
+- **Usage Examples**
+
+With auto-detected flow:
+
+```bash
+sglang generate \
+  --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
