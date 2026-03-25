@@ -223,14 +223,14 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
   
 - **Usage Example**
 
-With auto-detected flow:
-
-```bash
-sglang generate \
-  --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
-  --prompt "a beautiful sunset" \
-  --save-output
-```
+    With auto-detected flow:
+    
+    ```bash
+    sglang generate \
+      --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
+      --prompt "a beautiful sunset" \
+      --save-output
+    ```
 
 **Available Quantization Methods**:
   - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
