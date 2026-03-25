@@ -219,7 +219,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
       --output-path {path_to_converted_model}
     ```
 
-    After that, please copy all files from original `Diffusers` checkpoint (insted of `transformer`/`tranfsormer_2` folders)
+    After that, please copy all files from original `Diffusers` checkpoint (instead of `transformer`/`tranfsormer_2` folders)
 
 - **Usage Example**
 
