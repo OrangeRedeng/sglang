@@ -206,6 +206,8 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
     Download the original floating-point weights of the large model. Taking Wan2.2-T2V-A14B as an example, you can go to [Wan2.2-T2V-A14B](https://modelscope.cn/models/Wan-AI/Wan2.2-T2V-A14B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the modelscope model card).
     > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
+
+  Run quantization using one-click quantization (recommended):
   
   ```bash
   msmodelslim quant \
@@ -216,7 +218,9 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     --quant_type w8a8 \
     --trust_remote_code True
   ```
-  https://gitcode.com/Ascend/msmodelslim/tree/master/example/multimodal_sd/Wan2_1
+  
+  For more detailed examples of quantization of models, as well as information about their support, see the [examples]([https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md)) section in ModelSLim repo.
+  
 - **Usage Example**
 
 With auto-detected flow:
@@ -227,3 +231,9 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
+**Available Quantization Methods**:
+  - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
+  - [x]  ```W8A8``` linear with offline quantization of activations
+  - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
+  - [ ]  ```mxfp8``` linear in progress
