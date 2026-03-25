@@ -191,7 +191,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
 
   Run quantization using one-click quantization (recommended):
-  
+
   ```bash
   msmodelslim quant \
     --model_path /path/to/wan2_2_float_weights \
@@ -201,18 +201,18 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     --quant_type w8a8 \
     --trust_remote_code True
   ```
-  
+
   For more detailed examples of quantization of models, as well as information about their support, see the [examples]([https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md)) section in ModelSLim repo.
 
   > Note: SGLang does not support quantized embeddings, please disable this option when quantizing using msmodelslim.
-    
+
 - **Auto-Detection and different formats**
 
-    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of `quant_model_description.json` config. 
-    
-    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format, 
+    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of      `quant_model_description.json` config.
+
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format,
     for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
-    
+
     ```bash
     python wan_repack.py \
       --input-path {path_to_quantized_model} \
@@ -220,11 +220,11 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     ```
 
     After that, please copy all files from original `Diffusers` checkpoint (insted of `transformer`/`tranfsormer_2` folders)
-  
+
 - **Usage Example**
 
     With auto-detected flow:
-    
+
     ```bash
     sglang generate \
       --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
