@@ -6,7 +6,7 @@ Welcome to **SGLang**! We appreciate your interest in contributing. This guide p
 
 ### Prepare Environment
 
-Before contributing, please ensure that your environment is set up correctly. Follow the steps in the [Installation Guide](../platforms/ascend/ascend_npu.md) to install the necessary dependencies. We recommend [using docker](../platforms/ascend/ascend_npu.md#method-2-using-docker-image) to build the environment.
+Before contributing, please ensure that your environment is set up correctly. Follow the steps in the [Installation Guide](ascend_npu.md) to install the necessary dependencies. We recommend [using docker](ascend_npu.md#method-2-using-docker-image) to build the environment.
 
 ### Fork and clone the repository
 
@@ -64,7 +64,7 @@ You can find additional accuracy eval examples in:
 - [test_moe_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_moe_eval_accuracy_large.py)
 
 ## Benchmark the speed
-Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
+Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md).
 
 ## Requesting a review for merge
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
