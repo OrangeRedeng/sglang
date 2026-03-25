@@ -203,6 +203,8 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
   ```
   
   For more detailed examples of quantization of models, as well as information about their support, see the [examples]([https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md)) section in ModelSLim repo.
+
+  > Note: SGLang does not support quantized embeddings, please disable this option when quantizing using msmodelslim.
     
 - **Auto-Detection and different formats**
 
@@ -218,8 +220,6 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     ```
 
     After that, please copy all files from original `Diffusers` checkpoint (insted of `transformer`/`tranfsormer_2` folders)
-    
-    > Note: SGLang does not support embedding quantization, please disable this option when quantizing using msmodelslim.
   
 - **Usage Example**
 
