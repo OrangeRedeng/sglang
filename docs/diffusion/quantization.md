@@ -45,7 +45,7 @@ backend.
 | `fp8`            | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path` | ALL                                                          | None                                  | Component-folder and single-file flows are both supported                                                             |
 | `nvfp4-modelopt` | NVFP4 safetensors file, sharded directory, or repo providing transformer weights           | `--transformer-weights-path`                         | FLUX.2                                                       | `comfy-kitchen` optional on Blackwell | Blackwell can use a best-performance kit when available; otherwise SGLang falls back to the generic ModelOpt FP4 path |
 | `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                            |
-| `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `int8` and `int4`                              |
+| `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                              |
 
 ## NVFP4
 
@@ -202,9 +202,22 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     
     > Note: SGLang does not support embedding quantization, please disable this option when quantizing using msmodelslim.
 
-- **LLM quantization**
+- **Multimodal_sd quantization**
+
+    Download the original floating-point weights of the large model. Taking Wan2.2-T2V-A14B as an example, you can go to [Wan2.2-T2V-A14B](https://modelscope.cn/models/Wan-AI/Wan2.2-T2V-A14B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the modelscope model card).
+    > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
   
-- **Usage Examples**
+  ```bash
+  msmodelslim quant \
+    --model_path /path/to/wan2_2_float_weights \
+    --save_path /path/to/wan2_2_quantized_weights \
+    --device npu \
+    --model_type Wan2_2 \
+    --quant_type w8a8 \
+    --trust_remote_code True
+  ```
+  https://gitcode.com/Ascend/msmodelslim/tree/master/example/multimodal_sd/Wan2_1
+- **Usage Example**
 
 With auto-detected flow:
 
