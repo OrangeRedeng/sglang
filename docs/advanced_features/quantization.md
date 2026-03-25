@@ -522,7 +522,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     --trust_remote_code True
     ```
 
-- **Run quantization**
+- **Usage Example**
     ```bash
     python3 -m sglang.launch_server \
     --model-path $PWD/Qwen3-32B-w8a8 \
