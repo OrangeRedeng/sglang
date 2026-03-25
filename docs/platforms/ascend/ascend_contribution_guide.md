@@ -36,7 +36,7 @@ pre-commit run --all-files
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
-For detailed instructions on running tests and integrating them into CI, refer to [../../../test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
+For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
 ## Write documentations
 
