@@ -61,7 +61,7 @@ jobs:
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
-              - "!**/*.md
+              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
