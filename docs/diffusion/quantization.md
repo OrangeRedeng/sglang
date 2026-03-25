@@ -232,8 +232,8 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
       --save-output
     ```
 
-**Available Quantization Methods**:
-  - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
-  - [x]  ```W8A8``` linear with offline quantization of activations
-  - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
-  - [ ]  ```mxfp8``` linear in progress
+- **Available Quantization Methods**:
+    - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
+    - [x]  ```W8A8``` linear with offline quantization of activations
+    - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
+    - [ ]  ```mxfp8``` linear in progress
