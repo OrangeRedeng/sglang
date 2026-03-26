@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     )
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4DynamicMoEMethod,
+    NPUWnA16MoEMethod,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
