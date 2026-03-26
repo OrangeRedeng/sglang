@@ -797,7 +797,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         return hidden_states
 
 
-class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
+class NPUWnA16MoEMethod(_NPUFusedMoEMethodBase):
 
     def _pack_to_int32(self, weight: torch.Tensor):
         assert weight.dim() == 3
