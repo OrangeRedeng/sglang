@@ -179,6 +179,45 @@ def npu_fused_experts_unquant(
     return final_hidden_states
 
 
+'''def gguf_apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config is not None
+        ), "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
+
+        assert self.moe_runner_config.activation in ("silu", "swiglu"), (
+            f"Only SiLU/Swiglu activation is supported, "
+            f"got {self.moe_runner_config.activation!r}."
+        )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+
+        output = npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_qweight,
+            w13_scale=layer.w13_scales,
+            w13_offset=layer.w13_qzeros,
+            w2=layer.w2_qweight,
+            w2_scale=layer.w2_scales,
+            w2_offset=layer.w2_qzeros,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+            use_wna16=True,
+        )
+
+        return StandardCombineInput(hidden_states=output)'''
+
 def npu_fused_experts_wna16(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
