@@ -179,7 +179,7 @@ def npu_fused_experts_unquant(
     return final_hidden_states
 
 
-'''def gguf_apply(
+'''def gptq_apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
