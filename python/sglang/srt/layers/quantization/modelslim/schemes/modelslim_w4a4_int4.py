@@ -31,6 +31,12 @@ class ModelSlimW4A4Int4(ModelSlimLinearScheme):
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.int8)}
         return params_dict
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        moe_runner_config.quantization = "ModelSlimW4A4Int4MoE"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
+
     @staticmethod
     def get_perchannel_param(
         output_size: int,
