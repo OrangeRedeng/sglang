@@ -4,93 +4,97 @@ from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
 from sglang.srt.layers.activation import GeluAndMul
 
 # ==========================================
-# Helper Functions to Reduce Duplication
+# Helper Functions
 # ==========================================
 
-def _reshape_to_2d(hidden_states):
-    """Reshapes [B, S, H] to [B*S, H] if necessary."""
-    original_shape = hidden_states.shape
+def _reshape_to_2d(tensor):
+    """Reshape [B, S, H] -> [B*S, H]; returns (reshaped, original_shape)."""
+    original_shape = tensor.shape
     if len(original_shape) == 3:
-        hidden_states = hidden_states.view(-1, original_shape[-1])
-    return hidden_states, original_shape
+        tensor = tensor.view(-1, original_shape[-1])
+    return tensor, original_shape
 
 def _init_routing_v1(hidden_states, topk_ids, topk_weights, top_k):
-    """Handles the standard moe_init_routing used by unquant, wna16, and w8a8."""
+    """
+    Standard routing (v1) used by unquant, wna16, w8a8.
+    Returns (routed_hidden, expanded_row_idx, expanded_expert_idx).
+    """
     num_tokens = hidden_states.shape[0]
-    num_experts = topk_weights.shape[-1] if len(topk_weights.shape) > 1 else topk_ids.shape[-1] # fallback to id shape
     row_idx_len = num_tokens * top_k
-    
     row_idx = (
         torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
         .view(top_k, -1)
         .permute(1, 0)
         .contiguous()
     )
-
-    routed_hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch.ops.npu.npu_moe_init_routing(
-            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-        )
+    routed, expanded_row_idx, expanded_expert_idx = torch.ops.npu.npu_moe_init_routing(
+        hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
     )
+    return routed, expanded_row_idx, expanded_expert_idx
 
-    # Note: num_experts needs to be passed in from the calling function's weight matrix.
-    # We will pass it dynamically from the parent function instead to be safe.
-    return routed_hidden_states, expanded_row_idx, expanded_expert_idx
-
-def _init_routing_v2(hidden_states, topk_ids, top_k, num_experts, quant_mode=1, group_list_type=1):
-    num_tokens = hidden_states.shape[:-1].numel()
-    first_expert_idx = 0
-    last_expert_idx = w13.shape[0]
-    global_num_experts = w13.shape[0]
+def _init_routing_v2(hidden_states, topk_ids, top_k, num_experts, quant_mode=1):
+    """
+    Alternative routing (v2) used by w4a8 and sometimes w4a4.
+    Returns (sorted_hidden, expanded_row_idx, expert_tokens, pertoken_scale).
+    """
     original_shape = hidden_states.shape
-    group_list_type = 1
-
-    sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+    num_tokens = original_shape[:-1].numel()
+    first_expert_idx, last_expert_idx = 0, num_experts
+    sorted_hidden, expanded_row_idx, expert_tokens, pertoken_scale = (
         torch.ops.npu.npu_moe_init_routing_v2(
             hidden_states,
             topk_ids,
             active_num=num_tokens * top_k,
-            expert_num=global_num_experts,
-            expert_tokens_num_type=group_list_type,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[first_expert_idx, last_expert_idx],
-            quant_mode=1,
+            quant_mode=quant_mode,
         )
     )
-    return sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale
+    # Reshape expanded_row_idx for later use
+    expanded_row_idx = expanded_row_idx.view(-1, top_k).permute(1, 0).reshape(-1)
+    return sorted_hidden, expanded_row_idx, expert_tokens, pertoken_scale
 
 def _compute_expert_tokens(expanded_expert_idx, num_experts):
+    """Convert expanded expert indices to per-expert token counts."""
     expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
         expanded_expert_idx, num_experts
     )
     return expert_tokens.to(torch.int64)
 
-def _finalize_routing_v1(hidden_states, topk_weights, expanded_row_idx, topk_ids):
-    """Handles the standard finalize_routing used by unquant, wna16, and w8a8."""
-    return torch.ops.npu.npu_moe_finalize_routing(
-        hidden_states,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=expanded_row_idx,
-        export_for_source_row=topk_ids,
-    )
+def _finalize_routing_v1(hidden_states, topk_weights, expanded_row_idx, topk_ids,
+                         drop_pad_mode=None):
+    """
+    Standard finalize routing (v1) with optional drop_pad_mode.
+    """
+    kwargs = {
+        "skip1": None,
+        "skip2": None,
+        "bias": None,
+        "scales": topk_weights,
+        "expanded_src_to_dst_row": expanded_row_idx,
+        "export_for_source_row": topk_ids,
+    }
+    if drop_pad_mode is not None:
+        kwargs["drop_pad_mode"] = drop_pad_mode
+    return torch.ops.npu.npu_moe_finalize_routing(hidden_states, **kwargs)
 
-def _apply_activation(hidden_states, activation, layer=None, w13=None):
-    """Routes to the correct activation function."""
+def _apply_activation(hidden_states, activation, w13=None):
+    """Route to the correct activation function."""
     if activation == "npu_swiglu_oai":
-        if layer is None:
-            layer = nn.ModuleList()
-            layer.register_parameter("w13_weight", w13)
+        # Create a dummy module for swiglu_oai
+        layer = nn.ModuleList()
+        layer.register_parameter("w13_weight", w13)
         return swiglu_oai(layer, hidden_states)
     elif activation == "silu":
         return torch.ops.npu.npu_swiglu(hidden_states)
     else:
         return GeluAndMul()(hidden_states)
 
+
 # ==========================================
-# Main Fused Expert Functions
+# Main Expert Functions
 # ==========================================
 
 def npu_fused_experts_unquant(
@@ -103,13 +107,19 @@ def npu_fused_experts_unquant(
     topk_ids: torch.Tensor,
     top_k: int,
     activation: str,
+    input_shape=None,
 ):
+    """
+    Unquantized MoE forward pass.
+    """
+    # Reshape input if needed
+    hidden_states, orig_shape = _reshape_to_2d(hidden_states)
     original_dtype = hidden_states.dtype
     topk_weights = topk_weights.to(original_dtype)
     topk_ids = topk_ids.to(torch.int32)
     num_experts = w13.shape[0]
 
-    hidden_states, expanded_row_idx, expanded_expert_idx = _init_routing_v1(
+    routed, expanded_row_idx, expanded_expert_idx = _init_routing_v1(
         hidden_states, topk_ids, topk_weights, top_k
     )
     expert_tokens = _compute_expert_tokens(expanded_expert_idx, num_experts)
@@ -117,9 +127,9 @@ def npu_fused_experts_unquant(
     w13_bias = [w13_weight_bias] if w13_weight_bias is not None else None
     w2_bias = [w2_weight_bias] if w2_weight_bias is not None else None
 
-    # gmm1: gate_up_proj
+    # gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
-        x=[hidden_states],
+        x=[routed],
         weight=[w13],
         bias=w13_bias,
         split_item=2,
@@ -129,10 +139,10 @@ def npu_fused_experts_unquant(
         output_dtype=original_dtype,
     )[0]
 
-    # act_fn
+    # activation
     hidden_states = _apply_activation(hidden_states, activation, w13=w13)
 
-    # gmm2: down_proj
+    # down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
@@ -144,7 +154,10 @@ def npu_fused_experts_unquant(
         output_dtype=original_dtype,
     )[0]
 
-    return _finalize_routing_v1(hidden_states, topk_weights, expanded_row_idx, topk_ids)
+    out = _finalize_routing_v1(
+        hidden_states, topk_weights, expanded_row_idx, topk_ids
+    )
+    return out.view(orig_shape) if len(orig_shape) == 3 else out
 
 
 def npu_fused_experts_wna16(
@@ -158,18 +171,25 @@ def npu_fused_experts_wna16(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    input_shape=None,
 ):
+    """
+    WNA16 (int4 weights, bf16/fp16 activations) MoE forward pass.
+    """
+    hidden_states, orig_shape = _reshape_to_2d(hidden_states)
     original_dtype = hidden_states.dtype
+    topk_weights = topk_weights.to(original_dtype)
+    topk_ids = topk_ids.to(torch.int32)
     num_experts = w13.shape[0]
 
-    hidden_states, expanded_row_idx, expanded_expert_idx = _init_routing_v1(
+    routed, expanded_row_idx, expanded_expert_idx = _init_routing_v1(
         hidden_states, topk_ids, topk_weights, top_k
     )
     expert_tokens = _compute_expert_tokens(expanded_expert_idx, num_experts)
 
-    # gmm1: gate_up_proj
+    # gate_up_proj with anti-quant
     hidden_states = torch.ops.npu.npu_grouped_matmul(
-        x=[hidden_states],
+        x=[routed],
         weight=[w13],
         antiquant_scale=[w13_scale],
         antiquant_offset=[w13_offset],
@@ -180,10 +200,10 @@ def npu_fused_experts_wna16(
         output_dtype=original_dtype,
     )[0]
 
-    # act_fn: swiglu
+    # activation (always SiLU)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
 
-    # gmm2: down_proj
+    # down_proj with anti-quant
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
@@ -196,46 +216,75 @@ def npu_fused_experts_wna16(
         output_dtype=original_dtype,
     )[0]
 
-    return _finalize_routing_v1(hidden_states, topk_weights, expanded_row_idx, topk_ids)
+    out = _finalize_routing_v1(
+        hidden_states, topk_weights, expanded_row_idx, topk_ids
+    )
+    return out.view(orig_shape) if len(orig_shape) == 3 else out
 
 
 def npu_fused_experts_w4a4(
-    hidden_state: torch.Tensor, 
-    w13: torch.Tensor, 
-    w13_scale: torch.Tensor, 
-    w2: torch.Tensor, 
-    w2_scale: torch.Tensor, 
-    topk_weights: torch.Tensor, 
-    topk_ids: torch.Tensor, 
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     top_k: int,
+    input_shape=None,
 ):
-    hidden_states, original_shape = _reshape_to_2d(hidden_states)
+    """
+    W4A4 (int4 weights, int4 activations) MoE forward pass.
+    """
+    hidden_states, orig_shape = _reshape_to_2d(hidden_states)
     original_dtype = hidden_states.dtype
+    topk_weights = topk_weights.to(original_dtype)
+    topk_ids = topk_ids.to(torch.int32)
     num_experts = w13.shape[0]
 
-    hidden_states, expanded_row_idx, expert_tokens, _ = _init_routing_v2(
+    # Use v2 routing (quant_mode=-1)
+    routed, expanded_row_idx, expert_tokens, pertoken_scale = _init_routing_v2(
         hidden_states, topk_ids, top_k, num_experts, quant_mode=-1
     )
     expert_tokens = expert_tokens.to(torch.int64)
 
-    # gmm1
-    hidden_states, per_token = torch.ops.npu.npu_dynamic_quant(hidden_states, dst_type=torch.quint4x2)
-    hidden_states = _run_grouped_matmul(
-        hidden_states, w13, expert_tokens, original_dtype, group_list_type=1,
-        scale=w13_scale, per_token_scale=per_token
+    # gate_up_proj with dynamic quant to quint4x2
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
+        routed, dst_type=torch.quint4x2
     )
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w13],
+        scale=[w13_scale],
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
 
-    # act_fn + gmm2
+    # activation
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states, per_token = torch.ops.npu.npu_dynamic_quant(hidden_states)
-    
-    hidden_states = _run_grouped_matmul(
-        hidden_states, w2, expert_tokens, original_dtype, group_list_type=1,
-        scale=w2_scale, per_token_scale=per_token
-    )
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
 
-    out = _finalize_routing_v1(hidden_states, topk_weights, expanded_row_idx, topk_ids, drop_pad_mode=2)
-    return out.view(original_shape) if len(original_shape) == 3 else out
+    # down_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        scale=[w2_scale],
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    out = _finalize_routing_v1(
+        hidden_states, topk_weights, expanded_row_idx, topk_ids, drop_pad_mode=2
+    )
+    return out.view(orig_shape) if len(orig_shape) == 3 else out
 
 
 def npu_fused_experts_w4a8(
@@ -249,70 +298,62 @@ def npu_fused_experts_w4a8(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    input_shape=None,
 ):
-    group_list_type = 1
-    num_tokens = hidden_states.shape[:-1].numel()
+    """
+    W4A8 (int4 weights, int8 activations) MoE forward pass.
+    """
+    hidden_states, orig_shape = _reshape_to_2d(hidden_states)
+    original_dtype = hidden_states.dtype
+    topk_weights = topk_weights.to(original_dtype)
+    topk_ids = topk_ids.to(torch.int32)
     num_experts = w13.shape[0]
 
-    # Uses init_routing_v2 (specific to w4a8)
-    sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-        torch.ops.npu.npu_moe_init_routing_v2(
-            hidden_states,
-            topk_ids,
-            active_num=num_tokens * top_k,
-            expert_num=num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_expert_range=[0, num_experts],
-            quant_mode=1,
-        )
+    # v2 routing with quant_mode=1
+    routed, expanded_row_idx, expert_tokens, pertoken_scale = _init_routing_v2(
+        hidden_states, topk_ids, top_k, num_experts, quant_mode=1
     )
-
-    expanded_row_idx = expanded_row_idx.view(-1, top_k).permute(1, 0).reshape(-1)
     expert_tokens = expert_tokens.to(torch.int64)
-    _output_dtype = torch.bfloat16
 
-    w1_scale = [w13_scale.to(w2_scale.dtype)]
-    w2_scale = [w2_scale]
-
-    # gmm1: gate_up_proj
+    # gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
-        x=[sorted_hidden_states],
+        x=[routed],
         weight=[w13],
-        scale=w1_scale,
+        scale=[w13_scale],
         bias=[w13_scale_bias],
         per_token_scale=[pertoken_scale],
         group_list=expert_tokens,
         split_item=2,
         group_type=0,
-        group_list_type=group_list_type,
-        output_dtype=_output_dtype,
+        group_list_type=1,
+        output_dtype=original_dtype,
     )[0]
 
-    # act_fn: swiglu
+    # activation + dynamic quant
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
 
-    # gmm2: down_proj
-    output = torch.ops.npu.npu_grouped_matmul(
+    # down_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
-        scale=w2_scale,  # Changed from w1_scale to w2_scale based on expected logic, verify if intended!
+        scale=[w2_scale],
         bias=[w2_scale_bias],
         per_token_scale=[swiglu_out_scale],
         group_list=expert_tokens,
         split_item=2,
         group_type=0,
-        group_list_type=group_list_type,
-        output_dtype=_output_dtype,
+        group_list_type=1,
+        output_dtype=original_dtype,
     )[0]
 
-    # Uses token_unpermute instead of finalize_routing
-    return torch.ops.npu.npu_moe_token_unpermute(
-        permuted_tokens=output,
+    # final unpermute (instead of finalize_routing)
+    out = torch.ops.npu.npu_moe_token_unpermute(
+        permuted_tokens=hidden_states,
         sorted_indices=torch.abs(expanded_row_idx),
         probs=topk_weights,
     )
+    return out.view(orig_shape) if len(orig_shape) == 3 else out
 
 
 def npu_fused_experts_w8a8(
@@ -326,19 +367,26 @@ def npu_fused_experts_w8a8(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    input_shape=None,
 ):
+    """
+    W8A8 (int8 weights, int8 activations) MoE forward pass.
+    """
+    hidden_states, orig_shape = _reshape_to_2d(hidden_states)
     original_dtype = hidden_states.dtype
     scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
+    topk_weights = topk_weights.to(original_dtype)
+    topk_ids = topk_ids.to(torch.int32)
     num_experts = w13.shape[0]
 
-    hidden_states, expanded_row_idx, expanded_expert_idx = _init_routing_v2(
+    # Use v1 routing (standard)
+    routed, expanded_row_idx, expanded_expert_idx = _init_routing_v1(
         hidden_states, topk_ids, topk_weights, top_k
     )
     expert_tokens = _compute_expert_tokens(expanded_expert_idx, num_experts)
 
-    # gmm1: gate_up_proj (with dynamic quant)
-    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-    
+    # gate_up_proj with dynamic quant
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(routed)
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w13],
@@ -351,14 +399,15 @@ def npu_fused_experts_w8a8(
         output_dtype=original_dtype,
     )[0]
 
-    # act_fn
-    hidden_states, per_token = torch.ops.npu.npu_dequant_swiglu_quant(
+    # activation (using fused dequant+swiglu+quant)
+    hidden_states, _ = torch.ops.npu.npu_dequant_swiglu_quant(
         hidden_states, quant_mode=1, activate_left=True
     )
-    
-    # gmm2: down_proj (with dynamic quant)
-    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+    # Note: npu_dequant_swiglu_quant returns (quantized_output, scale)
+    # The output is already quantized to int8; we just use it.
 
+    # down_proj with dynamic quant (again)
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
@@ -371,5 +420,7 @@ def npu_fused_experts_w8a8(
         output_dtype=original_dtype,
     )[0]
 
-    out = torch.ops.npu.npu_moe_token_unpermute(output, torch.abs(expanded_row_idx), topk_weights)
-    return out.view(original_shape) if len(original_shape) == 3 else out
+    out = _finalize_routing_v1(
+        hidden_states, topk_weights, expanded_row_idx, topk_ids
+    )
+    return out.view(orig_shape) if len(orig_shape) == 3 else out
