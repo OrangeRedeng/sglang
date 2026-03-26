@@ -57,11 +57,10 @@ jobs:
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_cpu.toml"
-              - "test/**"
-              - "sgl-kernel/**"
+              - "test/**/!(*.md)"
+              - "sgl-kernel/**/*.!(md|txt)"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
-              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
