@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import (
     npu_fused_experts_unquant,
+    npu_fused_experts_w4a4,
     npu_fused_experts_w4a8,
     npu_fused_experts_w8a8,
     npu_fused_experts_wna16,
@@ -129,6 +130,22 @@ def output_wna16(hidden_states, quant_info, topk_weights, topk_ids):
     return output
 
 
+def output_w4a4(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_w4a4(
+        hidden_states=hidden_states,
+        w13=quant_info.w13_weight,
+        w13_scale=quant_info.w13_scale,
+        w13_offset=quant_info.w13_offset,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        w2_offset=quant_info.w2_offset,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=topk_ids.shape[1],
+    )
+    return output
+
+
 def output_w8a8(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_w8a8(
         hidden_states=hidden_states,
@@ -152,6 +169,7 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         self.selected_run = {
+            "ModelSlimW4A4Int4MoE": output_w4a4,
             "ModelSlimW4A8Int8MoE": output_w4a8,
             "NPUCompressedTensorsW4A8Int4DynamicMoEMethod": output_w4a8,
             "ModelSlimW8A8Int8MoE": output_w8a8,
