@@ -867,7 +867,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
 class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
-        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.kernel = NPUWnA16MoEMethod()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
