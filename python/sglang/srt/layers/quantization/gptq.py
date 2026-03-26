@@ -56,7 +56,7 @@ from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUWnA16DynamicMoEMethod,
+    NPUWnA16MoEMethod,
 )
 
 if TYPE_CHECKING:
@@ -610,7 +610,7 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
         self.moe_runner_config: Optional[MoeRunnerConfig] = None
-        self.kernel = NPUWnA16Int4DynamicMoEMethod()
+        self.kernel = NPUWnA16MoEMethod()
 
     def create_weights(
         self,
