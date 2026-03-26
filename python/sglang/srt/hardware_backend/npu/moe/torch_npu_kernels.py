@@ -173,7 +173,7 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
             "ModelSlimW4A8Int8MoE": output_w4a8,
             "NPUCompressedTensorsW4A8Int4DynamicMoEMethod": output_w4a8,
             "ModelSlimW8A8Int8MoE": output_w8a8,
-            "NPUCompressedTensorsW4A16Int4DynamicMoEMethod": output_wna16,
+            "NPUCompressedTensorsW4A16MoEMethod": output_wna16,
             "AWQMoEAscendMethod": output_wna16,
             "UnquantizedFusedMoEMethod": output_unquant,
         }.get(config.quantization, output_unquant)
