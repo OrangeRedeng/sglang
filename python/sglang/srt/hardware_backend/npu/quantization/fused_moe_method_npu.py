@@ -925,7 +925,7 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-    def process_weights_after_loading_gguf(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading_gptq(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
         )
