@@ -91,48 +91,6 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 | Multi-GPU (2/4/8) | `stage-b-test-2-gpu-large`, `stage-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |
 
-### Per-commit (AMD)
-
-| Suite | Runner (label) | Description |
-| --- | --- | --- |
-| `stage-a-test-1-gpu-small-amd` | `linux-mi325-1gpu-sglang` | Quick checks on one MI325-class GPU in the AMD CI container. |
-| `stage-b-test-2-gpu-large-amd` | `linux-mi325-2gpu-sglang` | 2-GPU ROCm correctness and parallel setups. |
-| `stage-b-test-large-8-gpu-35x-disaggregation-amd` | `linux-mi35x-gpu-8.fabric` | Prefill–decode disaggregation and RDMA-oriented tests on an 8×MI35x fabric runner. |
-| `stage-c-test-large-8-gpu-amd` | `linux-mi325-8gpu-sglang` | 8-GPU MI325 scaling and integration. |
-
-### Per-commit (Ascend NPU)
-
-| Suite | Runner (label) | Description |
-| --- | --- | --- |
-| `per-commit-1-npu-a2` | `linux-aarch64-a2-1` | 1-NPU LLM CI machine |
-| `per-commit-2-npu-a2` | `linux-aarch64-a2-2` | 2-NPU LLM CI machine |
-| `per-commit-4-npu-a3` | `linux-aarch64-a3-4` | 4-NPU LLM CI machine |
-| `per-commit-16-npu-a3` | `linux-aarch64-a3-16` | 16-NPU LLM CI machine  |
-| `multimodal-gen-test-1-npu-a3` | `linux-aarch64-a3-2` | 1-NPU multimodal CI machine |
-| `multimodal-gen-test-2-npu-a3` | `linux-aarch64-a3-16` | 2-NPU multimodal CI machine |
-| `multimodal-gen-test-8-npu-a3` | `linux-aarch64-a3-16` | 8-NPU multimodal CI machine |
-
-
-### Nightly
-
-Nightly registry suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](run_suite.py). They are not driven by `pr-test.yml` / `pr-test-amd*.yml`; see workflows such as `nightly-test-nvidia.yml` and `nightly-test-amd.yml`. Examples:
-
-- `nightly-1-gpu` (CUDA)
-- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
-- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly coverage)
-- `nightly-8-gpu-h200` (CUDA)
-- `nightly-eval-vlm-2-gpu` (CUDA)
-- `nightly-amd` (AMD)
-- `nightly-amd-8-gpu-mi35x` (AMD)
-- `nightly-1-npu-a3` (NPU)
-- `nightly-2-npu-a3` (NPU)
-- `nightly-4-npu-a3` (NPU)
-- `nightly-8-npu-a3` (NPU)
-- `nightly-16-npu-a3` (NPU)
-
-### Choosing a suite for your test
-
-Use the lightest suite that still meets your test's needs.
 ## Steps for Adding a Test
 
 See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
