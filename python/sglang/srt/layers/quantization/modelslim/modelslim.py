@@ -141,6 +141,7 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
                 key = "vision_model"
@@ -156,8 +157,9 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-
-            if self.is_layer_skipped(prefix, packed_modules_mapping_subset) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            if self.is_layer_skipped(
+                prefix, packed_modules_mapping_subset
+            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
