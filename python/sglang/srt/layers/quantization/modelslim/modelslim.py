@@ -157,7 +157,7 @@ class ModelSlimConfig(QuantizationConfig):
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
 
-            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
+            if self.is_layer_skipped(prefix, packed_modules_mapping_subset) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
