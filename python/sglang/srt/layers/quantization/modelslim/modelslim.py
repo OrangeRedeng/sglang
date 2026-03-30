@@ -186,7 +186,7 @@ class ModelSlimConfig(QuantizationConfig):
         
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
-            ("W8A8_STATIC", ModelSlimW8A8Int8),
+            ("W8A8", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
         ]
         
