@@ -13,7 +13,6 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -160,15 +159,12 @@ class ModelSlimConfig(QuantizationConfig):
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
-            layer.scheme = self.get_linear_scheme(
-                layer, prefix_in_quant_config
-            )
+            layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         return None
-
 
     def get_linear_scheme(
         self, layer: torch.nn.Module, prefix: Optional[str] = None
@@ -177,20 +173,20 @@ class ModelSlimConfig(QuantizationConfig):
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
-        
+
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
             ("W8A8", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
         ]
-        
+
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
-        
+
         for scheme_name, scheme_class in linear_quant_schemes:
             if any(s == scheme_name for s in quant_schemes):
                 logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
-            
+
         logger.warning(
             f"Unsupported Linear modelslim scheme: "
             f"{quant_schemes} in layer: {prefix}"
