@@ -166,54 +166,48 @@ class ModelSlimConfig(QuantizationConfig):
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
-            scheme = self.get_linear_scheme(
-                layer=layer, layer_name=prefix_in_quant_config
+            layer.scheme = self.get_linear_scheme(
+                layer, prefix_in_quant_config
             )
-            layer.scheme = scheme
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         return None
 
-    def _get_scheme_from_parts(
-        self,
-        layer_name: str,
-    ) -> ModelSlimLinearScheme:
-
-        quant_type = self.quant_description.get(layer_name + ".weight", "")
-        if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
-            return ModelSlimW8A8Int8(
-                quant_config=self.quant_description, prefix=layer_name
-            )
-        elif quant_type == "W4A4_DYNAMIC":
-            return ModelSlimW4A4Int4(
-                quant_config=self.quant_description, prefix=layer_name
-            )
-        raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_linear_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+        self, layer: torch.nn.Module, prefix: Optional[str] = None
     ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
-        scheme = self._get_scheme_from_parts(
-            layer_name=layer_name,
+        
+        linear_quant_schemes = [
+            ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
+            ("W8A8_STATIC", ModelSlimW8A8Int8),
+            ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
+        ]
+        
+        quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
+        
+        for scheme_name, scheme_class in linear_quant_schemes:
+            if any(s == scheme_name for s in quant_schemes):
+                logger.info_once(f"Using {scheme_class.__name__}")
+                return scheme_class(quant_config=self.quant_description, prefix=prefix)
+            
+        logger.warning(
+            f"Unsupported Linear modelslim scheme: "
+            f"{quant_schemes} in layer: {prefix}"
         )
-
-        # Ascend doesn't support device capability
-        logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
-        return scheme
+        return None
 
     def get_moe_scheme(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[ModelSlimMoEScheme]:
-        # TODO: @dsikka: refactor this to use schemes as other kernels
-        # are supported + check if the layer is being ignored.
         moe_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
@@ -222,7 +216,7 @@ class ModelSlimConfig(QuantizationConfig):
 
         moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
         quant_schemes = [
-            self.quant_description.get(prefix + suffix, "STATIC")
+            self.quant_description.get(prefix + suffix, "")
             for suffix in moe_weight_suffixes
         ]
 
