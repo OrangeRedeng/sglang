@@ -374,6 +374,52 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     ):
         return layer.create_moe_runner(layer, moe_runner_config)
 
+    def _init_routing(topk_output, hidden_states):
+        topk_weights, topk_ids, _ = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        original_shape = hidden_states.shape
+        original_dtype = hidden_states.dtype
+        scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
+        if len(original_shape) == 3:
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens = hidden_states.shape[0]
+        num_experts = w13.shape[0]
+
+        hidden_states, expanded_row_idx, expert_tokens, _ = (
+            torch.ops.npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids,
+                active_num=num_tokens * top_k,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, num_experts],
+                quant_mode=-1,
+            )
+        )
+        expert_tokens = expert_tokens.to(torch.int64)
+        return hidden_states, expanded_row_idx, expert_tokens
+
+    def _apply_activation(hidden_states):
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        return hidden_states
+
+    def _finalize_routing(hidden_states, topk_weights, expanded_row_idx, topk_ids):
+        final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+        drop_pad_mode=2,
+        )
+        if len(original_shape) == 3:
+            final_hidden_states = final_hidden_states.view(original_shape)
+        return final_hidden_states
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -389,7 +435,16 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
 
-        return layer.scheme.apply_weights(layer, dispatch_output)
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        hidden_states, expanded_row_idx, expert_tokens = layer._init_routing(x, topk_output)
+        hidden_states = layer.w13_scheme.apply_weights(layer, hidden_states)
+        hidden_states = layer._apply_activation(hidden_states)
+        hidden_states = layer.w2_scheme.apply_weights(layer, hidden_states)
+        output = layer._finalize_routing(hidden_states)
+
+        return output
 
     def apply_without_routing_weights(
         self,
