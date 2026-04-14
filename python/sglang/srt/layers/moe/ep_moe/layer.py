@@ -388,7 +388,6 @@ class DeepEPMoE(FusedMoE):
                 if not input_quant and not isinstance(
                     self.quant_method,
                     (
-                        NPUCompressedTensorsW4A16Int4DynamicMoE,
                         CompressedTensorsFusedMoEMethod,
                     ),
                 ):
