@@ -159,10 +159,6 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         if self.needs_quant_draft:
             cxt = contextlib.nullcontext()
         else:
-            unquant_patch = {
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
-                "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
-            }
             cxt = temp_set_env(allow_sglang=True, **unquant_patch)
 
         with cxt:
