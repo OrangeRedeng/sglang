@@ -119,7 +119,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -235,7 +234,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
