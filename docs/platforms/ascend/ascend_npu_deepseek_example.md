@@ -20,6 +20,7 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 #npu acceleration operator
 export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -66,6 +67,7 @@ export HCCL_BUFFSIZE=1536
 
 #npu acceleration operator
 export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
 export TASK_QUEUE_ENABLE=2
 
 python -m sglang.launch_server \
@@ -121,6 +123,7 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 #npu acceleration operator
 unset TASK_QUEUE_ENABLE
 export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
 
 # suggest max-running-requests <= max-cuda-graph-bs * dp_size, Because when this value is exceeded, performance will significantly degrade.
 python -m sglang.launch_server \
@@ -196,6 +199,7 @@ D_IP=('your decode ip1' 'your decode ip2')
 MODEL_PATH=xxx
 
 export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
