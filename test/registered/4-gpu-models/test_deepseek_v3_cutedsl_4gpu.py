@@ -60,7 +60,6 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
@@ -136,7 +135,6 @@ class TestDummyWithSBO(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
