@@ -606,10 +606,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
-            use_nvfp4 = True
-        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-            use_fp8 = True
+        #if input_global_scale is not None:
+        #    use_nvfp4 = True
+        #elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        #    use_fp8 = True
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
