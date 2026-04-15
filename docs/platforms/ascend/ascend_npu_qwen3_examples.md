@@ -61,7 +61,6 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --device npu \
@@ -82,7 +81,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
