@@ -28,6 +28,7 @@ def apply_rotary_embedding_native(
         and x.dim() == 3
         and x.shape[1] < NPU_ROTARY_MUL_MAX_NUM_HEADS
         and x.shape[2] < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        and not interleaved
     ):
         if cos.size(-1) * 2 == x.size(-1):
             cos = torch.cat([cos, cos], dim=-1)
@@ -39,14 +40,15 @@ def apply_rotary_embedding_native(
         x_embed = x_embed.squeeze(0)
         return x_embed
 
-    if interleaved:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
+    if interleaved and cos.shape[-1] == x.shape[-1]
+        cos = cos[..., ::2].contiguous()
+        sin = sin[..., ::2].contiguous()
     else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    if interleaved:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+    return torch.stack((o1, o2), dim=-1).flatten(-2)
