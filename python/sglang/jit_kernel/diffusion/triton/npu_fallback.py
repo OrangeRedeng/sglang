@@ -40,13 +40,6 @@ def apply_rotary_embedding_native(
         x_embed = x_embed.squeeze(0)
         return x_embed
 
-    if interleaved and cos.shape[-1] == x.shape[-1]:
-        cos = cos[..., ::2].contiguous()
-        sin = sin[..., ::2].contiguous()
-    else:
-        cos = cos.contiguous()
-        sin = sin.contiguous()
-
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     o1 = x1 * cos - x2 * sin
