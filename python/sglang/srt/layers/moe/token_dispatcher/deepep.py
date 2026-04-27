@@ -616,9 +616,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
-        use_nvfp4 = use_fp8 = False
-        
-        if get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
+        if get_global_server_args().deepep_dispather_output_dtype == "bf16" or get_global_server_args().deepep_dispather_output_dtype == "fp16:
+            use_nvfp4 = use_fp8 = False
+        elif get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
             use_nvfp4 = True
         elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
             use_fp8 = True
