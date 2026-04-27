@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+?# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -544,7 +544,7 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
-    deepep_dispather_output_dtype: Literal["auto", "fp8", "int8", "nvfp4"] = "auto"
+    deepep_dispather_output_dtype: Literal["auto", "fp16", "bf16", "fp8", "int8", "nvfp4"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
