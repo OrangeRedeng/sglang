@@ -617,16 +617,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        
+
         if get_global_server_args().deepep_dispather_output_dtype == "bf16" \
         or get_global_server_args().deepep_dispather_output_dtype == "fp16" \
-        or not get_moe_runner_backend().is_flashinfer_cutedsl():
+        or get_moe_runner_backend().is_flashinfer_cutedsl():
             use_nvfp4 = use_fp8 = False
             # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
             # off; its kernel quantizes to NVFP4 internally.
         elif get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
             use_nvfp4 = True
+            use_fp8 = False
         elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
+            use_nvfp4 = False
             use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
