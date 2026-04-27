@@ -494,7 +494,7 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             split_item=2,
             group_list_type=group_list_type,
             group_type=0,
-            group_list=expert_tokens,
+            group_list=group_list,
             output_dtype=output_dtype,
         )[0]
         return hidden_states
