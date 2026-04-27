@@ -38,11 +38,8 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A4Int4DynamicMoEMethod, 
-    NPUW4A8Int8DynamicMoEMethod, 
-    NPUW8A8Int8DynamicMoEMethod, 
-    NPUW4A16Int4DynamicMoEMethod
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_w4a4_int4 import (
+    ModelSlimW4A4Int4
 )
 
 if TYPE_CHECKING:
@@ -388,7 +385,7 @@ class DeepEPMoE(FusedMoE):
                 if isinstance(
                     self.scheme,
                     (
-                        NPUW4A4Int4DynamicMoEMethod
+                        ModelSlimW4A4Int4
                     ),
                 ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
@@ -424,7 +421,7 @@ class DeepEPMoE(FusedMoE):
                 if isinstance(
                     self.scheme,
                     (
-                        NPUW4A4Int4DynamicMoEMethod
+                        ModelSlimW4A4Int4
                     ),
                 ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
