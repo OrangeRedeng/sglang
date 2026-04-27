@@ -38,6 +38,13 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A4Int4DynamicMoEMethod, 
+    NPUW4A8Int8DynamicMoEMethod, 
+    NPUW8A8Int8DynamicMoEMethod, 
+    NPUW4A16Int4DynamicMoEMethod
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
@@ -378,6 +385,15 @@ class DeepEPMoE(FusedMoE):
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
+                if isinstance(
+                    self.scheme,
+                    (
+                        NPUW4A4Int4DynamicMoEMethod
+                    ),
+                ):
+                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+                        hidden_states, dst_type=torch.quint4x2
+                    )
                 hidden_states = self.quant_method.apply_without_routing_weights(
                     self,
                     hidden_states,
@@ -405,6 +421,15 @@ class DeepEPMoE(FusedMoE):
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
+                if isinstance(
+                    self.scheme,
+                    (
+                        NPUW4A4Int4DynamicMoEMethod
+                    ),
+                ):
+                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+                        hidden_states, dst_type=torch.quint4x2
+                    )
                 hidden_states = self.quant_method.apply_without_routing_weights(
                     self,
                     hidden_states,
