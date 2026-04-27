@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_npu,
     load_json_config,
 )
+from sglang.srt.server_args import get_global_server_args
 
 _is_npu = is_npu()
 
@@ -616,13 +617,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
     ):
         use_nvfp4 = use_fp8 = False
-        input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
+        
+        if get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
             use_nvfp4 = True
-        #elif not get_moe_runner_backend().is_flashinfer_cutedsl() and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
-            # off; its kernel quantizes to NVFP4 internally.
-        #    use_fp8 = True
+        elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
+            use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
