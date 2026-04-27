@@ -473,7 +473,7 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
-            scale=[layer.w13_weight_scale.to(output_dtype)],
+            scale=[layer.w13_weight_scale],
             per_token_scale=[hidden_states_scale],
             split_item=2,
             group_list_type=group_list_type,
@@ -489,7 +489,7 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
-            scale=[layer.w2_weight_scale.to(output_dtype)],
+            scale=[layer.w2_weight_scale],
             per_token_scale=[pertoken_scale],
             split_item=2,
             group_list_type=group_list_type,
