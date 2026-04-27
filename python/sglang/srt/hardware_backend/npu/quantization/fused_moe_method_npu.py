@@ -460,6 +460,43 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        # gmm1: up_gate_proj
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w13_weight],
+            scale=[layer.w13_weight_scale.to(output_dtype)],
+            per_token_scale=[hidden_states_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=output_dtype,
+        )[0]
+        # act_fn: swiglu
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+    
+        # gmm2: down_proj
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w2_weight],
+            scale=[layer.w2_weight_scale.to(output_dtype)],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=output_dtype,
+        )[0]
+        return hidden_states
 
 class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
