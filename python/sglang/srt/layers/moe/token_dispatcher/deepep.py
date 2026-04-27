@@ -616,8 +616,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
-        if get_global_server_args().deepep_dispather_output_dtype == "bf16" or get_global_server_args().deepep_dispather_output_dtype == "fp16:
+        if get_global_server_args().deepep_dispather_output_dtype == "bf16" \
+        or get_global_server_args().deepep_dispather_output_dtype == "fp16" \
+        or not get_moe_runner_backend().is_flashinfer_cutedsl():
             use_nvfp4 = use_fp8 = False
+            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
+            # off; its kernel quantizes to NVFP4 internally.
         elif get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
             use_nvfp4 = True
         elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
