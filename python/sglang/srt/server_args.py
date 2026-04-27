@@ -5480,6 +5480,13 @@ class ServerArgs:
             help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
+            "--deepep-dispather-output-dtype",
+            type=str,
+            choices=["auto", "fp16", "bf16", "fp8", "int8", "nvfp4"],
+            default="auto",
+            help="Select DeepEP dispather output dtype",
+        )
+        parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
