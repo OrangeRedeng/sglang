@@ -616,6 +616,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        
         if get_global_server_args().deepep_dispather_output_dtype == "bf16" \
         or get_global_server_args().deepep_dispather_output_dtype == "fp16" \
         or not get_moe_runner_backend().is_flashinfer_cutedsl():
