@@ -467,6 +467,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = buffer.dispatch(
             x,
+            use_fp8=use_fp8,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_tokens_per_rank=num_tokens_per_rank,
