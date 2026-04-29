@@ -629,7 +629,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
             use_nvfp4 = False
             use_fp8 = True
-            if _is_npu():
+            if _is_npu:
                 os.environ['DEEP_NORMAL_MODE_USE_INT8_QUANT'] = '1'
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
