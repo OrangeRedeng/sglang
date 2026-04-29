@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     load_json_config,
 )
 from sglang.srt.server_args import get_global_server_args
+import os
 
 _is_npu = is_npu()
 
