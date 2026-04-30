@@ -94,16 +94,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         **kwargs,
     ):
         exit_stack = ExitStack()
-        if (
-            is_npu()
-            and self.quant_config is None
-            and get_global_server_args().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
 
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
