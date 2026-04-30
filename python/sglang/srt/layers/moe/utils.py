@@ -216,6 +216,7 @@ def initialize_moe_config(server_args: ServerArgs):
 
 def get_dispatch_output_dtype():
     dtype = get_global_server_args().deepep_dispather_output_dtype
+    return dtype
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
