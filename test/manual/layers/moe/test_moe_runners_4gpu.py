@@ -63,6 +63,8 @@ class TestMoERunner4GPU(CustomTestCase):
                 "deepep",
                 "--deepep-mode",
                 "low_latency",
+                "--moe-a2a-backend",
+                "deepep",
                 "--attention-backend",
                 "triton",
                 "--sampling-backend",
