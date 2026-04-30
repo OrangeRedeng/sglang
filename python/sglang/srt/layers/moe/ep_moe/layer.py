@@ -13,6 +13,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_dispatch_output_dtype,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
