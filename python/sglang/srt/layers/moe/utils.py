@@ -214,6 +214,9 @@ def initialize_moe_config(server_args: ServerArgs):
     MOE_QUANTIZATION = server_args.quantization
 
 
+def get_dispatch_output_dtype():
+    dtype = get_global_server_args().deepep_dispather_output_dtype
+
 def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
