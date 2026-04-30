@@ -195,6 +195,8 @@ class TestDeepseekV3W4Afp8DeepepAutoMtp(CustomTestCase):
             "deepep",
             "--deepep-mode",
             "auto",
+            "--deepep-dispather-output-dtype",
+            "bf16",
             "--dp",
             "8",
             "--enable-dp-attention",
