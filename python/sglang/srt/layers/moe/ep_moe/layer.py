@@ -117,6 +117,8 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return
 
+        self.dispather_output_dtype = get_dispatch_output_dtype()
+
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
