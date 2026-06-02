@@ -669,7 +669,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=original_dtype,
+            output_dtype=torch.float16,
         )[0]
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
