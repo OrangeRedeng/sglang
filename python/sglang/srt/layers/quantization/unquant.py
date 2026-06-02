@@ -315,12 +315,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
-                weight = getattr(layer, weight_name)
-                origin_weight = weight.data.transpose(1, 2)
-                new_weight = origin_weight.contiguous()
-                origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(new_weight)
-
+                weight_fp = getattr(layer, weight_name)
+                weight_fp = weight.data.transpose(1, 2)
+                qw, weight_scale = torch.ops.npu.npu_dynamic_quant(
+                    weight_fp, dst_type=torch_npu.int8
+                )
+                #new_weight = origin_weight.contiguous()
+                #origin_weight.untyped_storage().resize_(0)
+                weight.data = npu_format_cast(qw)
+                layer.register_parameter("weight_scale", weight_scale)
         return
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
