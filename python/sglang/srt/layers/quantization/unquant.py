@@ -642,7 +642,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 quant_mode=-1,
             )
         )
-        expert_tokens = expert_tokens.to(torch.int64)
+        
         hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
         scale_args13 = {
             "scale": [layer.w13_weight_scale],
@@ -657,7 +657,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             weight=[layer.w13_weight],
             **scale_args13,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=torch.float16,
