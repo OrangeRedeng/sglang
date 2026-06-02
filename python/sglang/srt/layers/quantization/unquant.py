@@ -331,7 +331,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 setattr(layer, weight_name, torch.nn.Parameter(qw, requires_grad=False))
                 layer.register_parameter(
                     f"{weight_name}_scale",
-                    torch.nn.Parameter(weight_scale.to(torch.bfloat16), requires_grad=False)
+                    torch.nn.Parameter(weight_scale.transpose(1, 2).to(torch.bfloat16), requires_grad=False)
                 )
         return
 
