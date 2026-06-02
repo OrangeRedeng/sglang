@@ -322,7 +322,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 )
                 #new_weight = origin_weight.contiguous()
                 #origin_weight.untyped_storage().resize_(0)
-                setattr(layer, f"{weight_name}", torch.nn.Parameter(npu_format_cast(qw),requires_grad=False,)
+                setattr(layer, f"{weight_name}", torch.nn.Parameter(npu_format_cast(qw),requires_grad=False,))
                 layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter((weight_scale),requires_grad=False,))
         return
 
