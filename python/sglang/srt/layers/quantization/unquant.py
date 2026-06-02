@@ -318,7 +318,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 weight_fp = getattr(layer, weight_name)
                 weight_fp = weight_fp.data.transpose(1, 2)
                 qw, weight_scale = torch.ops.npu.npu_dynamic_quant(
-                    weight_fp, dst_type=torch_npu.int8
+                    weight_fp, dst_type=torch.int8
                 )
                 #new_weight = origin_weight.contiguous()
                 #origin_weight.untyped_storage().resize_(0)
