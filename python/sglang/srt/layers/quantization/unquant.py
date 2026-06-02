@@ -650,6 +650,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             "per_token_scale": [pertoken_scale],
         }
 
+        print(layer.w13_weight.data.shape)
+        print(layer.w13_weight_scale.shape)
+
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
