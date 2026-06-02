@@ -322,7 +322,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 )
                 #new_weight = origin_weight.contiguous()
                 #origin_weight.untyped_storage().resize_(0)
-                weight.data = npu_format_cast(qw)
+                weight_fp.data = npu_format_cast(qw)
                 layer.register_parameter("weight_scale", weight_scale)
         return
 
