@@ -145,6 +145,8 @@ def npu_fused_experts(
             "scale": [w13_scale.to(scale_dtype)],
             "per_token_scale": [pertoken_scale],
         }
+        print(w13.shape)
+        print(w13_scale.shape)
     else:
         scale_args13 = {
             "antiquant_scale": [w13_scale],
