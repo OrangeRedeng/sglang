@@ -323,7 +323,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 #new_weight = origin_weight.contiguous()
                 #origin_weight.untyped_storage().resize_(0)
                 setattr(layer, f"{weight_name}", torch.nn.Parameter(weight,requires_grad=False,))
-                layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter((weight_scale),requires_grad=False,))
+                layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter((weight_scale.to(torch.bfloat16)),requires_grad=False,))
         return
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
@@ -648,7 +648,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=0,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=torch.float16,
+            output_dtype=torch.bfloat16,
         )[0]
 
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
@@ -669,7 +669,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=torch.float16,
+            output_dtype=torch.bfloat16,
         )[0]
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
