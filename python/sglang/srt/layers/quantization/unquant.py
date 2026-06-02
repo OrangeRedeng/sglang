@@ -327,10 +327,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 weight_fp = getattr(layer, weight_name)
                 qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
                 # Keep original layout – no transpose
-                setattr(layer, weight_name, torch.nn.Parameter(qw.transpose(0, 1), requires_grad=False))
+                setattr(layer, weight_name, torch.nn.Parameter(qw.transpose(-2, -1), requires_grad=False))
                 layer.register_parameter(
                     f"{weight_name}_scale",
-                    torch.nn.Parameter(weight_scale.to(torch.bfloat16), requires_grad=False)
+                    torch.nn.Parameter(weight_scale, requires_grad=False)
                 )
         return
 
@@ -660,7 +660,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=0,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=torch.bfloat16,
+            output_dtype=torch.float16,
         )[0]
 
         hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
@@ -684,7 +684,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=torch.bfloat16,
+            output_dtype=torch.float16,
         )[0]
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
