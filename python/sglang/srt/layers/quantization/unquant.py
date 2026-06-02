@@ -316,7 +316,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight_fp = getattr(layer, weight_name)
-                weight_fp = weight.data.transpose(1, 2)
+                weight_fp = weight_fp.data.transpose(1, 2)
                 qw, weight_scale = torch.ops.npu.npu_dynamic_quant(
                     weight_fp, dst_type=torch_npu.int8
                 )
