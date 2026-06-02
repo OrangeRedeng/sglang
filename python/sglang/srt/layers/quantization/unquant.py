@@ -323,7 +323,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 #new_weight = origin_weight.contiguous()
                 #origin_weight.untyped_storage().resize_(0)
                 weight_fp.data = npu_format_cast(qw)
-                layer.register_parameter("weight_scale", weight_scale)
+                layer.register_parameter("weight_scale", torch.nn.Parameter((weight_scale),requires_grad=False,))
         return
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
