@@ -683,7 +683,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             drop_pad_mode=2,
         )
 
-        return StandardCombineInput(hidden_states=final_hidden_states.to(torch.bfloat16))
+        return StandardCombineInput(hidden_states=final_hidden_states)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
