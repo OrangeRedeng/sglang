@@ -612,96 +612,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
-    def forward_npu_155(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
-
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        # x.shape = [B*S, H]
-        x = dispatch_output.hidden_states
-        # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
-
-        original_dtype = x.dtype
-        num_tokens = x.shape[0]
-        topk_weights = topk_weights.to(x.dtype)
-        topk_ids = topk_ids.to(torch.int32)
-        num_experts = layer.num_experts
-        top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
-        
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch.ops.npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-            )
-        )
-        expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
-        
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-        scale_args13 = {
-            "scale": [layer.w13_weight_scale],
-            "per_token_scale": [pertoken_scale],
-        }
-
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[layer.w13_weight],
-            **scale_args13,
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=torch.float16,
-        )[0]
-
-        #hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        #hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            hidden_states, quant_mode=1, activate_left=True
-        )
-
-        scale_args2 = {
-            "scale": [layer.w2_weight_scale],
-            "per_token_scale": [swiglu_out_scale],
-        }
-
-        # gmm2: down_proj
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[layer.w2_weight],
-            **scale_args2,
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=torch.float16,
-        )[0]
-
-        final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
-            hidden_states,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights,
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=topk_ids,
-        )
-
-        return StandardCombineInput(hidden_states=final_hidden_states)
-
     def forward_npu(
         self,
         layer: torch.nn.Module,
@@ -723,7 +633,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
+            torch.ops.npu.npu_moe_init_routing_quant_v2(
                 x,
                 topk_ids,
                 active_num=num_tokens * top_k,
