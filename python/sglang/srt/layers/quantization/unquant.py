@@ -748,25 +748,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
-            output_dtype=torch.int32,
+            output_dtype=torch.float16,
         )[0]
 
-        # act_fn: swiglu
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            x=hidden_states,
-            weight_scale=layer.w13_weight_scale,
-            activation_scale=pertoken_scale,
-            bias=None,
-            quant_scale=None,
-            quant_offset=None,
-            group_index=expert_tokens,
-            activate_left=True,
-            quant_mode=1,
+            hidden_states, quant_mode=1, activate_left=True
         )
-
-        #hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-        #    hidden_states, quant_mode=1, activate_left=True
-        #)
 
         scale_args2 = {
             "scale": [layer.w2_weight_scale],
