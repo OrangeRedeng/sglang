@@ -744,6 +744,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
+            **scale_args13,
             split_item=2,
             group_list_type=1,
             group_type=0,
