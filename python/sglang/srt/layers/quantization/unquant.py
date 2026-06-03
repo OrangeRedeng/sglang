@@ -698,7 +698,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=topk_ids,
-            drop_pad_mode=2,
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
