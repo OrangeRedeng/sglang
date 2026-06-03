@@ -324,6 +324,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 #origin_weight.untyped_storage().resize_(0)
                 setattr(layer, f"{weight_name}", torch.nn.Parameter(weight,requires_grad=False,))
                 layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter((weight_scale.to(torch.bfloat16)),requires_grad=False,))'''
+                print('+++++++++++++++ ONLINE QUANT')
                 weight_fp = getattr(layer, weight_name)
                 qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
                 qwnz = npu_format_cast(qw.transpose(-2, -1))
@@ -332,6 +333,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     f"{weight_name}_scale",
                     torch.nn.Parameter(weight_scale, requires_grad=False)
                 )
+                torch.npu.empty_cache()
         return
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
