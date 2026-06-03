@@ -660,7 +660,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             weight=[layer.w13_weight],
             **scale_args13,
             split_item=2,
-            group_list_type=1,
+            group_list_type=0,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=torch.float16,
