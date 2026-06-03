@@ -326,8 +326,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter((weight_scale.to(torch.bfloat16)),requires_grad=False,))'''
                 weight_fp = getattr(layer, weight_name)
                 qw, weight_scale = torch.ops.npu.npu_dynamic_quant(weight_fp)
-                # Keep original layout – no transpose
-                setattr(layer, weight_name, torch.nn.Parameter(qw.transpose(-2, -1), requires_grad=False))
+                qwnz = npu_format_cast(qw.transpose(-2, -1))
+                setattr(layer, weight_name, torch.nn.Parameter(qwnz, requires_grad=False))
                 layer.register_parameter(
                     f"{weight_name}_scale",
                     torch.nn.Parameter(weight_scale, requires_grad=False)
@@ -639,11 +639,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
-                quant_mode=-1,
+                quant_mode=1,
             )
         )
         
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        # hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
         scale_args13 = {
             "scale": [layer.w13_weight_scale],
             "per_token_scale": [pertoken_scale],
@@ -660,12 +660,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             output_dtype=torch.float16,
         )[0]
 
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        #hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        #hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
 
-        #hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-        #    hidden_states, quant_mode=1, activate_left=True
-        #)
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            hidden_states, quant_mode=1, activate_left=True
+        )
 
         scale_args2 = {
             "scale": [layer.w2_weight_scale],
