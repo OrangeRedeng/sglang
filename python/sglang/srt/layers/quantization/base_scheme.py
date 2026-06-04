@@ -71,29 +71,3 @@ class BaseMoEScheme(ABC):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         raise NotImplementedError
-
-    @abstractmethod
-    def process_weights_after_loading(self, layer: torch.nn.Module):
-        """
-        Called after weight loading is complete for any cleanup that
-        needs to occur.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ):
-        """
-        Run the forward pass for the particular scheme. This is where
-        scheme-specific dequant/quant steps/kernels should be applied.
-
-        :param layer: torch.nn.Module with the registered weights and
-            other parameters relevant to the particular scheme.
-        :param x: input to the layer
-        :param bias: bias parameter
-
-        """
-        raise NotImplementedError
