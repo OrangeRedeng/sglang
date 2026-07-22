@@ -2111,6 +2111,22 @@ def _a2a_ep_size(view: Any) -> dict:
 
 
 @register_post_process
+def _npu_eplb_deepep_mode(view: Any) -> dict:
+    if (
+        view.device == "npu"
+        and view.enable_eplb
+        and view.moe_a2a_backend == "deepep"
+        and view.deepep_mode == "auto"
+    ):
+        logger.warning(
+            "DeepEP auto mode is not supported with EPLB on NPU; "
+            "falling back to deepep_mode='normal'."
+        )
+        return {"deepep_mode": "normal"}
+    return {}
+
+
+@register_post_process
 def _pipeline_parallel_overlap_disable(view: Any) -> dict:
     if view.pp_size > 1:
         logger.warning("Pipeline parallelism is incompatible with overlap schedule.")

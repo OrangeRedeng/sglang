@@ -2223,7 +2223,10 @@ class ServerArgs:
     ] = "default"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
-        "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        Arg(
+            help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+            resolvable=True,
+        ),
         NS("exec.moe"),
     ] = "auto"
     fuseep_mode: A[
@@ -6267,19 +6270,22 @@ class ServerArgs:
             _a2a_backend_overrides,
             _a2a_ep_size,
             _a2a_fusion_adjustments,
+            _npu_eplb_deepep_mode,
             resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _a2a_backend_overrides)
         run_post_process_pass(self, _a2a_ep_size)
+        run_post_process_pass(self, _npu_eplb_deepep_mode)
 
         # The a2a-driven shared-experts fusion adjustments moved to the
         # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
-        a2a_backend = resolved_view(self).moe_a2a_backend
+        view = resolved_view(self)
+        a2a_backend = view.moe_a2a_backend
         if self.enable_waterfill:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
@@ -6293,7 +6299,7 @@ class ServerArgs:
             )
 
         if a2a_backend == "deepep":
-            if self.deepep_mode == "normal":
+            if view.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
