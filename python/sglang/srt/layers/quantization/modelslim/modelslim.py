@@ -423,6 +423,21 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
 
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+        self.quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            w13_weight_offset=layer.w13_weight_offset,
+            w2_weight_offset=layer.w2_weight_offset,
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -472,18 +487,4 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-        quant_info = AscendQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
-            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
-            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
-            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
-            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
-        )
-        return self.runner.run(dispatch_output, quant_info)
+        return self.runner.run(dispatch_output, self.quant_info)

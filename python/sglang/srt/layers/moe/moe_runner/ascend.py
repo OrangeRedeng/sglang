@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
@@ -86,6 +87,8 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        self.w13_apply = config.layer.w13_kernel.apply
+        self.w2_apply = kernel.apply
 
         if get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
@@ -93,6 +96,7 @@ class AscendRunnerCore(MoeRunnerCore):
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
             self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
+            self.is_deepep_activation = True
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
@@ -118,6 +122,107 @@ class AscendRunnerCore(MoeRunnerCore):
                 self.activation = AllGatherActivationWrapper(inner, dim=-1)
             else:
                 self.activation = inner
+            self.is_deepep_activation = False
+
+    def _run_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor],
+        expert_tokens: torch.Tensor,
+        group_list_type: int,
+        quant_info: AscendQuantInfo,
+    ) -> torch.Tensor:
+        original_dtype = (
+            torch.float16
+            if hidden_states.dtype == torch.float16
+            else torch.bfloat16
+        )
+
+        hidden_states = self.w13_apply(
+            quant_info,
+            hidden_states,
+            expert_tokens,
+            pertoken_scale=hidden_states_scale,
+            output_dtype=original_dtype,
+            weight_prefix="w13",
+            group_list_type=group_list_type,
+        )
+
+        if self.is_deepep_activation:
+            hidden_states, pertoken_scale = self.activation._apply_activation(
+                hidden_states,
+                group_list=expert_tokens,
+                group_list_type=group_list_type,
+            )
+        else:
+            hidden_states, pertoken_scale = self.activation._apply_activation(
+                hidden_states
+            )
+
+        return self.w2_apply(
+            quant_info,
+            hidden_states,
+            expert_tokens,
+            pertoken_scale=pertoken_scale,
+            output_dtype=original_dtype,
+            weight_prefix="w2",
+            group_list_type=group_list_type,
+        )
+
+    def run_from_dispatch(
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: AscendQuantInfo,
+        config: MoeRunnerConfig,
+        hooks: Optional[Any] = None,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+            AscendTPCombineInput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLCombineInput,
+            DeepEPNormalCombineInput,
+        )
+
+        if DispatchOutputChecker.format_is_ascend_tp(dispatch_output):
+            hidden_states = self._run_hidden_states(
+                dispatch_output.hidden_states,
+                dispatch_output.hidden_states_scale,
+                dispatch_output.expert_tokens,
+                dispatch_output.group_list_type,
+                quant_info,
+            )
+            return AscendTPCombineInput(hidden_states=hidden_states)
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            group_list = torch.tensor(
+                dispatch_output.num_recv_tokens_per_expert,
+                dtype=torch.int64,
+                device=dispatch_output.hidden_states.device,
+            )
+            combine_cls = DeepEPNormalCombineInput
+        elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            group_list = dispatch_output.masked_m.to(torch.int64)
+            combine_cls = DeepEPLLCombineInput
+        else:
+            raise ValueError(
+                "Unsupported dispatch format for Ascend runner: "
+                f"{dispatch_output.format}"
+            )
+
+        hidden_states = self._run_hidden_states(
+            dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
+            group_list,
+            1,
+            quant_info,
+        )
+        return combine_cls(
+            hidden_states=hidden_states,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     def run(
         self,
@@ -129,44 +234,12 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
-        x = runner_input.hidden_states
-        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
-        expert_tokens = runner_input.expert_tokens
-        group_list_type = runner_input.group_list_type
-
-        # --- w13 (gate & up) projection ---
-        hidden_states = self.config.layer.w13_kernel.apply(
+        hidden_states = self._run_hidden_states(
+            runner_input.hidden_states,
+            runner_input.hidden_states_scale,
+            runner_input.expert_tokens,
+            runner_input.group_list_type,
             quant_info,
-            x,
-            expert_tokens,
-            pertoken_scale=runner_input.hidden_states_scale,
-            output_dtype=original_dtype,
-            weight_prefix="w13",
-            group_list_type=group_list_type,
-        )
-
-        # --- Activation ---
-        # The DeepEP kernel expects extra dispatch metadata
-        if isinstance(self.activation, NPUSwigluDeepEPKernel):
-            hidden_states, pertoken_scale = self.activation._apply_activation(
-                hidden_states,
-                group_list=expert_tokens,
-                group_list_type=group_list_type,
-            )
-        else:
-            hidden_states, pertoken_scale = self.activation._apply_activation(
-                hidden_states
-            )
-
-        # --- w2 (down) projection ---
-        hidden_states = self.config.layer.w2_kernel.apply(
-            quant_info,
-            hidden_states,
-            expert_tokens,
-            pertoken_scale=pertoken_scale,
-            output_dtype=original_dtype,
-            weight_prefix="w2",
-            group_list_type=group_list_type,
         )
         return AscendRunnerOutput(hidden_states=hidden_states)
 
