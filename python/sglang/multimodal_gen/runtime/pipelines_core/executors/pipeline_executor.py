@@ -152,6 +152,21 @@ class PipelineExecutor(ABC):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
+    def execute_group_sequentially_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Run the AR stage as a group, then yield each completed DiT request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                yield from self.execute_group_sequentially(
+                    stages,
+                    batches,
+                    server_args,
+                )
+
     @staticmethod
     @contextlib.contextmanager
     def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
@@ -244,6 +259,31 @@ class PipelineExecutor(ABC):
         for stage in stages:
             batches = stage.run_grouped_requests(batches, server_args)
         return batches
+
+    def execute_group_sequentially(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Yield outputs after batched AR and per-request DiT/VAE inference."""
+        batches = self.execute_group(stages[:1], batches, server_args)
+
+        remaining_stages = stages[1:]
+        for batch in batches:
+            try:
+                yield self.execute(remaining_stages, batch, server_args)
+            except Exception as e:
+                logger.error(
+                    "Per-request DiT/VAE inference failed for request %s: %s",
+                    batch.request_id,
+                    e,
+                    exc_info=True,
+                )
+                yield OutputBatch(
+                    error=f"Error executing grouped request {batch.request_id}: {e}",
+                    metrics=batch.metrics,
+                )
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):

@@ -1,7 +1,7 @@
 import inspect
 import re
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -214,6 +214,86 @@ class GlmImageAR(PipelineStage):
         token_ids = token_ids.reshape(1, -1)
         return token_ids
 
+    @staticmethod
+    def _external_ar_sampling_params(max_new_tokens: int, seed: Optional[int]):
+        sampling_params = {
+            "temperature": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        }
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
+        return sampling_params
+
+    @staticmethod
+    def _request_external_ar(payload: dict, server_args: ServerArgs):
+        try:
+            response = requests.post(
+                server_args.srt_encoder_url + "/generate",
+                json=payload,
+                timeout=(
+                    server_args.srt_encoder_connect_timeout,
+                    server_args.srt_encoder_timeout,
+                ),
+            )
+            response.raise_for_status()
+        except requests.ConnectTimeout as e:
+            logger.error(
+                "Connection timeout to SGLang encoder (%s). Try to increase "
+                "--srt-encoder-connection-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_connect_timeout,
+                e,
+            )
+            raise
+        except requests.ReadTimeout as e:
+            logger.error(
+                "Read timeout from SGLang encoder (%s). Try to increase "
+                "--srt-encoder-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_timeout,
+                e,
+            )
+            raise
+        except requests.ConnectionError as e:
+            logger.error(
+                "Failed to connect to SGLang encoder at %s: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        except requests.RequestException as e:
+            logger.error(
+                "SGLang encoder request to %s failed: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        return response.json()
+
+    def _extract_prior_token_ids(
+        self,
+        generated_ids: Any,
+        generation_shape: tuple[int, int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        large_image_offset, token_h, token_w = generation_shape
+        expected_output_len = large_image_offset + token_h * token_w
+        actual_output_len = 0 if generated_ids is None else len(generated_ids)
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={large_image_offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
+
+        prior_token_ids_d32 = torch.tensor(
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
+            device=device,
+        )
+        return self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+
     def generate_prior_tokens(
         self,
         prompt: str,
@@ -222,6 +302,7 @@ class GlmImageAR(PipelineStage):
         server_args: ServerArgs,
         image: Optional[List[PIL.Image.Image]] = None,
         factor: int = 32,
+        seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, int, int]:
         """
         Generate prior tokens using the AR (vision_language_encoder) model.
@@ -281,56 +362,11 @@ class GlmImageAR(PipelineStage):
             payload = {
                 "input_ids": inputs["input_ids"][0].tolist(),
                 "image_data": [{"image_grid_thw": image_grid_thw.tolist()}],
-                "sampling_params": {
-                    "temperature": 1.0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
+                "sampling_params": self._external_ar_sampling_params(
+                    max_new_tokens, seed
+                ),
             }
-            try:
-                response = requests.post(
-                    server_args.srt_encoder_url + "/generate",
-                    json=payload,
-                    timeout=(
-                        server_args.srt_encoder_connect_timeout,
-                        server_args.srt_encoder_timeout,
-                    ),
-                )
-            except requests.ConnectionError as e:
-                logger.error(
-                    "Failed to establish a connection to SGLang encoder server at %s. "
-                    "Verify that the AR model server is running and accessible. Error details: %s",
-                    server_args.srt_encoder_url,
-                    e,
-                )
-                raise
-            except requests.ConnectTimeout as e:
-                logger.error(
-                    "Connection timeout to SGLang encoder (%s). Try to increase --srt-encoder-connection-timeout (current: %s sec). Details: %s",
-                    server_args.srt_encoder_url,
-                    server_args.srt_encoder_connect_timeout,
-                    e,
-                )
-                raise
-            except requests.ReadTimeout as e:
-                logger.error(
-                    "Read timeout from SGLang encoder (%s). Try to increase --srt-encoder-timeout (current: %s sec). Details: %s",
-                    server_args.srt_encoder_url,
-                    server_args.srt_encoder_timeout,
-                    e,
-                )
-                raise
-            except requests.RequestException as e:
-                logger.error(
-                    "An error occurred during communication with SGLang encoder server at %s. "
-                    "The server is reachable, but the request failed. Error type: %s, Details: %s",
-                    server_args.srt_encoder_url,
-                    type(e).__name__,
-                    e,
-                )
-                raise
-
-            data = response.json()
+            data = self._request_external_ar(payload, server_args)
             generated_ids = data.get("output_ids")
         else:
             if image is not None:
@@ -367,26 +403,127 @@ class GlmImageAR(PipelineStage):
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = outputs[0][input_len:]
 
-        expected_output_len = large_image_offset + token_h * token_w
-        actual_output_len = 0 if generated_ids is None else len(generated_ids)
-        if actual_output_len < expected_output_len:
-            raise RuntimeError(
-                "GLM-Image AR returned too few output_ids: "
-                f"got {actual_output_len}, need at least {expected_output_len} "
-                f"(large_image_offset={large_image_offset}, "
-                f"token_h={token_h}, token_w={token_w})."
-            )
-
-        # Extract large image tokens + upsample D32→D16
-        prior_token_ids_d32 = torch.tensor(
-            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
-            device=device,
-        )
-        prior_token_ids = self._upsample_token_ids(
-            prior_token_ids_d32, token_h, token_w
+        prior_token_ids = self._extract_prior_token_ids(
+            generated_ids,
+            (large_image_offset, token_h, token_w),
+            device,
         )
 
         return prior_token_ids, prior_token_image_ids
+
+    def generate_prior_tokens_batch(
+        self,
+        prompts: list[str],
+        seeds: list[Optional[int]],
+        height: int,
+        width: int,
+        server_args: ServerArgs,
+        factor: int = 32,
+    ) -> list[torch.Tensor]:
+        device = get_local_torch_device()
+        height = (height // factor) * factor
+        width = (width // factor) * factor
+
+        input_ids = []
+        image_data = []
+        sampling_params = []
+        generation_shapes = []
+        for prompt, seed in zip(prompts, seeds, strict=True):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                target_h=height,
+                target_w=width,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            image_grid_thw = inputs.get("image_grid_thw")
+            max_new_tokens, large_image_offset, token_h, token_w = (
+                self._compute_generation_params(
+                    image_grid_thw=image_grid_thw,
+                    is_text_to_image=True,
+                )
+            )
+            input_ids.append(inputs["input_ids"][0].tolist())
+            image_data.append([{"image_grid_thw": image_grid_thw.tolist()}])
+            sampling_params.append(
+                self._external_ar_sampling_params(max_new_tokens, seed)
+            )
+            generation_shapes.append((large_image_offset, token_h, token_w))
+
+        payload = {
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "sampling_params": sampling_params,
+        }
+        data = self._request_external_ar(payload, server_args)
+        if not isinstance(data, list) or len(data) != len(prompts):
+            raise RuntimeError(
+                "GLM-Image AR batch returned an unexpected response: "
+                f"expected {len(prompts)} outputs, got "
+                f"{len(data) if isinstance(data, list) else type(data).__name__}."
+            )
+
+        prior_token_ids = []
+        for item, generation_shape in zip(data, generation_shapes, strict=True):
+            prior_token_ids.append(
+                self._extract_prior_token_ids(
+                    item.get("output_ids"), generation_shape, device
+                )
+            )
+        return prior_token_ids
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str)
+                and batch.image_path is None
+                and _num_outputs_per_prompt(batch) == 1
+                for batch in batches
+            )
+        )
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        start_time = time.time()
+        prior_token_ids = self.generate_prior_tokens_batch(
+            prompts=[batch.prompt for batch in batches],
+            seeds=[_seed_for_output(batch.seed, 0) for batch in batches],
+            height=height,
+            width=width,
+            server_args=server_args,
+        )
+        duration = time.time() - start_time
+        logger.info(
+            "generate_prior_tokens_batch time: %.3fs for %d requests",
+            duration,
+            len(batches),
+        )
+
+        stage_name = self._active_profile_stage_name()
+        for batch, prior_token_id in zip(batches, prior_token_ids, strict=True):
+            batch.prior_token_id = prior_token_id
+            batch.prior_token_image_ids = None
+            if batch.metrics is not None:
+                batch.metrics.record_stage(stage_name, duration)
+        return batches
 
     @torch.no_grad()
     def forward(
@@ -451,6 +588,7 @@ class GlmImageAR(PipelineStage):
                             height=height,
                             width=width,
                             server_args=server_args,
+                            seed=output_seed,
                         )
                     )
             prior_token_ids.append(prior_token_id)
