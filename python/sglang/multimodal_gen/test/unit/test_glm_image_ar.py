@@ -36,6 +36,14 @@ class _FakeResponse:
         return {"output_ids": self._output_ids}
 
 
+class _FakeBatchResponse:
+    def __init__(self, output_ids_batch):
+        self._output_ids_batch = output_ids_batch
+
+    def json(self):
+        return [{"output_ids": output_ids} for output_ids in self._output_ids_batch]
+
+
 class TestGlmImageARSrtBackend(unittest.TestCase):
     def _server_args(self):
         return SimpleNamespace(
@@ -96,6 +104,55 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
                 width=1024,
                 server_args=self._server_args(),
             )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.get_local_torch_device",
+        return_value=torch.device("cuda"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.requests.post"
+    )
+    def test_grouped_srt_ar_keeps_prefetch_tokens_on_cpu(self, mock_post, _mock_device):
+        set_global_server_args(self._server_args())
+        mock_post.return_value = _FakeBatchResponse(
+            [list(range(1025)), list(range(1025, 2050))]
+        )
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        batches = [
+            SimpleNamespace(
+                prompt="A simple product sketch",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=42,
+                height=1024,
+                width=1024,
+                metrics=None,
+            ),
+            SimpleNamespace(
+                prompt="A bright package mockup",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=43,
+                height=1024,
+                width=1024,
+                metrics=None,
+            ),
+        ]
+
+        prepared = stage.run_grouped_requests(batches, self._server_args())
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(len(payload["input_ids"]), 2)
+        self.assertEqual(len(payload["sampling_params"]), 2)
+        self.assertEqual(
+            [batch.prior_token_id.device.type for batch in prepared], ["cpu", "cpu"]
+        )
+        self.assertEqual(
+            [batch.prior_token_id.shape for batch in prepared],
+            [(1, 4096), (1, 4096)],
+        )
 
 
 if __name__ == "__main__":

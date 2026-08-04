@@ -419,8 +419,9 @@ class GlmImageAR(PipelineStage):
         width: int,
         server_args: ServerArgs,
         factor: int = 32,
+        device: Optional[torch.device] = None,
     ) -> list[torch.Tensor]:
-        device = get_local_torch_device()
+        device = device or get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
 
@@ -509,6 +510,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
+            device=torch.device("cpu"),
         )
         duration = time.time() - start_time
         logger.info(
