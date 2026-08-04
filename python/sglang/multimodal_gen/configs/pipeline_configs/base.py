@@ -414,6 +414,12 @@ class PipelineConfig:
 
     def supports_async_ar_prefetch(self):
         """Return whether grouped AR preparation can safely run off-thread."""
+
+        return False
+
+    def supports_sequential_multi_output_inference(self):
+        """Return whether one request's outputs run through DiT/VAE sequentially."""
+
         return False
 
     def estimate_request_cost(self, batch) -> float:
