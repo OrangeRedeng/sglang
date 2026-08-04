@@ -485,24 +485,45 @@ class GlmImageAR(PipelineStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        can_batch_ar = (
-            len(batches) > 1
-            and server_args.srt_encoder_url is not None
-            and all(
-                isinstance(batch.prompt, str)
-                and batch.image_path is None
-                and _num_outputs_per_prompt(batch) == 1
-                for batch in batches
-            )
-        )
-        if not can_batch_ar:
+        if len(batches) <= 1 or not self.can_prepare_external_ar_group(
+            batches, server_args
+        ):
             return super().run_grouped_requests(batches, server_args)
+        return self.prepare_external_ar_group(batches, server_args)
+
+    @staticmethod
+    def can_prepare_external_ar_group(
+        batches: list[Req], server_args: ServerArgs
+    ) -> bool:
+        if server_args.srt_encoder_url is None:
+            return False
+        if not batches:
+            return False
+        if not all(
+            isinstance(batch.prompt, str)
+            and batch.image_path is None
+            and _num_outputs_per_prompt(batch) == 1
+            for batch in batches
+        ):
+            return False
+        height = batches[0].height
+        width = batches[0].width
+        return not any(
+            batch.height != height or batch.width != width for batch in batches[1:]
+        )
+
+    def prepare_external_ar_group(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        if not self.can_prepare_external_ar_group(batches, server_args):
+            raise ValueError(
+                "GLM-Image external AR prefetch received incompatible requests"
+            )
 
         height = batches[0].height
         width = batches[0].width
-        if any(batch.height != height or batch.width != width for batch in batches[1:]):
-            return super().run_grouped_requests(batches, server_args)
-
         start_time = time.time()
         prior_token_ids = self.generate_prior_tokens_batch(
             prompts=[batch.prompt for batch in batches],

@@ -412,6 +412,10 @@ class PipelineConfig:
         """Return whether batched AR is followed by per-request DiT inference."""
         return False
 
+    def supports_async_ar_prefetch(self):
+        """Return whether grouped AR preparation can safely run off-thread."""
+        return False
+
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
 

@@ -59,6 +59,10 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_sequential_dit_inference(self):
         return True
 
+    def supports_async_ar_prefetch(self):
+        server_args = get_global_server_args()
+        return server_args.srt_encoder_url is not None
+
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
