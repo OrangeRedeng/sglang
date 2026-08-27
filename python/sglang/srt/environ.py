@@ -867,6 +867,10 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Opt in to MXFP8 Q/K/V quantization and FA-v2 for diffusion self-attention.
+    SGLANG_ENABLE_DIFFUSION_MXFP8_ATTN = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_DIFFUSION_FA_MXFP8"
+    )
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
