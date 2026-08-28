@@ -318,6 +318,7 @@ class AscendFAImpl(AttentionImpl):
             and not self._is_cross_attention
             and query.shape[1:3] == key.shape[1:3]
             and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
         ):
             batch_size, query_length, num_heads, head_size = query.shape
             key_length = key.shape[1]
@@ -388,6 +389,7 @@ class AscendFAImpl(AttentionImpl):
             and not self.causal
             and query.shape[1:] == key.shape[1:]
             and key.shape == value.shape
+            and query.shape[0] % 64 == 0
         ):
             boundaries = _packed_boundaries(
                 cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
@@ -457,20 +459,10 @@ class AscendFAImpl(AttentionImpl):
                 "MXFP8 attention does not support returning softmax LSE"
             )
 
+        logger.info_once("Using online MXFP8 quantized Ascend Flash Attention.")
         rotation = self._get_rotation(query.device, query.dtype)
         query = torch.matmul(query, rotation)
         key = torch.matmul(key, rotation)
-
-        # Value scales pack pairs of 32-token MX blocks. Keep tail padding
-        # outside the logical sequences described by actual_seq_kvlen.
-        kv_padding = (-key.shape[0]) % 64
-        if kv_padding:
-            key = torch.cat(
-                (key, key.new_zeros((kv_padding, *key.shape[1:]))), dim=0
-            )
-            value = torch.cat(
-                (value, value.new_zeros((kv_padding, *value.shape[1:]))), dim=0
-            )
 
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
