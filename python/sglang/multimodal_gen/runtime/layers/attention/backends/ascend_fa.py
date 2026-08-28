@@ -265,6 +265,7 @@ class AscendFAImpl(AttentionImpl):
             self._head_size = head_size
             self._ensure_rot_matrix(head_size)
             self._rot_device: torch.Tensor | None = None
+            self._p_scale_device: torch.Tensor | None = None
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -295,6 +296,13 @@ class AscendFAImpl(AttentionImpl):
                 device=device, dtype=dtype
             )
         return self._rot_device
+
+    def _get_p_scale(self, device: torch.device) -> torch.Tensor:
+        if self._p_scale_device is None or self._p_scale_device.device != device:
+            self._p_scale_device = torch.ones(
+                (1,), dtype=torch.float32, device=device
+            )
+        return self._p_scale_device
 
     def forward(
         self,
@@ -346,8 +354,8 @@ class AscendFAImpl(AttentionImpl):
             ).bool()[None]
         # transpose to bs, heads, seq_len, head_dim
         query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
         output, lse = torch.ops.npu.npu_fused_infer_attention_score(
             query,
             key,
@@ -531,6 +539,7 @@ class AscendFAImpl(AttentionImpl):
             dequant_scale_query_dtype=scale_dtype,
             dequant_scale_key_dtype=scale_dtype,
             dequant_scale_value_dtype=scale_dtype,
+            quant_scale_p=self._get_p_scale(query.device),
             out_dtype=query.dtype,
         )[0]
 
