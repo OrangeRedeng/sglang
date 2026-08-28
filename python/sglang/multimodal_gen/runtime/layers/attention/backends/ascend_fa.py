@@ -461,6 +461,17 @@ class AscendFAImpl(AttentionImpl):
         query = torch.matmul(query, rotation)
         key = torch.matmul(key, rotation)
 
+        # Value scales pack pairs of 32-token MX blocks. Keep tail padding
+        # outside the logical sequences described by actual_seq_kvlen.
+        kv_padding = (-key.shape[0]) % 64
+        if kv_padding:
+            key = torch.cat(
+                (key, key.new_zeros((kv_padding, *key.shape[1:]))), dim=0
+            )
+            value = torch.cat(
+                (value, value.new_zeros((kv_padding, *value.shape[1:]))), dim=0
+            )
+
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         if num_heads != num_kv_heads:
