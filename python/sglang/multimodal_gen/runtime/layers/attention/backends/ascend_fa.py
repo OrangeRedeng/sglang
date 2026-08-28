@@ -379,7 +379,7 @@ class AscendFAImpl(AttentionImpl):
         if (
             self._quant_scheme == "MXFP8"
             and not self.causal
-            and query.shape[1:] == key.shape[1:]
+            and query.shape == key.shape
             and key.shape == value.shape
             and query.shape[0] % 64 == 0
         ):
