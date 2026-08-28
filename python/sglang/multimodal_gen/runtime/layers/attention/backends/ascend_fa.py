@@ -502,6 +502,9 @@ class AscendFAImpl(AttentionImpl):
         params = self._MXFP8_FA_PARAMS
         quant_dtype = torch.float8_e4m3fn
         scale_dtype = torch_npu.float8_e8m0fnu
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
         query_fp8, query_scale = torch_npu.npu_dynamic_mx_quant(
             query, dst_type=quant_dtype, axis=params["qk_quant_axis"]
         )
