@@ -233,9 +233,9 @@ class AscendFABackend(AttentionBackend):
 class AscendFAImpl(AttentionImpl):
 
     _MXFP8_FA_PARAMS = {
-        "q_quant_mode": 7,
-        "k_quant_mode": 7,
-        "v_quant_mode": 7,
+        "q_quant_mode": 6,
+        "k_quant_mode": 6,
+        "v_quant_mode": 8,
         "qk_quant_axis": -1,
         "v_quant_axis": 0,
         "layout": "TND",
@@ -498,6 +498,7 @@ class AscendFAImpl(AttentionImpl):
     ) -> torch.Tensor:
         params = self._MXFP8_FA_PARAMS
         quant_dtype = torch.float8_e4m3fn
+        scale_dtype = torch_npu.float8_e8m0fnu
         query_fp8, query_scale = torch_npu.npu_dynamic_mx_quant(
             query, dst_type=quant_dtype, axis=params["qk_quant_axis"]
         )
@@ -507,11 +508,6 @@ class AscendFAImpl(AttentionImpl):
         value_fp8, value_scale = torch_npu.npu_dynamic_mx_quant(
             value, dst_type=quant_dtype, axis=params["v_quant_axis"]
         )
-        # Some FA-v2 builds expose MXFP8 inputs but classify these scale
-        # layouts as per-block quantization, whose dequant scales must be FP32.
-        query_scale = query_scale.float()
-        key_scale = key_scale.float()
-        value_scale = value_scale.float()
         return torch_npu.npu_fused_infer_attention_score_v2(
             query_fp8,
             key_fp8,
@@ -532,9 +528,9 @@ class AscendFAImpl(AttentionImpl):
             query_dtype=quant_dtype,
             key_dtype=quant_dtype,
             value_dtype=quant_dtype,
-            dequant_scale_query_dtype=torch.float32,
-            dequant_scale_key_dtype=torch.float32,
-            dequant_scale_value_dtype=torch.float32,
+            dequant_scale_query_dtype=scale_dtype,
+            dequant_scale_key_dtype=scale_dtype,
+            dequant_scale_value_dtype=scale_dtype,
             out_dtype=query.dtype,
         )[0]
 
