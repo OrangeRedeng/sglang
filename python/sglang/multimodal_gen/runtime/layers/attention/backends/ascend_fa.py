@@ -233,9 +233,9 @@ class AscendFABackend(AttentionBackend):
 class AscendFAImpl(AttentionImpl):
 
     _MXFP8_FA_PARAMS = {
-        "q_quant_mode": 6,
-        "k_quant_mode": 6,
-        "v_quant_mode": 8,
+        "q_quant_mode": 7,
+        "k_quant_mode": 7,
+        "v_quant_mode": 7,
         "qk_quant_axis": -1,
         "v_quant_axis": 0,
         "layout": "TND",
