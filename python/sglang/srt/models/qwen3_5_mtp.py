@@ -16,14 +16,12 @@
 
 import copy
 import logging
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -35,7 +33,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    get_model,
     get_parallel,
     get_spec,
 )
@@ -69,21 +66,35 @@ def _mtp_quant_config(quant_config):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Some Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module
+    # entirely in bf16, listing every `mtp.*` layer under the quantization
+    # exclude list. Skip quantization for those so linear/MoE weight loaders
+    # allocate bf16 shapes (see sgl-project/sglang#23146).
+    #
+    # Others are mixed: the routed experts stay MXFP4 while attention, the
+    # shared expert and fc are excluded. Skipping there would make the MoE
+    # loader allocate bf16 experts that the MXFP4 checkpoint shards no longer
+    # fit. The routed experts are the bulk of the draft, so use them as the
+    # signal and skip only when they are excluded too; the per-layer
+    # exclusions keep the remaining bf16 modules bf16 on their own.
     if quant_config and quant_config.get_name() == "quark":
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+        mtp_excludes = [
+            layer
+            for layer in getattr(quant_config, "exclude_layers", [])
+            if isinstance(layer, str) and layer.startswith("mtp.")
+        ]
+        if mtp_excludes and any("mlp.experts" in layer for layer in mtp_excludes):
             return None
     return quant_config
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # The loader reads this off the model class and hands it to the quant
+    # config, which needs it to expand fused module names (qkv_proj ->
+    # q/k/v_proj) before matching them against an exclude list. Without it an
+    # excluded attention projection is not recognised as excluded.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
@@ -181,65 +192,50 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        exit_stack = ExitStack()
+        assert input_embeds is None
+        input_embeds = forward_batch.mm_input_embeds
         if (
-            is_npu()
-            and self.quant_config is None
-            and get_model().quantization is not None
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            assert input_embeds is not None
+            last_indices = (
+                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            ).long()
+            input_embeds[last_indices] = self.model.embed_tokens(
+                input_ids[last_indices]
             )
 
-        try:
-            assert input_embeds is None
-            input_embeds = forward_batch.mm_input_embeds
-            if (
-                forward_batch.forward_mode.is_extend()
-                and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend_v2()
-            ):
-                assert input_embeds is not None
-                last_indices = (
-                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
-                ).long()
-                input_embeds[last_indices] = self.model.embed_tokens(
-                    input_ids[last_indices]
-                )
+        if input_embeds is None:
+            input_embeds = self.model.embed_tokens(input_ids)
 
-            if input_embeds is None:
-                input_embeds = self.model.embed_tokens(input_ids)
+        hidden_states = forward_batch.spec_info.hidden_states
 
-            hidden_states = forward_batch.spec_info.hidden_states
+        if not forward_batch.forward_mode.is_idle():
+            input_embeds = self.pre_fc_norm_embedding(input_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        # Captured prefill gives padded embeddings but real-height target states;
+        # place the real rows in an equal-height slot whose padding stays unread.
+        if hidden_states.shape[0] != input_embeds.shape[0]:
+            rows = min(hidden_states.shape[0], input_embeds.shape[0])
+            slot = hidden_states.new_zeros(
+                (input_embeds.shape[0], hidden_states.shape[1])
+            )
+            slot[:rows] = hidden_states[:rows]
+            hidden_states = slot
 
-            if not forward_batch.forward_mode.is_idle():
-                input_embeds = self.pre_fc_norm_embedding(input_embeds)
-                hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            # Captured prefill gives padded embeddings but real-height target states;
-            # place the real rows in an equal-height slot whose padding stays unread.
-            if hidden_states.shape[0] != input_embeds.shape[0]:
-                rows = min(hidden_states.shape[0], input_embeds.shape[0])
-                slot = hidden_states.new_zeros(
-                    (input_embeds.shape[0], hidden_states.shape[1])
-                )
-                slot[:rows] = hidden_states[:rows]
-                hidden_states = slot
+        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
 
-            hidden_states = self.fc(hidden_states)
-
-            with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states = self.model(
-                    input_ids,
-                    positions,
-                    forward_batch,
-                    hidden_states,
-                )
-        finally:
-            exit_stack.close()
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

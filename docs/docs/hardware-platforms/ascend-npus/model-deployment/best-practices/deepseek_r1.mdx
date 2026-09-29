@@ -98,7 +98,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=4000
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -151,7 +150,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -273,13 +271,12 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export DEEPEP_HCCL_BUFFSIZE=2000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
@@ -405,7 +402,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -458,7 +454,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -610,7 +605,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -665,7 +659,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_LM_HEAD_TP=8
         export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
@@ -815,7 +808,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -868,7 +860,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1018,7 +1009,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1071,7 +1061,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1221,7 +1210,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1273,7 +1261,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 

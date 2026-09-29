@@ -13,7 +13,7 @@ import torch
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=5, suite="base-a-test-npu")
 
 # Mock NPU-only modules before importing the source module, so the file
 # imports on non-NPU machines. Skipped on real NPU hosts: a MagicMock parent
@@ -167,6 +167,7 @@ class TestForwardMetadata(unittest.TestCase):
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
+            "dcp_local_block_tables",
         }
         self.assertEqual(names, expected)
 
@@ -810,86 +811,6 @@ class TestGenerateAlibiBias(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(result.dtype, torch.bfloat16)
-
-
-class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
-    def test_returns_zero(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertEqual(backend.get_cuda_graph_seq_len_fill_value(), 0)
-
-
-class TestGetVerifyBuffers(unittest.TestCase):
-    def test_no_verify_mask(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertIsNone(backend.verify_mask)
-
-    def test_update_is_noop(self):
-        backend = object.__new__(AscendAttnBackend)
-        backend.update_verify_buffers_to_fill_after_draft(None, None)
-        backend.update_verify_buffers_to_fill_after_draft(MagicMock(), 4)
-        backend.update_verify_buffers_to_fill_after_draft(None, 16)
-
-
-class TestCommonTemplate(unittest.TestCase):
-    @staticmethod
-    def _make_draft_backend(speculative_num_steps):
-        backend = object.__new__(AscendAttnMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
-        return backend
-
-    def test_calls_fn_for_each_step(self):
-        """call_fn is invoked for steps 0..speculative_num_steps-2."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 3)
-        for i in range(3):
-            call_fn.assert_any_call(i, forward_batch)
-
-    def test_zero_steps(self):
-        """speculative_num_steps=1 -> no calls (range(0))."""
-        backend = self._make_draft_backend(speculative_num_steps=1)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_not_called()
-
-    def test_two_steps(self):
-        """speculative_num_steps=2 -> exactly one call with index 0."""
-        backend = self._make_draft_backend(speculative_num_steps=2)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_called_once_with(0, forward_batch)
-
-    def test_call_indices(self):
-        backend = self._make_draft_backend(speculative_num_steps=5)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        indices = []
-        backend.common_template(forward_batch, lambda i, fb: indices.append(i))
-        self.assertEqual(indices, [0, 1, 2, 3])
-
-    def test_assert_spec_info_not_none(self):
-        """Raises AssertionError when forward_batch.spec_info is None."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = None
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, MagicMock())
-
-    def test_passes_same_forward_batch(self):
-        backend = self._make_draft_backend(speculative_num_steps=3)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        for call in call_fn.call_args_list:
-            self.assertIs(call.args[1], forward_batch)
 
 
 if __name__ == "__main__":

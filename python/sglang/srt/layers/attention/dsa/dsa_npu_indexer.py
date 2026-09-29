@@ -7,7 +7,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -199,7 +198,7 @@ def _build_indexer_query_shard(
 
 
 def _get_indexer_query_shard(
-    forward_batch: ForwardBatch, num_tokens: int, layer_scatter_modes
+    forward_batch: ForwardBatch, num_tokens: int
 ) -> Optional[_IndexerQueryShard]:
     """The query shard for a prefill indexer call, or None to score every row.
 
@@ -214,17 +213,6 @@ def _get_indexer_query_shard(
     Planned once per forward. Every input to the decision is identical across
     the attention-TP group, so all ranks take the collective or none do.
     """
-    if (
-        layer_scatter_modes is not None
-        and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
-    ):
-        # The plan assumes this rank was handed the whole batch, which is what
-        # TP_ATTN_FULL means; any other mode would slice a slice.
-        print_info_once(
-            "DSA indexer query sharding is off: attention scatter mode is "
-            f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
-        )
-        return None
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
         forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
             forward_batch
@@ -288,7 +276,7 @@ class DSANPUIndexerMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        layer_scatter_modes=None,
+        input_on_attention_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
@@ -368,11 +356,7 @@ class DSANPUIndexerMixin:
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
-            if (
-                _use_ag_after_qlora
-                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-            ):
+            if _use_ag_after_qlora and input_on_attention_tp_slices:
                 k = scattered_to_tp_attn_full(k, forward_batch)
             k_pe, k_nope = torch.split(
                 k,
@@ -517,11 +501,7 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-        if (
-            _use_ag_after_qlora
-            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-        ):
+        if _use_ag_after_qlora and input_on_attention_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if (
@@ -548,9 +528,7 @@ class DSANPUIndexerMixin:
             query = q.view(-1, self.n_heads, self.head_dim)
             num_query_tokens = query.shape[0]
             shard = (
-                _get_indexer_query_shard(
-                    forward_batch, num_query_tokens, layer_scatter_modes
-                )
+                _get_indexer_query_shard(forward_batch, num_query_tokens)
                 if is_prefill and _shard_indexer_queries
                 else None
             )

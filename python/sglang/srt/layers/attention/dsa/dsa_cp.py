@@ -42,7 +42,6 @@ from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
     cumulative,
     plan_dsa_cp_shard,
 )
-from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
@@ -121,7 +120,6 @@ def dsa_cp_enabled() -> bool:
 
 def get_dsa_cp_plan(
     forward_batch: "ForwardBatch",
-    layer_scatter_modes=None,
     index_topk: Optional[int] = None,
 ) -> Optional[DsaCpPlan]:
     """This forward's token slice for this rank, or None if DSA-CP is off here.
@@ -146,14 +144,12 @@ def get_dsa_cp_plan(
     if cached is not _MISSING:
         return cached
 
-    plan = _build_dsa_cp_plan(forward_batch, layer_scatter_modes, index_topk)
+    plan = _build_dsa_cp_plan(forward_batch, index_topk)
     forward_batch.npu_dsa_cp_plan = plan
     return plan
 
 
-def _build_dsa_cp_plan(
-    forward_batch, layer_scatter_modes, index_topk=None
-) -> Optional[DsaCpPlan]:
+def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
         print_info_once("DSA-CP is off: attention TP size is 1, nothing to shard")
@@ -168,18 +164,6 @@ def _build_dsa_cp_plan(
         print_info_once(
             f"DSA-CP is off for {mode}: the draft and verify paths carry their "
             "own per-step sequence-length tables, which this does not build yet"
-        )
-        return None
-
-    if (
-        layer_scatter_modes is not None
-        and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
-    ):
-        # The slice assumes this rank holds the whole batch (TP_ATTN_FULL);
-        # any other mode would cut a slice twice.
-        print_info_once(
-            "DSA-CP is off: attention scatter mode is "
-            f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
         )
         return None
 
