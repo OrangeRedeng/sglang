@@ -24,10 +24,14 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
+from sglang.srt.layers.dcp.layout import (
+    localize_dcp_indices,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.utils import is_npu
 
 
 def prepare_decode_context_parallel_metadata(
@@ -113,9 +117,18 @@ def prepare_decode_context_parallel_metadata(
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     translator = get_attn_backend().kv_index_translator
-    dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
-        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
-    )
+    if is_npu():
+        local_indices = localize_dcp_indices(
+            dcp_prefix_kv_indices,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            interleave_size=get_attn_backend().page_size,
+        )
+        dcp_local_prefix_kv_indices = local_indices[local_indices >= 0]
+    else:
+        dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
+            dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+        )
     dcp_kv_buffer = torch.empty(
         (
             seq_lens_sum,

@@ -49,10 +49,21 @@ class AscendTPCombineInput(NamedTuple):
 
 
 class AscendTPDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, *, local_ep: bool = False):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self.top_k = moe_runner_config.top_k
+        self.local_ep = local_ep
+        self.active_expert_range = None
+        if local_ep:
+            if moe_runner_config.num_fused_shared_experts:
+                raise ValueError("allreduce-deepep requires separate shared experts")
+            parallel = get_parallel()
+            if parallel.moe_tp_size != 1:
+                raise ValueError("allreduce-deepep requires full-width local experts")
+            num_local = moe_runner_config.num_local_experts
+            start = parallel.moe_ep_rank * num_local
+            self.active_expert_range = [start, start + num_local]
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
@@ -61,6 +72,8 @@ class AscendTPDispatcher(BaseDispatcher):
         self.set_ascend_dispatcher_output_dtype()
 
     def set_quant_config(self, quant_config: dict) -> None:
+        if self.local_ep and quant_config.get("quant_type") == "gguf":
+            raise ValueError("allreduce-deepep does not support GGUF routing")
         self.quant_config = quant_config
         self.set_ascend_dispatcher_output_dtype()
 
@@ -93,6 +106,11 @@ class AscendTPDispatcher(BaseDispatcher):
             raise ValueError(
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
             )
+
+        if self.local_ep:
+            self.init.active_expert_range = self.active_expert_range
+            # Mode 3 zeros filtered routes; mode 2 assumes every route is present.
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=3)
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput

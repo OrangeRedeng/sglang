@@ -68,13 +68,15 @@ def _combinations():
                     yield prefix_lens, extend_lens, dcp_size, piece_rows
 
 
-def _gather(prefix_lens, extend_lens, dcp_size, piece_rows, seed=0):
+def _gather(prefix_lens, extend_lens, dcp_size, piece_rows, seed=0, interleave_size=1):
     """Run the plan against a simulated all-gather. Returns (out, expected, plans)."""
     g = torch.Generator().manual_seed(seed)
     prefixes = [torch.randn(p, 1, DIM, generator=g) for p in prefix_lens]
     extends = [torch.randn(e, 1, DIM, generator=g) for e in extend_lens]
     plans = [
-        plan_dcp_extend_gather(prefix_lens, extend_lens, dcp_size, rank, piece_rows)
+        plan_dcp_extend_gather(
+            prefix_lens, extend_lens, dcp_size, rank, piece_rows, interleave_size
+        )
         for rank in range(dcp_size)
     ]
 
@@ -82,7 +84,10 @@ def _gather(prefix_lens, extend_lens, dcp_size, piece_rows, seed=0):
     for rank, plan in enumerate(plans):
         # What the planner lists for this rank: positions rank, rank + dcp_size,
         # ... of each request, concatenated per request.
-        local = [kv[rank::dcp_size] for kv in prefixes]
+        local = [
+            kv[torch.arange(kv.shape[0]) // interleave_size % dcp_size == rank]
+            for kv in prefixes
+        ]
         send = torch.full((plan.send_rows, 1, DIM), float("nan"))
         dst = 0
         for shard, local_len, padded_len in zip(
@@ -104,6 +109,20 @@ def _gather(prefix_lens, extend_lens, dcp_size, piece_rows, seed=0):
 
 
 class TestDcpExtendGatherPlan(CustomTestCase):
+    def test_page_interleaved_prefixes_rebuild_in_position_order(self):
+        for page_size in (16, 128):
+            for ranks in (2, 4):
+                for budget in (1, page_size * ranks, page_size * ranks * 3):
+                    with self.subTest(page_size=page_size, ranks=ranks, budget=budget):
+                        out, expected, _ = _gather(
+                            [page_size - 1, page_size * ranks + 3, page_size * 9],
+                            [2, 7, 1],
+                            ranks,
+                            budget,
+                            interleave_size=page_size,
+                        )
+                        self.assertTrue(torch.equal(out, expected))
+
     def test_the_pieces_rebuild_every_request_in_position_order(self):
         for args in _combinations():
             with self.subTest(args=args):

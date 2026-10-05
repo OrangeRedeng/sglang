@@ -168,6 +168,13 @@ class TestForwardMetadata(unittest.TestCase):
             "prefix_lens",
             "flatten_prefix_block_tables",
             "dcp_local_block_tables",
+            "dcp_seq_lens_cpu_int",
+            "dcp_seq_lens",
+            "dcp_block_tables",
+            "dcp_origin_out_cache_loc",
+            "dcp_spec_seq_lens_cpu_int",
+            "dcp_spec_seq_lens",
+            "dcp_spec_block_tables",
         }
         self.assertEqual(names, expected)
 
