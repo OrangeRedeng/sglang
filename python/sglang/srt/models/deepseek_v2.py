@@ -562,7 +562,7 @@ class MoEGate(nn.Module):
                 isinstance(hidden_states, tuple)
                 or hidden_states.dtype == torch.float8_e4m3fn
             ):
-                raise ValueError("Disable native MXFP8 norm to use the FP32 gate")
+                raise ValueError("Disable native MXFP8 norm to use the original gate")
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 

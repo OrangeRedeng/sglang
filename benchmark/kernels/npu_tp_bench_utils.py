@@ -5,6 +5,17 @@ import statistics
 import time
 
 import torch
+import torch.nn.functional as F
+
+
+def npu_router_reference(hidden_states, weight, *, deterministic=False):
+    # MoEGate's deterministic NPU path promotes both operands.
+    if deterministic:
+        return F.linear(hidden_states.float(), weight.float())
+    return F.linear(
+        hidden_states.float() if weight.dtype == torch.float32 else hidden_states,
+        weight,
+    )
 
 
 def timing(run, warmup, iterations):

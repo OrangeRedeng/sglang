@@ -1,7 +1,8 @@
 """Replay captured GLM-5.2 TP4 prefill norm and gate boundaries on Ascend A5.
 
-Capture dictionary: x, residual, gamma, eps, FP32 gate_weight, correction_bias,
+Capture dictionary: x, residual, gamma, eps, loaded gate_weight, correction_bias,
 tp_size=4 and topk (the production TopKConfig fields saved by input capture).
+Optional deterministic flag records the production FP32 reference override.
 Route mismatches fail acceptance but all timing/error diagnostics are printed.
 Optional --outputs compares separately captured moe_output, model_logits and
 generated_ids from identical deterministic A/B serving requests.
@@ -11,9 +12,8 @@ import argparse
 import json
 
 import torch
-import torch.nn.functional as F
 import torch_npu
-from npu_tp_bench_utils import timing
+from npu_tp_bench_utils import npu_router_reference, timing
 
 from sglang.srt.hardware_backend.npu.moe.norm_gate import (
     MXFP8GateMethod,
@@ -30,7 +30,7 @@ def error(actual, reference):
 
 def route(logits, bias, cfg):
     return torch.ops.npu.npu_moe_gating_top_k(
-        logits,
+        logits.float(),
         k=cfg["top_k"],
         bias=bias,
         k_group=cfg["topk_group"] if cfg["use_grouped_topk"] else 1,
@@ -52,6 +52,7 @@ def routing_report(reference, actual, bias, cfg):
         torch.isfinite(reference).all().item() and torch.isfinite(actual).all().item()
     ):
         raise RuntimeError("Router logits contain NaN or Inf")
+    reference, actual = reference.float(), actual.float()
     w0, ids0 = route(reference, bias, cfg)
     w1, ids1 = route(actual, bias, cfg)
     changed = ids0 != ids1
@@ -91,7 +92,7 @@ def routing_report(reference, actual, bias, cfg):
         "router_logit_error": error(actual, reference),
         "routing_weight_slot_error": error(w1, w0),
         "routing_weight_by_expert_error": error(dense1, dense0),
-        "fp32_kth_kplus1_logit_margin_on_changed_tokens": (
+        "reference_kth_kplus1_logit_margin_on_changed_tokens": (
             {
                 "min": margin[changed_rows].min().item(),
                 "mean": margin[changed_rows].mean().item(),
@@ -142,8 +143,12 @@ def main():
     )
     if data["tp_size"] != 4 or x.ndim != 2 or x.shape[1] != 6144 or not x.shape[0]:
         parser.error("Expected nonempty captured TP4 [T,6144] input")
-    if x.dtype != torch.bfloat16 or gate_weight.dtype != torch.float32:
-        parser.error("Expected BF16 input and original FP32 checkpoint gate weight")
+    if x.dtype != torch.bfloat16 or gate_weight.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        parser.error("Expected BF16 input and loaded FP16/BF16/FP32 gate weight")
     residual = data["residual"]
     residual = torch.zeros_like(x) if residual is None else residual.to(args.device)
     bias = data["correction_bias"]
@@ -156,6 +161,12 @@ def main():
         "weight", torch.nn.Parameter(gate_weight, requires_grad=False)
     )
     method.process_weights_after_loading(gate)
+    deterministic = bool(data.get("deterministic", False))
+
+    def baseline_gate(normalized):
+        return npu_router_reference(
+            normalized, gate.weight, deterministic=deterministic
+        )
 
     def baseline_norm():
         normalized, _, residual_out = torch_npu.npu_add_rms_norm(
@@ -168,27 +179,31 @@ def main():
 
     def baseline():
         normalized, residual_out = baseline_norm()
-        logits = F.linear(normalized.float(), gate.weight)
+        logits = baseline_gate(normalized)
         operand = torch.ops.npu.npu_dynamic_mx_quant(
             normalized, dst_type=torch.float8_e4m3fn
         )
         return logits, residual_out, operand
 
-    def native():
+    def native(output_dtype=torch.float32):
         q, residual_out, scale, _ = native_norm()
-        return method.apply(gate, (q, scale)), residual_out, (q, scale)
+        return (
+            method.apply(gate, (q, scale), output_dtype=output_dtype),
+            residual_out,
+            (q, scale),
+        )
 
     logits0, residual0, operand0 = baseline()
     logits1, residual1, operand1 = native()
     torch.testing.assert_close(residual1, residual0, atol=0, rtol=0)
-    report = routing_report(logits0, logits1, bias, cfg)
-    report["input_payload_byte_match"] = (
+    norm_report = {}
+    norm_report["input_payload_byte_match"] = (
         (operand0[0].view(torch.uint8) == operand1[0].view(torch.uint8))
         .float()
         .mean()
         .item()
     )
-    report["input_scale_byte_match"] = (
+    norm_report["input_scale_byte_match"] = (
         (
             operand0[1].view(torch.uint8).reshape(-1)
             == operand1[1].view(torch.uint8).reshape(-1)
@@ -199,17 +214,45 @@ def main():
     )
     print(
         json.dumps(
-            {"correctness": report, "capture": args.inputs, "tokens": x.shape[0]}
+            {
+                "capture": args.inputs,
+                "tokens": x.shape[0],
+                "gate_weight_dtype": str(gate.weight.dtype),
+                "baseline_router_dtype": str(logits0.dtype),
+                "deterministic_reference": deterministic,
+                "norm_correctness": norm_report,
+            }
         )
     )
+    reports = {}
+    for mode, dtype in (("fp32", torch.float32), ("bf16", torch.bfloat16)):
+        logits = (
+            logits1
+            if mode == "fp32"
+            else method.apply(gate, operand1, output_dtype=dtype)
+        )
+        reports[mode] = routing_report(logits0, logits, bias, cfg)
+        print(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "router_dtype": str(logits.dtype),
+                    "correctness": reports[mode],
+                }
+            )
+        )
     normalized, _ = baseline_norm()
     stages = {
         "baseline_total": baseline,
-        "native_total": native,
+        "native_fp32_total": native,
+        "native_bf16_total": lambda: native(torch.bfloat16),
         "baseline_norm": baseline_norm,
         "native_norm_quant": native_norm,
-        "baseline_gate_cast_gemm": lambda: F.linear(normalized.float(), gate.weight),
-        "native_gate": lambda: method.apply(gate, operand1),
+        "baseline_gate": lambda: baseline_gate(normalized),
+        "native_fp32_gate": lambda: method.apply(gate, operand1),
+        "native_bf16_gate": lambda: method.apply(
+            gate, operand1, output_dtype=torch.bfloat16
+        ),
         "baseline_quant": lambda: torch.ops.npu.npu_dynamic_mx_quant(
             normalized, dst_type=torch.float8_e4m3fn
         ),
@@ -229,8 +272,13 @@ def main():
             b["generated_ids"], a["generated_ids"], atol=0, rtol=0
         )
         print(json.dumps({"deterministic_generation_exact": True}))
-    if not report["accepted_exact_routes"] and not args.allow_route_mismatch:
-        raise SystemExit("Routing acceptance failed: TopK IDs must match exactly")
+    failed_modes = [
+        mode for mode, report in reports.items() if not report["accepted_exact_routes"]
+    ]
+    if failed_modes and not args.allow_route_mismatch:
+        raise SystemExit(
+            f"Routing acceptance failed for {failed_modes}: TopK IDs must match exactly"
+        )
 
 
 if __name__ == "__main__":

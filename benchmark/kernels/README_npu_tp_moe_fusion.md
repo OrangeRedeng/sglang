@@ -165,11 +165,20 @@ captures and these profile/accuracy results are pending on this CPU-only host.
 
 Both new switches default to zero. `NATIVE_NORM_MXFP8=1` requires
 `MXFP8_GATE=1`: the sparse-layer norm emits FP8 plus scales, with no normalized
-BF16 tensor. The original FP32 gate parameter remains available with both
-experiments off. Gate MXFP8 weights are created once in the loader's normal
-postprocessing stage, directly from FP32 using native DynamicMxQuant, with the
+BF16 tensor. The original loaded gate parameter keeps its dtype and values for
+fallback and reference comparison. Gate MXFP8 weights are created once in the
+loader's normal postprocessing stage, directly from the loaded FP16/BF16/FP32
+tensor using native DynamicMxQuant, with the
 same transpose/scale views as `NPUMXFP8LinearMethod`. There is no weight
 quantization in forward and no new contiguous weight copy.
+
+Gate allocation is unchanged. GLM's gate uses the model dtype unless
+`router_fp32=True`; the usual BF16 NPU path computes BF16 activation x BF16
+gate -> BF16 logits. A configured FP32 gate promotes the activation to FP32;
+deterministic inference also promotes both operands. Capture records the
+actual loaded weight and deterministic flag. Replay reproduces those baseline
+semantics rather than assuming an FP32 GEMM or casting the gate before quantization.
+The experimental serving gate still returns FP32 logits by default.
 
 The paired experiment requires GLM-5.2 W4A8 MXFP, TP4/EP1, separate compatible
 shared experts, prequant/reuse enabled, and no DP/CP input movement or batch
@@ -214,8 +223,9 @@ export SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS=1024
 
 Each sparse layer/rank saves its first qualifying norm input as
 `rank<R>-layer<L>-tokens<T>.pt`. Captures contain post-attention `x`, residual,
-gamma, epsilon, the original FP32 gate weight, FP32 correction bias and the
-actual production routing configuration. Saving synchronizes and copies to
+gamma, epsilon, the loaded gate weight in its original dtype, FP32 correction
+bias, the deterministic flag and actual production routing configuration.
+Saving synchronizes and copies to
 CPU; exclude this run from performance comparisons. Shut down the capture
 server before replay to release model memory.
 
@@ -230,17 +240,26 @@ for capture in /tmp/glm52-norm-gate/*.pt; do
 done
 ```
 
-Replay reports complete-boundary p50/p95 and host enqueue p50, separate norm,
-gate and quant timings, exact ordered TopK ID match, set match, top-1 match,
+Replay reports the actual gate/baseline-logit dtypes and compares both MXFP8
+QuantMatmul output modes against the same production baseline: BF16 isolates
+quantization for the usual BF16 router, while FP32 also changes output precision.
+For FP32 or deterministic baselines the BF16 candidate also changes output
+precision. Each mode gets separate accuracy and timing results. An unsupported
+output mode fails explicitly at operator execution; schema probing alone does
+not prove execution support. Replay reports complete-boundary p50/p95 and host
+enqueue p50, separate norm, gate and quant timings, exact ordered TopK ID match,
+set match, top-1 match,
 changed routes/total, max/mean logit error and routing-weight error. Residual
 output must match exactly. The quantized input payload/scale byte match is
 also reported; native norm need not reproduce the intermediate BF16 rounding.
-Route mismatches report FP32 k-th/(k+1)-th raw-logit margins and score-plus-bias
-margins on affected tokens. Grouped routing can add another selection boundary;
+Route mismatches report reference k-th/(k+1)-th raw-logit margins and score-plus-bias
+margins on affected tokens, computed in FP32 from the production logits.
+Production BF16 logits are rounded before promotion, matching the grouped NPU
+TopK path. Grouped routing can add another selection boundary;
 the reported global margins do not fully explain group-selection changes.
-The benchmark exits unsuccessfully for any ordered TopK mismatch after
+The benchmark exits unsuccessfully for any ordered TopK mismatch in either mode after
 printing diagnostics and timings. `--allow-route-mismatch` allows research
-timing, and leaves `accepted_exact_routes=false` in the report.
+timing, and leaves `accepted_exact_routes=false` in each affected mode's report.
 
 For the serving A/B, restart the server for each case with your exact current
 command and workload, matching prompts, request seed, warmup/cache state and
@@ -273,8 +292,8 @@ prompt before accepting router quantization. Kernel replay alone does not
 validate final outputs, graph replay or serving performance.
 
 The supplied control is wall 39.02 s, steady forwards approximately 3.22 s,
-MoE bucket 6.32 s. Inspect standalone MoE input DynamicMxQuant, gate Cast and
-FP32 MatMul counts versus native fused norm/quant and QuantMatmul. Promote only
+MoE bucket 6.32 s. Inspect standalone MoE input DynamicMxQuant and the actual
+baseline gate GEMM/casts versus native fused norm/quant and QuantMatmul. Promote only
 after exact routing, output/generation correctness and improved serving wall
 and TTFT. No A5 runtime, accuracy or performance result was measured locally.
 
