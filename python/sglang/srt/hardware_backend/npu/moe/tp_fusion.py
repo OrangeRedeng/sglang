@@ -148,7 +148,20 @@ def shared_gmm1_weight_views(weight, weight_scale):
     )
 
 
-def shared_gmm1(mlp, x, pre_quant_input=None):
+def shared_gmm1_mode():
+    from sglang.srt.environ import envs
+
+    mode = envs.SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE.get()
+    if not mode:
+        return (
+            "grouped_fused" if envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get() else "baseline"
+        )
+    if mode not in ("baseline", "grouped_fused", "split_group_quant", "split3"):
+        raise ValueError(f"Unknown SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE: {mode!r}")
+    return mode
+
+
+def shared_gateup_quant(mlp, x, pre_quant_input=None, *, mode="grouped_fused"):
     from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
         NPUMXFP8LinearMethod,
     )
@@ -166,6 +179,11 @@ def shared_gmm1(mlp, x, pre_quant_input=None):
         raise ValueError("Shared GMM1 fusion requires a bias-free gate/up projection")
     qx, scale = mxfp8_input(x) if pre_quant_input is None else pre_quant_input
     record_mxfp8_operand((qx, scale))
+    if mode in ("split_group_quant", "split3"):
+        gate_up = gate((qx, scale))[0]
+        return shared_activation_quant(mlp, gate_up, mode=mode)
+    if mode != "grouped_fused":
+        raise ValueError(f"Unsupported shared gate/up mode: {mode!r}")
     kernel = getattr(getattr(gate, "scheme", None), "kernel", gate.quant_method)
     weight_dtype = (
         None
@@ -174,7 +192,14 @@ def shared_gmm1(mlp, x, pre_quant_input=None):
     )
     weight_scale = gate.weight_scale_inv if weight_dtype is None else gate.weight_scale
     grouped_weight, grouped_scale = shared_gmm1_weight_views(gate.weight, weight_scale)
-    group_list = torch.full((1,), qx.shape[0], dtype=torch.int64, device=qx.device)
+    group_key = (qx.shape[0], qx.device)
+    cached = getattr(mlp, "_npu_shared_group_list", None)
+    if cached is None or cached[0] != group_key:
+        group_list = torch.full((1,), qx.shape[0], dtype=torch.int64, device=qx.device)
+        mlp._npu_shared_group_list = (group_key, group_list)
+    else:
+        group_list = cached[1]
+    group_list.record_stream(torch.get_device_module().current_stream())
     op = require_npu_op("npu_grouped_matmul_swiglu_quant_v2")
     quantized, output_scale = op(
         x=qx,
@@ -190,7 +215,33 @@ def shared_gmm1(mlp, x, pre_quant_input=None):
         weight_scale_dtype=_require_e8m0_dtype(),
         x_scale_dtype=_require_e8m0_dtype(),
     )
-    return mlp.down_proj((quantized, output_scale))[0]
+    return quantized, output_scale
+
+
+def shared_activation_quant(mlp, gate_up, *, mode):
+    if mode == "split_group_quant":
+        # sgl-kernel-npu's MX ABI differs from torch_npu.npu_swiglu_group_quant.
+        op = require_npu_op(
+            "swiglu_group_quant",
+            ("group_index", "dst_type", "quant_mode", "group_list_type", "clamp_value"),
+        )
+        quantized, scale, _ = op(
+            x=gate_up,
+            group_index=None,
+            dst_type=torch.float8_e4m3fn,
+            quant_mode=2,
+            group_list_type=0,
+            clamp_value=0.0,
+        )
+        return quantized, scale
+    if mode == "split3":
+        return mxfp8_input(mlp.act_fn(gate_up))
+    raise ValueError(f"Unsupported shared activation mode: {mode!r}")
+
+
+def shared_gmm1(mlp, x, pre_quant_input=None, *, mode="grouped_fused"):
+    operand = shared_gateup_quant(mlp, x, pre_quant_input, mode=mode)
+    return mlp.down_proj(operand)[0]
 
 
 def fused_gmm2_finalize(
