@@ -140,6 +140,14 @@ def tp_fused_shared_expert_reason(config, quant_config):
     return None
 
 
+def shared_gmm1_weight_views(weight, weight_scale):
+    # CANN checks full batch strides even for the singleton expert dimension.
+    return (
+        weight.transpose(0, 1).unsqueeze(0).transpose(1, 2),
+        weight_scale.transpose(0, 1).unsqueeze(0).transpose(1, 2),
+    )
+
+
 def shared_gmm1(mlp, x, pre_quant_input=None):
     from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
         NPUMXFP8LinearMethod,
@@ -165,12 +173,13 @@ def shared_gmm1(mlp, x, pre_quant_input=None):
         else _get_float4_e2m1fn_x2_dtype()
     )
     weight_scale = gate.weight_scale_inv if weight_dtype is None else gate.weight_scale
+    grouped_weight, grouped_scale = shared_gmm1_weight_views(gate.weight, weight_scale)
     group_list = torch.full((1,), qx.shape[0], dtype=torch.int64, device=qx.device)
     op = require_npu_op("npu_grouped_matmul_swiglu_quant_v2")
     quantized, output_scale = op(
         x=qx,
-        weight=[gate.weight.unsqueeze(0)],
-        weight_scale=[weight_scale.unsqueeze(0)],
+        weight=[grouped_weight],
+        weight_scale=[grouped_scale],
         x_scale=scale,
         group_list=group_list,
         dequant_mode=2,
@@ -207,7 +216,7 @@ def fused_gmm2_finalize(
         ("w_dtype", "scale_dtype", "pertoken_scale_dtype", "shared_input", "dtype"),
     )
     row_index, logit = pack_finalize_routing(expanded_row_idx, topk_weights)
-    return op(
+    output = op(
         x,
         weight,
         expert_tokens,
@@ -219,8 +228,10 @@ def fused_gmm2_finalize(
         row_index=row_index,
         output_bs=topk_weights.shape[0],
         group_list_type=1,
-        dtype=torch.bfloat16,
+        # Deployed torch_npu 2.10 wrappers require FP32 output.
+        dtype=torch.float32,
         w_dtype=_get_float4_e2m1fn_x2_dtype(),
         scale_dtype=_require_e8m0_dtype(),
         pertoken_scale_dtype=_require_e8m0_dtype(),
     )
+    return output.to(torch.bfloat16)

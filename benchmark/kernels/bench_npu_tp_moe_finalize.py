@@ -79,9 +79,9 @@ def main():
         parser.error("Expected BF16 H=6144, FP32 TopK=8 weights, routed IDs in [0,256)")
 
     factor = float(data["routed_scaling_factor"])
-    unscaled_weights = weights.to(expert.dtype)
+    unscaled_weights = weights
     # Production folds this multiplication into the TopK operator.
-    scaled_weights = (weights * factor).to(expert.dtype)
+    scaled_weights = weights * factor
     finalize = NPUFinalizeRouting(drop_pad_mode=2)
 
     def routed(route_weights, skip1=None):
@@ -90,6 +90,9 @@ def main():
         )
 
     cases = {
+        "baseline_bf16_weights": lambda: (
+            routed(weights.to(expert.dtype)).mul_(factor).add_(shared)
+        ),
         "baseline": lambda: routed(unscaled_weights).mul_(factor).add_(shared),
         "scaled_topk": lambda: routed(scaled_weights).add_(shared),
         "scaled_topk_shared": lambda: routed(scaled_weights, skip1=shared),
