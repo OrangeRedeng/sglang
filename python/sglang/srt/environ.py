@@ -990,6 +990,15 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Opt-in A/B stages; shared finalization also requires scaled routing weights.
+    SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE = EnvBool(False)
+    SGLANG_NPU_TP_MOE_PREQUANT_INPUT = EnvBool(False)
+    SGLANG_NPU_TP_MOE_REUSE_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_SHARED_GMM1 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)

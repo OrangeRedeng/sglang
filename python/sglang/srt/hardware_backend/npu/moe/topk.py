@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -24,6 +25,32 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
+    if topk_config.num_fused_shared_experts:
+        if (
+            topk_config.num_fused_shared_experts != 1
+            or not topk_config.apply_routed_scaling_factor_on_output
+        ):
+            raise ValueError(
+                "NPU fused shared routing requires one expert and scaled TopK"
+            )
+        from sglang.srt.hardware_backend.npu.triton_kernel.tp_moe_fusion import (
+            append_shared_topk,
+        )
+
+        routed = fused_topk_npu(
+            hidden_states,
+            router_logits,
+            replace(
+                topk_config, top_k=topk_config.top_k - 1, num_fused_shared_experts=0
+            ),
+            num_token_non_padded,
+            expert_location_dispatch_info,
+            layer_id,
+        )
+        weights, ids = append_shared_topk(
+            routed.topk_weights, routed.topk_ids, router_logits.shape[-1]
+        )
+        return StandardTopKOutput(weights, ids, router_logits)
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias

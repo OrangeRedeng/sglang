@@ -103,6 +103,7 @@ class AscendRunnerOutput(RunnerOutput):
     """Output bundle from the NPU runner."""
 
     hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -264,6 +265,8 @@ class AscendRunnerCore(MoeRunnerCore):
                 )
 
         # --- w2 (down) projection ---
+        if running_state.get("ascend_tp_fused_gmm2") and hidden_states.shape[0] > 0:
+            return AscendRunnerOutput(hidden_states, pertoken_scale)
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
             hidden_states,
@@ -307,6 +310,9 @@ def pre_permute_ascend_tp_to_ascend(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
+    running_state["ascend_tp_fused_gmm2"] = getattr(
+        runner_config.layer, "_npu_tp_fuse_gmm2_finalize", False
+    )
     return AscendRunnerInput(
         hidden_states=dispatch_output.hidden_states,
         hidden_states_scale=dispatch_output.hidden_states_scale,
@@ -380,6 +386,13 @@ def post_permute_ascend_to_ascend_tp(
 ) -> AscendTPCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
 
+    if runner_output.hidden_states_scale is not None:
+        return AscendTPCombineInput(
+            hidden_states=runner_output.hidden_states,
+            gmm2_input_scale=runner_output.hidden_states_scale,
+            gmm2_weight=quant_info.w2_weight,
+            gmm2_weight_scale=quant_info.w2_weight_scale,
+        )
     return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
 
 
