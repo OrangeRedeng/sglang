@@ -988,6 +988,23 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_NPU_AUTO_HCCL_BUFFSIZE = EnvBool(False)
+    SGLANG_NPU_HCCL_HEADROOM = EnvFloat(1.25)
+    SGLANG_NPU_HCCL_QUANTUM_MB = EnvInt(32)
+    SGLANG_NPU_HCCL_MIN_MB = EnvInt(64)
+    SGLANG_NPU_HCCL_MAX_MB = EnvInt(1024)
+    SGLANG_NPU_TUNING_PROFILE = EnvBool(False)
+    SGLANG_NPU_TUNING_CACHE_DIR = EnvStr("~/.cache/sglang/npu_tuning")
+    SGLANG_NPU_AUTOTUNE_DRY_RUN = EnvBool(False)
+    SGLANG_NPU_AUTO_STREAM_THRESHOLDS = EnvBool(False)
+    SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS = EnvBool(False)
+    SGLANG_NPU_DCP_SCRATCH_BUDGET_MB = EnvInt(256)
+    SGLANG_NPU_MEMORY_DIAGNOSTICS = EnvBool(False)
+    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Opt-in A/B stages; shared finalization also requires scaled routing weights.

@@ -9,6 +9,7 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -402,10 +403,16 @@ def forward_dsa_prepare_npu(
     needs_indexer = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
     overlap_qnope_rope = (
         envs.SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE.get()
+        and threshold_allows(
+            "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS", hidden_states.shape[0]
+        )
         and _use_dsa_eager_streams(forward_batch)
     )
     eager_indexer = (
         envs.SGLANG_NPU_DSA_EAGER_INDEXER.get()
+        and threshold_allows(
+            "SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS", hidden_states.shape[0]
+        )
         and _use_dsa_eager_streams(forward_batch)
         and needs_indexer
         and not dsa_use_prefill_cp(forward_batch)

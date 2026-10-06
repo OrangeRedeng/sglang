@@ -1791,6 +1791,10 @@ class Engine(EngineScoreMixin, EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
 
     cfg = resolving_view(server_args)
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.autotune import initialize
+
+        initialize(cfg)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set

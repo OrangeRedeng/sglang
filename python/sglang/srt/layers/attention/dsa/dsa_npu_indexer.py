@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -416,6 +417,7 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
+            num_query_tokens = q.view(-1, self.n_heads, self.head_dim).shape[0]
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
