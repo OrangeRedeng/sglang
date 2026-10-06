@@ -18,9 +18,14 @@ def require_npu_op(name: str, arguments=()):
 
 
 def mxfp8_input(hidden_states: torch.Tensor):
+    scale = getattr(hidden_states, "_npu_mxfp8_scale", None)
+    if scale is not None:
+        return hidden_states, scale
     operand = getattr(hidden_states, "_npu_mxfp8_operand", None)
     if operand is not None:
         return operand
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        raise RuntimeError("MXFP8 input is missing its E8M0 scales")
     return torch.ops.npu.npu_dynamic_mx_quant(
         hidden_states, dst_type=torch.float8_e4m3fn
     )
@@ -51,6 +56,8 @@ def prequantize_tp_input(experts, hidden_states):
     from sglang.srt.layers.moe.utils import DispatcherOutputDtype
 
     dispatcher = experts.dispatcher
+    if getattr(hidden_states, "_npu_mxfp8_scale", None) is not None:
+        return mxfp8_input(hidden_states)
     if (
         not envs.SGLANG_NPU_TP_MOE_PREQUANT_INPUT.get()
         or hidden_states.shape[0] == 0

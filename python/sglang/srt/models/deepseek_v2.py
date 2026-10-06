@@ -555,6 +555,14 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if _is_npu and getattr(self, "_npu_mxfp8_gate", False):
+            if envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get():
+                return self.quant_method.apply(self, hidden_states)
+            if (
+                isinstance(hidden_states, tuple)
+                or hidden_states.dtype == torch.float8_e4m3fn
+            ):
+                raise ValueError("Disable native MXFP8 norm to use the FP32 gate")
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 
@@ -974,6 +982,15 @@ class DeepseekV2MoE(nn.Module):
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        if _is_npu and (
+            envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get()
+            or envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get()
+        ):
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_native_norm_gate,
+            )
+
+            configure_native_norm_gate(self)
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -1121,7 +1138,11 @@ class DeepseekV2MoE(nn.Module):
                 fused_gate=not use_flashinfer_trtllm_bypass and not use_vision_topk,
             )
         else:
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            gate_input = hidden_states
+            if _is_npu and getattr(self.gate, "_npu_mxfp8_gate", False):
+                if envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get():
+                    gate_input = pre_quant_input or hidden_states
+            router_logits = self.gate(gate_input, gemm_output_zero_allocator)
             router_logits_partials = None
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
@@ -1441,7 +1462,11 @@ class DeepseekV2MoE(nn.Module):
                     fused_gate=not use_vision_topk,
                 )
             else:
-                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+                gate_input = hidden_states
+                if _is_npu and getattr(self.gate, "_npu_mxfp8_gate", False):
+                    if envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get():
+                        gate_input = pre_quant_input or hidden_states
+                router_logits = self.gate(gate_input, gemm_output_zero_allocator)
                 router_logits_partials = None
             topk_kwargs = (
                 {"input_ids": input_ids_global}
@@ -2004,6 +2029,10 @@ class DeepseekV2MoE(nn.Module):
         """Quantize hidden_states once (per-token-group-128 fp8, rows padded to
         a multiple of 4, column-major scales) for both the shared-expert GEMM
         and the routed dispatch, or return None when ineligible."""
+        if _is_npu and getattr(hidden_states, "_npu_mxfp8_scale", None) is not None:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import mxfp8_input
+
+            return mxfp8_input(hidden_states)
         if hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16:
             return None
         if _is_npu:
@@ -2851,12 +2880,33 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if (
+            _is_npu
+            and self.is_layer_sparse
+            and envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get()
+        ):
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import NativeMXFP8MoENorm
+
+            self.post_attention_layernorm = NativeMXFP8MoENorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         if _is_npu and self.is_layer_sparse and envs.SGLANG_NPU_TP_MOE_NORM_MXFP8.get():
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
                 configure_tp_mxfp8_norm,
             )
 
             configure_tp_mxfp8_norm(self.post_attention_layernorm, self.mlp.experts)
+
+        if (
+            _is_npu
+            and self.is_layer_sparse
+            and envs.SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR.get()
+        ):
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                install_input_capture,
+            )
+
+            install_input_capture(self.post_attention_layernorm, self.mlp)
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 

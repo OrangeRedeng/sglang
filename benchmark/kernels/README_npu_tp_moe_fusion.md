@@ -161,6 +161,128 @@ Compare exact TopK IDs/counts, FP32 weights/scaling, BF16 layer output, logits
 and deterministic generation against the original. Hardware runs, production
 captures and these profile/accuracy results are pending on this CPU-only host.
 
+## Native GLM-5.2 norm and MXFP8 gate
+
+Both new switches default to zero. `NATIVE_NORM_MXFP8=1` requires
+`MXFP8_GATE=1`: the sparse-layer norm emits FP8 plus scales, with no normalized
+BF16 tensor. The original FP32 gate parameter remains available with both
+experiments off. Gate MXFP8 weights are created once in the loader's normal
+postprocessing stage, directly from FP32 using native DynamicMxQuant, with the
+same transpose/scale views as `NPUMXFP8LinearMethod`. There is no weight
+quantization in forward and no new contiguous weight copy.
+
+The paired experiment requires GLM-5.2 W4A8 MXFP, TP4/EP1, separate compatible
+shared experts, prequant/reuse enabled, and no DP/CP input movement or batch
+overlap. Unsupported configurations, missing schemas and incompatible outputs
+fail explicitly. The existing norm and Triton implementations are unchanged.
+The FP8 input tensor carries only its E8M0 scale; gate, routed and shared work
+reuse that operand, including the existing graph and eager overlap paths.
+Existing collectives remain on their calling streams.
+
+Run from this checkout in the A5 torch_npu/CANN environment. First probe the
+installed schemas (the deployed ABI is authoritative):
+
+```bash
+python benchmark/kernels/bench_npu_tp_moe_norm_gate.py --probe-only
+```
+
+Keep these settings for capture and both serving cases:
+
+```bash
+export SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE=1
+export SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT=1
+export SGLANG_NPU_TP_MOE_PREQUANT_INPUT=1
+export SGLANG_NPU_TP_MOE_REUSE_MXFP8=1
+export SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE=0
+export SGLANG_NPU_TP_MOE_NORM_MXFP8=0
+export SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT=0
+export SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE=grouped_fused
+export SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+```
+
+Capture real prefill inputs in a separate, untimed run. Use your exact current
+server command after these exports and send the same real prefill workload:
+
+```bash
+export SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8=0
+export SGLANG_NPU_TP_MOE_MXFP8_GATE=0
+export SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR=/tmp/glm52-norm-gate
+export SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS=1024
+# Run the current server command, then its normal prefill workload.
+```
+
+Each sparse layer/rank saves its first qualifying norm input as
+`rank<R>-layer<L>-tokens<T>.pt`. Captures contain post-attention `x`, residual,
+gamma, epsilon, the original FP32 gate weight, FP32 correction bias and the
+actual production routing configuration. Saving synchronizes and copies to
+CPU; exclude this run from performance comparisons. Shut down the capture
+server before replay to release model memory.
+
+```bash
+unset SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR
+unset SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS
+set -o pipefail
+for capture in /tmp/glm52-norm-gate/*.pt; do
+  python benchmark/kernels/bench_npu_tp_moe_norm_gate.py \
+    --inputs "$capture" --device npu:0 --warmup 20 --iterations 100 \
+    | tee "${capture%.pt}.norm-gate.jsonl" || break
+done
+```
+
+Replay reports complete-boundary p50/p95 and host enqueue p50, separate norm,
+gate and quant timings, exact ordered TopK ID match, set match, top-1 match,
+changed routes/total, max/mean logit error and routing-weight error. Residual
+output must match exactly. The quantized input payload/scale byte match is
+also reported; native norm need not reproduce the intermediate BF16 rounding.
+Route mismatches report FP32 k-th/(k+1)-th raw-logit margins and score-plus-bias
+margins on affected tokens. Grouped routing can add another selection boundary;
+the reported global margins do not fully explain group-selection changes.
+The benchmark exits unsuccessfully for any ordered TopK mismatch after
+printing diagnostics and timings. `--allow-route-mismatch` allows research
+timing, and leaves `accepted_exact_routes=false` in the report.
+
+For the serving A/B, restart the server for each case with your exact current
+command and workload, matching prompts, request seed, warmup/cache state and
+profiler window. The common settings above stay fixed. Capture must be unset.
+
+```bash
+# A: 703dead selective fusion and eager overlap configuration.
+export SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8=0
+export SGLANG_NPU_TP_MOE_MXFP8_GATE=0
+# Run the current server command and unchanged workload; save A results/profile.
+
+# B: after stopping A, repeat the exact command and workload.
+export SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8=1
+export SGLANG_NPU_TP_MOE_MXFP8_GATE=1
+# Save B results/profile. Do not change shared GMM1 mode or eager overlap.
+```
+
+Compare BF16 MoE outputs, final model logits and deterministic generated token
+IDs on identical requests. If saved as tensor dictionaries containing
+`moe_output`, `model_logits`, `generated_ids`, the replay can compare them:
+
+```bash
+python benchmark/kernels/bench_npu_tp_moe_norm_gate.py \
+  --inputs /path/to/real-capture.pt --outputs /path/to/A.pt /path/to/B.pt
+```
+
+These output dictionaries must be captured separately; input capture does not
+record model outputs. Compare more than one sparse layer and more than one
+prompt before accepting router quantization. Kernel replay alone does not
+validate final outputs, graph replay or serving performance.
+
+The supplied control is wall 39.02 s, steady forwards approximately 3.22 s,
+MoE bucket 6.32 s. Inspect standalone MoE input DynamicMxQuant, gate Cast and
+FP32 MatMul counts versus native fused norm/quant and QuantMatmul. Promote only
+after exact routing, output/generation correctness and improved serving wall
+and TTFT. No A5 runtime, accuracy or performance result was measured locally.
+
+ABI references: [Ascend operator schemas](https://github.com/Ascend/op-plugin/blob/master/op_plugin/config/op_plugin_functions.yaml),
+[MX quantization](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_mx_quant.md),
+[QuantMatmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_matmul.md).
+These upstream references do not establish availability in the installed build.
+
 ## Remaining P2/P3 research
 
 The following requested boundaries are **not implemented**:
