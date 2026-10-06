@@ -259,8 +259,16 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        operand = getattr(x, "_npu_mxfp8_operand", None)
+        if operand is not None and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get():
+            x = operand
         if isinstance(x, tuple):
             # MLAProlog supplies a [tokens, hidden] quantized query norm.
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_mxfp8_operand,
+            )
+
+            record_mxfp8_operand(x)
             qx, input_scale = x
             input_shape = qx.shape
             if input_scale.dtype == torch.uint8:
@@ -643,25 +651,41 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
+        operand = getattr(x, "_npu_mxfp8_operand", None)
+        if operand is not None and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get():
+            x = operand
+        if isinstance(x, tuple):
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_mxfp8_operand,
+            )
+
+            record_mxfp8_operand(x)
+            quantized_x, dynamic_scale = x
+            if quantized_x.dtype != torch.float8_e4m3fn:
+                raise ValueError("W4A8 prequantized input must use MXFP8 E4M3")
             original_dtype = torch.bfloat16
-
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic MXFP8 activation quantisation (A8).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
+            input_shape = quantized_x.shape
+            if dynamic_scale.dtype == torch.uint8:
+                dynamic_scale = dynamic_scale.view(e8m0_dtype)
+            dynamic_scale = dynamic_scale.reshape(
+                quantized_x.shape[0], quantized_x.shape[1] // 64, 2
+            )
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
+            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)

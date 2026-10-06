@@ -5,7 +5,7 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -577,6 +577,48 @@ class FusedMoE(torch.nn.Module):
         self._dwdp_bound = False
 
         self.runner = self.quant_method.runner
+
+    def configure_ascend_tp_finalize_fusion(self) -> Tuple[bool, bool]:
+        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+            NPUW4A8MXFP4MoEMethod,
+        )
+
+        eligible = (
+            isinstance(self.dispatcher, AscendTPDispatcher)
+            and not self.dispatcher.local_ep
+            and self.moe_ep_size == 1
+            and self.num_fused_shared_experts in (0, 1)
+            and not self.reduce_results
+            and not isinstance(self.quant_method, KTEPWrapperMethod)
+            and isinstance(getattr(self, "w2_kernel", None), NPUW4A8MXFP4MoEMethod)
+        )
+        self._npu_tp_fuse_gmm2_finalize = (
+            eligible and envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
+        )
+        if self._npu_tp_fuse_gmm2_finalize:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import require_npu_op
+
+            require_npu_op(
+                "npu_grouped_matmul_finalize_routing",
+                ("w_dtype", "scale_dtype", "pertoken_scale_dtype"),
+            )
+            self.dispatcher.fuse_gmm2_finalize = True
+            self.dispatcher.init.row_idx_type = 1
+        fuse_shared = (
+            eligible
+            and self.num_fused_shared_experts == 0
+            and envs.SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT.get()
+        )
+        fuse_scale = eligible and (
+            envs.SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE.get()
+            or fuse_shared
+            or (
+                self.num_fused_shared_experts == 1
+                and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get()
+            )
+        )
+        self.should_fuse_routed_scaling_factor_in_topk |= fuse_scale
+        return fuse_scale, fuse_shared
 
     @property
     def num_global_routed_experts(self) -> int:
@@ -1509,7 +1551,18 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        *,
+        shared_output: Optional[torch.Tensor] = None,
+        shared_output_ready: Optional[Callable[[], None]] = None,
     ):
+        if shared_output is not None:
+            return self.forward_impl(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+                shared_output_ready=shared_output_ready,
+            )
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1550,7 +1603,16 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        *,
+        shared_output: Optional[torch.Tensor] = None,
+        shared_output_ready: Optional[Callable[[], None]] = None,
     ):
+        if shared_output is not None and (
+            not isinstance(self.dispatcher, AscendTPDispatcher)
+            or self.dispatcher.local_ep
+            or self.reduce_results
+        ):
+            raise ValueError("Shared finalization requires unreduced TP expert output")
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1568,6 +1630,13 @@ class FusedMoE(torch.nn.Module):
 
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
+
+        if shared_output is not None:
+            # Join at the finalizer; fused GMM2 also consumes the shared input.
+            if shared_output_ready is not None:
+                shared_output_ready()
+                shared_output.record_stream(torch.get_device_module().current_stream())
+            combine_input = combine_input._replace(shared_output=shared_output)
 
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -1590,9 +1659,22 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple],
     ) -> DispatchOutput:
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        if pre_quant_input is not None and isinstance(
+            self.dispatcher, AscendTPDispatcher
+        ):
+            if self.dispatcher._original_dispatch_func is not None:
+                raise ValueError(
+                    "Prequantized TP routing does not support dispatch hooks"
+                )
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        else:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
         if (
             pre_quant_input is not None
             and dispatch_output.format.is_standard()

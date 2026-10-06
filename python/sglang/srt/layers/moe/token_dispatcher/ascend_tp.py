@@ -42,6 +42,10 @@ class AscendTPDispatchOutput(NamedTuple):
 
 class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
+    shared_output: Optional[torch.Tensor] = None
+    gmm2_input_scale: Optional[torch.Tensor] = None
+    gmm2_weight: Optional[torch.Tensor] = None
+    gmm2_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -67,6 +71,7 @@ class AscendTPDispatcher(BaseDispatcher):
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
+        self.fuse_gmm2_finalize = False
 
         # Initialise routing kernels with default (no quant config yet)
         self.set_ascend_dispatcher_output_dtype()
@@ -111,14 +116,29 @@ class AscendTPDispatcher(BaseDispatcher):
             self.init.active_expert_range = self.active_expert_range
             # Mode 3 zeros filtered routes; mode 2 assumes every route is present.
             self.finalize = NPUFinalizeRouting(drop_pad_mode=3)
+        self.init.row_idx_type = int(self.fuse_gmm2_finalize)
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        pre_quant_input=None,
     ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
+        input_scale = None
+        if pre_quant_input is not None:
+            if self.local_ep:
+                raise ValueError("Prequantized TP routing does not support local EP")
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_mxfp8_operand,
+            )
+
+            record_mxfp8_operand(pre_quant_input)
+            hidden_states, input_scale = pre_quant_input
 
         (
             permuted_hidden_states,
@@ -130,6 +150,7 @@ class AscendTPDispatcher(BaseDispatcher):
             topk_ids,
             self.num_experts,
             top_k,
+            input_scale=input_scale,
         )
 
         self._dispatch_output = AscendTPDispatchOutput(
@@ -149,12 +170,41 @@ class AscendTPDispatcher(BaseDispatcher):
 
         dispatch_out = self._dispatch_output
 
+        if combine_input.gmm2_input_scale is not None:
+            if self.local_ep or not self.fuse_gmm2_finalize:
+                raise ValueError(
+                    "Fused GMM2 finalization requires token-major TP routing"
+                )
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                fused_gmm2_finalize,
+            )
+
+            final_hidden_states = fused_gmm2_finalize(
+                combine_input.hidden_states,
+                combine_input.gmm2_input_scale,
+                combine_input.gmm2_weight,
+                combine_input.gmm2_weight_scale,
+                dispatch_out.expert_tokens,
+                dispatch_out.topk_weights,
+                dispatch_out.expanded_row_idx,
+                combine_input.shared_output,
+            )
+            self._dispatch_output = None
+            return final_hidden_states
+
+        shared_kwargs = {}
+        if combine_input.shared_output is not None:
+            if self.local_ep or not isinstance(self.finalize, NPUFinalizeRouting):
+                raise ValueError("Shared finalization requires native TP routing")
+            shared_kwargs["skip1"] = combine_input.shared_output
+
         # The finalizer (possibly wrapped with TP all‑gather) does all the work.
         final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_ids,
+            **shared_kwargs,
         )
 
         self._dispatch_output = None

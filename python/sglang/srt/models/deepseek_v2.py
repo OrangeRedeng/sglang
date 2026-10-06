@@ -333,6 +333,14 @@ class DeepseekV2MLP(nn.Module):
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
+        if (
+            getattr(self, "_npu_tp_shared", False)
+            and envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get()
+            and x.shape[0]
+        ):
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_gmm1
+
+            return shared_gmm1(self, x, gateup_pre_quant)
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -707,6 +715,12 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        self._fuse_npu_tp_routed_scale, self._fuse_npu_tp_shared = (
+            self.experts.configure_ascend_tp_finalize_fusion()
+            if _is_npu and not self.is_hash and not is_deepseek_v4
+            else (False, False)
+        )
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -914,6 +928,14 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._fuse_npu_tp_shared &= not (
+            self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
+        )
+        if _is_npu and hasattr(self, "shared_experts"):
+            self.shared_experts._npu_tp_shared = (
+                not (self._enable_a2a_moe or self._shared_expert_tp1)
+                and self.experts.moe_ep_size == 1
+            )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1129,7 +1151,25 @@ class DeepseekV2MoE(nn.Module):
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
             )
         )
-        if deferred_finalize:
+        shared_output = None
+        if self._fuse_npu_tp_shared and has_shared_output:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    pre_quant_input=pre_quant_input,
+                )
+        shared_fused = shared_output is not None
+        if shared_fused:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=routed_pre_quant_input,
+                shared_output=shared_output,
+                shared_output_ready=lambda: current_stream.wait_stream(self.alt_stream),
+            )
+            shared_output = None
+        elif deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
                 hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
             )
@@ -1146,20 +1186,22 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and not self._fuse_npu_tp_routed_scale:
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states,
-                gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
-            )
+        if not shared_fused:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    pre_quant_input=pre_quant_input,
+                )
 
         # The routed-input pre-quant was already joined inside the routed MoE apply.
-        current_stream.wait_stream(self.alt_stream)
+        if not shared_fused:
+            current_stream.wait_stream(self.alt_stream)
 
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
@@ -1311,7 +1353,9 @@ class DeepseekV2MoE(nn.Module):
             if get_exec().moe.enable_eplb and not self.is_nextn
             else None
         )
-        defer_shared = not self.experts.moe_runner_config.inplace
+        defer_shared = (
+            not self.experts.moe_runner_config.inplace and not self._fuse_npu_tp_shared
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
@@ -1403,7 +1447,15 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        if self._fuse_npu_tp_shared and shared_output is not None:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+            )
+            shared_output = None
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1420,7 +1472,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and not self._fuse_npu_tp_routed_scale:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1772,6 +1824,16 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            if _is_npu and pre_quant_input is not None:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_mxfp8_linear,
+                )
+
+                if not (
+                    envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get()
+                    and supports_mxfp8_linear(self.shared_experts.gate_up_proj)
+                ):
+                    pre_quant_input = None
             if pre_quant_input is None and _is_hip:
                 # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
@@ -1881,6 +1943,14 @@ class DeepseekV2MoE(nn.Module):
         and the routed dispatch, or return None when ineligible."""
         if hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16:
             return None
+        if _is_npu:
+            if self._fuse_shared_experts_inside_sbo:
+                return None
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                prequantize_tp_input,
+            )
+
+            return prequantize_tp_input(self.experts, hidden_states)
         if not self._moe_quant_once_enabled():
             return None
         if is_in_tc_piecewise_cuda_graph():
@@ -2718,6 +2788,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if _is_npu and self.is_layer_sparse and envs.SGLANG_NPU_TP_MOE_NORM_MXFP8.get():
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                configure_tp_mxfp8_norm,
+            )
+
+            configure_tp_mxfp8_norm(self.post_attention_layernorm, self.mlp.experts)
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
@@ -3344,6 +3420,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ``install_shared_experts_fusion_decision``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
+        if _is_npu and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get():
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                tp_fused_shared_expert_reason,
+            )
+
+            return tp_fused_shared_expert_reason(hf_config, quant_config)
         # Need to disable if quant precision mismatch, even if
         # --enforce-shared-experts-fusion is specified
         if quant_blocks_shared_experts_fusion(quant_config):
