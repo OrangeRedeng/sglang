@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
@@ -233,7 +233,89 @@ def _get_indexer_query_shard(
     return shard
 
 
+@dataclass
+class _PendingIndexerTopk:
+    indices: torch.Tensor
+    ready: object
+    shard: Optional[_IndexerQueryShard]
+    num_tokens: int
+
+    def wait_and_gather(self) -> torch.Tensor:
+        stream = torch.npu.current_stream()
+        stream.wait_event(self.ready)
+        self.indices.record_stream(stream)
+        # HCCL retains the caller's collective order and stream.
+        if self.shard is not None:
+            return self.shard.gather(self.indices, self.num_tokens)
+        return self.indices
+
+
 class DSANPUIndexerMixin:
+    def can_forward_npu_eager(
+        self, forward_batch: ForwardBatch, input_on_attn_tp_slices: bool
+    ) -> bool:
+        return (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.attn_cp_metadata is None
+            and not get_parallel().dcp_enabled
+            and not (_use_ag_after_qlora and input_on_attn_tp_slices)
+        )
+
+    def forward_npu_eager(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        input_on_attn_tp_slices: bool = False,
+    ) -> _PendingIndexerTopk:
+        stream = get_stream("npu_dsa_indexer")
+        input_ready = torch.npu.current_stream().record_event()
+        metadata = get_attn_backend().forward_metadata
+        with torch.npu.stream(stream):
+            stream.wait_event(input_ready)
+            tensors = [
+                x,
+                q_lora,
+                positions,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.out_cache_loc,
+                metadata.seq_lens,
+                metadata.seq_lens_cpu_int,
+                metadata.block_tables,
+                getattr(metadata, "quant_indexer_cu_seqlens_q", None),
+                getattr(metadata, "quant_indexer_seqused_k", None),
+                getattr(metadata, "quant_indexer_metadata", None),
+                getattr(self.rotary_emb, "sin_cos_cache", None),
+            ]
+            tensors.extend(getattr(forward_batch, "npu_indexer_sin_cos_cache", ()))
+            shard = getattr(forward_batch, "npu_indexer_query_shard", None)
+            if shard is not None:
+                tensors.extend(
+                    (shard.actual_seq_lengths_q, shard.actual_seq_lengths_kv)
+                )
+                if shard.quant_indexer_plan is not None:
+                    tensors.extend(shard.quant_indexer_plan)
+            for tensor in tensors:
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
+                    tensor.record_stream(stream)
+            indices, shard, num_tokens = self.forward_npu(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                input_on_attn_tp_slices,
+                defer_query_gather=True,
+            )
+            indices.record_stream(stream)
+            ready = stream.record_event()
+        return _PendingIndexerTopk(indices, ready, shard, num_tokens)
+
     def _plan_quant_lightning_indexer(
         self,
         cum_query_lens: torch.Tensor,
@@ -278,7 +360,9 @@ class DSANPUIndexerMixin:
         layer_id: int,
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
-    ) -> torch.Tensor:
+        *,
+        defer_query_gather: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[_IndexerQueryShard], int]]:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
@@ -304,6 +388,12 @@ class DSANPUIndexerMixin:
             if self.alt_stream is not None:
                 self.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(self.alt_stream):
+                    if defer_query_gather:
+                        q_lora.record_stream(self.alt_stream)
+                        cos.record_stream(self.alt_stream)
+                        sin.record_stream(self.alt_stream)
+                        if dynamic_scale is not None:
+                            dynamic_scale.record_stream(self.alt_stream)
                     q_lora = (
                         (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
                     )
@@ -346,6 +436,8 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream = get_indexer_weight_stream()
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
+                    if defer_query_gather:
+                        x.record_stream(indexer_weight_stream)
                     x = x.view(-1, self.hidden_size)
                     weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
                     weights.record_stream(indexer_weight_stream)
@@ -375,6 +467,8 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream = get_indexer_weight_stream()
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
+                    if defer_query_gather:
+                        x.record_stream(indexer_weight_stream)
                     x = x.view(-1, self.hidden_size)
                     weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
                     weights.record_stream(indexer_weight_stream)
@@ -514,8 +608,12 @@ class DSANPUIndexerMixin:
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
+            if defer_query_gather:
+                q.record_stream(torch.npu.current_stream())
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
+            if defer_query_gather:
+                weights.record_stream(torch.npu.current_stream())
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
@@ -648,6 +746,8 @@ class DSANPUIndexerMixin:
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
+            if defer_query_gather:
+                return topk_indices, shard, num_query_tokens
             if shard is not None:
                 topk_indices = shard.gather(topk_indices, num_query_tokens)
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.

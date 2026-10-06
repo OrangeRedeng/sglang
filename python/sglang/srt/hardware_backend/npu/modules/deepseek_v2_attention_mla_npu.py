@@ -33,10 +33,17 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_dcp_mla_decode_phase,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_stream
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -64,6 +71,17 @@ def _get_dcp_gather_prefetch_stream():
     if _dcp_gather_prefetch_stream is None:
         _dcp_gather_prefetch_stream = torch.npu.Stream()
     return _dcp_gather_prefetch_stream
+
+
+def _use_dsa_eager_streams(forward_batch: "ForwardBatch") -> bool:
+    return (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_draft_extend_v2()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not get_is_capture_mode()
+        and not is_in_breakable_cuda_graph()
+        and not is_in_tc_piecewise_cuda_graph()
+    )
 
 
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
@@ -416,9 +434,23 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    pending_indexer = None
+    q_nope_ready = None
+    needs_indexer = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
+    overlap_qnope_rope = (
+        envs.SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE.get()
+        and _use_dsa_eager_streams(forward_batch)
+    )
     get_dsa_cp_plan(
         forward_batch,
         index_topk=m.indexer.index_topk if m.indexer is not None else None,
+    )
+    eager_indexer = (
+        envs.SGLANG_NPU_DSA_EAGER_INDEXER.get()
+        and _use_dsa_eager_streams(forward_batch)
+        and needs_indexer
+        and not dsa_use_prefill_cp(forward_batch)
+        and m.indexer.can_forward_npu_eager(forward_batch, input_on_attn_tp_slices)
     )
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
@@ -455,10 +487,22 @@ def forward_dsa_prepare_npu(
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             q_lora = q.clone()  # required for topk_indices
 
+            if eager_indexer:
+                pending_indexer = m.indexer.forward_npu_eager(
+                    hidden_states,
+                    q_lora,
+                    positions,
+                    forward_batch,
+                    m.layer_id,
+                    input_on_attn_tp_slices,
+                )
+
             q_event = None
             if m.alt_stream is not None:
                 m.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(m.alt_stream):
+                    if eager_indexer or overlap_qnope_rope:
+                        q_lora.record_stream(m.alt_stream)
                     q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
                     # record q to ensure memory space will not be released
                     q.record_stream(m.alt_stream)
@@ -473,6 +517,8 @@ def forward_dsa_prepare_npu(
             # main stream waits for the completion of the event on the alt stream to ensure data dependency is complete
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
+                if eager_indexer or overlap_qnope_rope:
+                    q.record_stream(torch.npu.current_stream())
         else:
             if (
                 fused_qkv_a_proj_out.shape[0] < 65535
@@ -488,6 +534,15 @@ def forward_dsa_prepare_npu(
                     m.qk_rope_head_dim,
                     eps=m.q_a_layernorm.variance_epsilon,
                 )
+                if eager_indexer:
+                    pending_indexer = m.indexer.forward_npu_eager(
+                        hidden_states,
+                        q_lora,
+                        positions,
+                        forward_batch,
+                        m.layer_id,
+                        input_on_attn_tp_slices,
+                    )
             else:
                 # Keep the numerically validated unfused path for models that
                 # explicitly opt out of the fused split and RMSNorm kernel.
@@ -498,6 +553,15 @@ def forward_dsa_prepare_npu(
                 q = m.q_a_layernorm(q)
 
                 q_lora = q.clone()  # required for topk_indices
+                if eager_indexer:
+                    pending_indexer = m.indexer.forward_npu_eager(
+                        hidden_states,
+                        q_lora,
+                        positions,
+                        forward_batch,
+                        m.layer_id,
+                        input_on_attn_tp_slices,
+                    )
                 k_nope, k_pe = latent_cache.unsqueeze(1).split(
                     [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
                 )
@@ -506,13 +570,30 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            m.w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        if overlap_qnope_rope:
+            stream = get_stream("npu_dsa_qnope")
+            q_ready = torch.npu.current_stream().record_event()
+            with torch.npu.stream(stream):
+                stream.wait_event(q_ready)
+                q_nope.record_stream(stream)
+                m.w_kc.record_stream(stream)
+                q_nope_out = torch_npu.npu_transpose_batchmatmul(
+                    q_nope,
+                    m.w_kc,
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                )
+                q_nope_out.record_stream(stream)
+                q_nope_ready = stream.record_event()
+        else:
+            q_nope_out = torch_npu.npu_transpose_batchmatmul(
+                q_nope,
+                m.w_kc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             # Match the half-layout RoPE outputs used by MLA preprocessing.
@@ -532,16 +613,19 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        topk_indices = m.indexer(
-            hidden_states,
-            q_lora,
-            positions,
-            forward_batch,
-            m.layer_id,
-            input_on_attn_tp_slices,
-            dynamic_scale,
-        )
+    if needs_indexer:
+        if pending_indexer is not None:
+            topk_indices = pending_indexer.wait_and_gather()
+        else:
+            topk_indices = m.indexer(
+                hidden_states,
+                q_lora,
+                positions,
+                forward_batch,
+                m.layer_id,
+                input_on_attn_tp_slices,
+                dynamic_scale,
+            )
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
@@ -560,6 +644,10 @@ def forward_dsa_prepare_npu(
         q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
+
+    if q_nope_ready is not None:
+        torch.npu.current_stream().wait_event(q_nope_ready)
+        q_nope_out.record_stream(torch.npu.current_stream())
 
     return (
         q_pe,

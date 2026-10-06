@@ -940,7 +940,20 @@ class DeepseekV2MoE(nn.Module):
             self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
         )
         self._npu_tp_shared_stream = None
+        self._npu_tp_shared_stream_start = "pre_gate"
         if _is_npu and hasattr(self, "shared_experts"):
+            self._npu_tp_shared_stream_start = (
+                envs.SGLANG_NPU_TP_MOE_SHARED_STREAM_START.get()
+            )
+            if self._npu_tp_shared_stream_start not in (
+                "pre_gate",
+                "post_gate",
+                "post_topk",
+            ):
+                raise ValueError(
+                    "SGLANG_NPU_TP_MOE_SHARED_STREAM_START must be "
+                    "pre_gate, post_gate, or post_topk"
+                )
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
                 shared_gmm1_mode,
                 supports_mxfp8_linear,
@@ -1425,7 +1438,7 @@ class DeepseekV2MoE(nn.Module):
                 if skip_shared_experts
                 else self._maybe_quant_moe_input_once(hidden_states)
             )
-            if (
+            shared_async = (
                 self._npu_tp_shared_stream is not None
                 and not skip_shared_experts
                 and not get_is_capture_mode()
@@ -1433,18 +1446,14 @@ class DeepseekV2MoE(nn.Module):
                 and not is_in_tc_piecewise_cuda_graph()
                 and not get_forward().sp_active
                 and not self.shared_experts.down_proj.use_decode_attn_tp
-            ):
-                # Shared compute is independent; all collectives stay on the caller.
-                input_ready = torch.npu.current_stream().record_event()
-                with torch.npu.stream(self._npu_tp_shared_stream):
-                    self._npu_tp_shared_stream.wait_event(input_ready)
-                    hidden_states.record_stream(self._npu_tp_shared_stream)
-                    shared_output = self._forward_shared_experts(
-                        hidden_states, pre_quant_input=pre_quant_input
-                    )
-                    shared_ready = self._npu_tp_shared_stream.record_event()
+            )
+            if shared_async and self._npu_tp_shared_stream_start == "pre_gate":
+                shared_output, shared_ready = self._start_npu_tp_shared_experts(
+                    hidden_states, pre_quant_input
+                )
             elif (
-                not defer_shared
+                not shared_async
+                and not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
@@ -1468,6 +1477,10 @@ class DeepseekV2MoE(nn.Module):
                         gate_input = pre_quant_input or hidden_states
                 router_logits = self.gate(gate_input, gemm_output_zero_allocator)
                 router_logits_partials = None
+            if shared_async and self._npu_tp_shared_stream_start == "post_gate":
+                shared_output, shared_ready = self._start_npu_tp_shared_experts(
+                    hidden_states, pre_quant_input
+                )
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1489,6 +1502,10 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
+                )
+            if shared_async and self._npu_tp_shared_stream_start == "post_topk":
+                shared_output, shared_ready = self._start_npu_tp_shared_experts(
+                    hidden_states, pre_quant_input
                 )
         else:
             pre_quant_input = None
@@ -1904,6 +1921,23 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
+
+    def _start_npu_tp_shared_experts(self, hidden_states, pre_quant_input):
+        stream = self._npu_tp_shared_stream
+        input_ready = torch.npu.current_stream().record_event()
+        with torch.npu.stream(stream):
+            stream.wait_event(input_ready)
+            hidden_states.record_stream(stream)
+            if pre_quant_input is not None:
+                for tensor in pre_quant_input:
+                    tensor.record_stream(stream)
+            shared_output = self._forward_shared_experts(
+                hidden_states, pre_quant_input=pre_quant_input
+            )
+            shared_output.record_stream(stream)
+            shared_ready = stream.record_event()
+        shared_output.record_stream(torch.npu.current_stream())
+        return shared_output, shared_ready
 
     def _forward_shared_experts(
         self,
