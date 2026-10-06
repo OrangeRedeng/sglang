@@ -1,9 +1,11 @@
 """Opt-in native MXFP8 input and router for GLM-5.2 TP MoE."""
 
+import logging
 from functools import lru_cache
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
     mxfp8_input,
     record_mxfp8_operand,
@@ -13,6 +15,41 @@ from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import _require_e8m0_dtype
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+
+logger = logging.getLogger(__name__)
+
+
+def _gate_option(name, choices):
+    value = getattr(envs, name).get()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {choices}; got {value!r}")
+    return value
+
+
+def _tensor_layout(tensor):
+    import torch_npu
+
+    return (
+        f"dtype={tensor.dtype} shape={tuple(tensor.shape)} stride={tensor.stride()} "
+        f"contiguous={tensor.is_contiguous()} format={torch_npu.get_npu_format(tensor)}"
+    )
+
+
+@lru_cache(maxsize=None)
+def _log_gate_config(output_dtype, weight_layout, topk_layout, scale_alg):
+    logger.info(
+        "MXFP8 gate: output_dtype=%s weight_layout=%s topk_layout=%s "
+        "weight_scale_alg=%s; grouped TopK uses FP32 logits/bias",
+        output_dtype,
+        weight_layout,
+        topk_layout,
+        scale_alg,
+    )
+
+
+@lru_cache(maxsize=None)
+def _log_gate_output(output_dtype):
+    logger.info("MXFP8 gate actual QuantMatmul output_dtype=%s", output_dtype)
 
 
 @lru_cache(maxsize=None)
@@ -97,12 +134,48 @@ class NativeMXFP8MoENorm(RMSNorm):
     forward = forward_npu
 
 
+def _mxfp8_gate_logits_dtype():
+    mode = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE.get()
+    if mode == "bf16":
+        return torch.bfloat16
+    if mode == "fp32":
+        return torch.float32
+    raise ValueError(
+        f"SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE must be bf16 or fp32; got {mode!r}"
+    )
+
+
 class MXFP8GateMethod(QuantizeMethodBase):
     def __init__(self):
+        self.output_dtype = _mxfp8_gate_logits_dtype()
+        self.weight_layout = _gate_option(
+            "SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT",
+            ("transposed", "contiguous", "nz"),
+        )
+        self.topk_layout = _gate_option(
+            "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT",
+            ("default", "contiguous", "clone", "nd"),
+        )
+        self.scale_alg = _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG", (0, 1))
+        self.diagnostics = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS.get()
+        self._topk_layout_logged = set()
         self.matmul = mxfp8_gate_op()
         self.quantize = require_npu_op(
             "npu_dynamic_mx_quant",
             ("dst_type", "block_size", "scale_alg", "round_mode"),
+        )
+        self.format_cast = (
+            require_npu_op("npu_format_cast")
+            if self.weight_layout == "nz" or self.topk_layout == "nd"
+            else None
+        )
+        if (
+            self.weight_layout == "nz"
+            and envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get()
+        ):
+            raise ValueError("MXFP8 gate NZ conflicts with DISABLE_ACL_FORMAT_WEIGHT=1")
+        _log_gate_config(
+            self.output_dtype, self.weight_layout, self.topk_layout, self.scale_alg
         )
 
     @torch.no_grad()
@@ -121,21 +194,47 @@ class MXFP8GateMethod(QuantizeMethodBase):
             layer.weight.data,
             dst_type=torch.float8_e4m3fn,
             block_size=32,
-            scale_alg=0,
+            scale_alg=self.scale_alg,
             round_mode="rint",
         )
         if q.dtype != torch.float8_e4m3fn or q.shape != layer.weight.shape:
             raise RuntimeError("Unsupported native gate MXFP8 quantization output")
-        layer.register_buffer("mxfp8_weight", q.transpose(0, 1), persistent=False)
-        layer.register_buffer(
-            "mxfp8_weight_scale",
-            mx_scale_layout(scale, 256, 6144).transpose(0, 1),
-            persistent=False,
-        )
+        weight = q.transpose(0, 1)
+        weight_scale = mx_scale_layout(scale, 256, 6144).transpose(0, 1)
+        if self.weight_layout != "transposed":
+            # Match the scale's reduction-axis layout to the persistent weight.
+            weight = weight.contiguous()
+            weight_scale = weight_scale.contiguous()
+        if self.weight_layout == "nz":
+            weight = self.format_cast(weight, 29)
+        layer.register_buffer("mxfp8_weight", weight, persistent=False)
+        layer.register_buffer("mxfp8_weight_scale", weight_scale, persistent=False)
+        if self.diagnostics:
+            logger.info("MXFP8 gate weight: %s", _tensor_layout(weight))
+            logger.info("MXFP8 gate weight scale: %s", _tensor_layout(weight_scale))
 
-    def apply(self, layer, hidden_states, *, output_dtype=torch.float32):
+    def prepare_topk_logits(self, logits):
+        # Preserve the FP32 correction-bias routing boundary before changing layout.
+        topk_logits = logits.to(torch.float32)
+        if self.topk_layout == "contiguous":
+            topk_logits = topk_logits.contiguous()
+        elif self.topk_layout == "clone":
+            topk_logits = topk_logits.clone(memory_format=torch.contiguous_format)
+        elif self.topk_layout == "nd":
+            topk_logits = self.format_cast(topk_logits, 2)
+        if self.diagnostics:
+            key = (tuple(logits.shape), logits.dtype, logits.stride())
+            if key not in self._topk_layout_logged:
+                logger.info("MXFP8 gate output: %s", _tensor_layout(logits))
+                logger.info("MXFP8 grouped TopK input: %s", _tensor_layout(topk_logits))
+                self._topk_layout_logged.add(key)
+        return topk_logits
+
+    def apply(self, layer, hidden_states, *, output_dtype=None):
+        if output_dtype is None:
+            output_dtype = self.output_dtype
         if output_dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("MXFP8 gate replay supports BF16 or FP32 output")
+            raise ValueError("MXFP8 gate supports BF16 or FP32 logits")
         if not hasattr(layer, "mxfp8_weight"):
             raise RuntimeError("MXFP8 gate weights were not prepared after loading")
         operand = (
@@ -159,6 +258,9 @@ class MXFP8GateMethod(QuantizeMethodBase):
         )
         if logits.dtype != output_dtype:
             raise RuntimeError(f"MXFP8 gate did not return {output_dtype} logits")
+        _log_gate_output(logits.dtype)
+        if self.topk_layout != "default" or self.diagnostics:
+            logits._npu_mxfp8_gate_method = self
         return logits
 
 

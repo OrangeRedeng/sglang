@@ -169,8 +169,8 @@ BF16 tensor. The original loaded gate parameter keeps its dtype and values for
 fallback and reference comparison. Gate MXFP8 weights are created once in the
 loader's normal postprocessing stage, directly from the loaded FP16/BF16/FP32
 tensor using native DynamicMxQuant, with the
-same transpose/scale views as `NPUMXFP8LinearMethod`. There is no weight
-quantization in forward and no new contiguous weight copy.
+same transpose/scale views as `NPUMXFP8LinearMethod` by default. There is no
+weight quantization or weight layout conversion in forward.
 
 Gate allocation is unchanged. GLM's gate uses the model dtype unless
 `router_fp32=True`; the usual BF16 NPU path computes BF16 activation x BF16
@@ -179,6 +179,82 @@ deterministic inference also promotes both operands. Capture records the
 actual loaded weight and deterministic flag. Replay reproduces those baseline
 semantics rather than assuming an FP32 GEMM or casting the gate before quantization.
 The experimental serving gate still returns FP32 logits by default.
+
+For a serving BF16/FP32 A/B, select the logits dtype in `norm_gate.py` through
+the environment variable, then restart the server with the same launch settings:
+
+```bash
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE=bf16
+# Run the unchanged serving workload, then stop the server.
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE=fp32
+```
+
+The setting defaults to `fp32`, accepts only `bf16` or `fp32`, and is resolved
+when the gate method is constructed. The QuantMatmul output and dtype check
+follow that setting. Replay passes both output dtypes explicitly, so its
+FP32/BF16 labels remain correct regardless of the serving setting.
+Native norm, shared/routed overlap and collectives are unchanged.
+Grouped NPU TopK promotes both BF16 and FP32 gate logits to FP32 before the
+operator call. A BF16 gate experiment changes rounding and may add that cast;
+it does not select a BF16 TopK kernel. The supplied TopK timing difference
+therefore remains a profiling hypothesis, requiring matched A/B routing and
+timeline checks. The switch does not establish accuracy or a speedup.
+
+The runtime gate in `python/sglang/srt/hardware_backend/npu/moe/norm_gate.py`
+also supports these independent A/B controls. Restart serving between changes;
+keep all other launch and workload settings fixed.
+
+| Environment suffix (prefix `SGLANG_NPU_TP_MOE_`) | Default | Choices |
+| --- | --- | --- |
+| `MXFP8_GATE_WEIGHT_LAYOUT` | `transposed` | `transposed`, `contiguous`, `nz` |
+| `MXFP8_GATE_TOPK_LAYOUT` | `default` | `default`, `contiguous`, `clone`, `nd` |
+| `MXFP8_GATE_SCALE_ALG` | `0` | `0`, `1` |
+| `MXFP8_GATE_DIAGNOSTICS` | `0` | `0`, `1` |
+
+`contiguous` weight mode prepares persistent contiguous weight **and** scale
+buffers at loading time. `nz` additionally converts the FP8 weight to
+FRACTAL_NZ; scales remain ND. An explicit `nz` request conflicts with
+`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` and fails rather than silently running
+the baseline. The layout follows the
+[vLLM-Ascend MXFP8 NZ transformation](https://github.com/vllm-project/vllm-ascend/pull/15565).
+The installed torch_npu/CANN build still needs to validate FP8 format conversion.
+
+TopK layout changes run **after** promoting logits to FP32, immediately before
+grouped `npu_moe_gating_top_k`. Correction bias stays FP32, preserving the
+existing GLM-5.2 routing semantics. `contiguous` can be a no-op; `clone` forces
+a fresh contiguous allocation; `nd` explicitly requests storage format ND.
+These copy modes are diagnostics until matched measurements show a gain.
+
+`SCALE_ALG` changes only the once-per-load **gate weight** quantization. Native
+norm activation quantization and the input reused by experts retain algorithm 0.
+Recheck captured TopK agreement and end-to-end accuracy before accepting either
+logit dtype or quantization algorithm changes.
+
+```bash
+# Weight A/B: rerun unchanged serving with transposed, contiguous, then nz.
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT=contiguous
+# Separate TopK A/B: reset weight layout; try default/contiguous/clone/nd.
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT=transposed
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT=nd
+# Separate accuracy A/B: reset TopK layout; try weight scale algorithm 1.
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT=default
+export SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG=1
+```
+
+Startup reports the selected dtype, layouts and weight scale algorithm; the
+first QuantMatmul call reports its actual output dtype. For a separate
+diagnostic run, set `SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS=1` to log weight,
+scale, gate output and actual grouped TopK input dtype/shape/stride/contiguity/
+NPU storage format once per input layout per layer. Turn it off for timing runs.
+
+Shared GMM1 and eager overlap already have serving switches:
+`SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE=grouped_fused|split_group_quant|split3|baseline`
+and `SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM=0|1`. Measure these separately after
+fixing the gate settings. Shared grouped metadata is already cached for the
+current token count/device. Layer-wise original-gate fallback requires a BF16
+norm output for selected layers and is deferred until capture identifies those
+layers. Attention/indexer, collectives, scheduler and custom kernels are outside
+this change.
 
 The paired experiment requires GLM-5.2 W4A8 MXFP, TP4/EP1, separate compatible
 shared experts, prequant/reuse enabled, and no DP/CP input movement or batch
