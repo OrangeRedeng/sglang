@@ -1000,6 +1000,7 @@ class Envs:
     # An explicit mode overrides the legacy SHARED_GMM1 switch.
     SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_TP_MOE_SHARED_STREAM_START = EnvStr("pre_gate")
     SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
@@ -1031,6 +1032,10 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: overlap the q-nope projection's RoPE with the eager indexer
+    # on a side stream (opt-in A/B experiments).
+    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE = EnvBool(False)
+    SGLANG_NPU_DSA_EAGER_INDEXER = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
