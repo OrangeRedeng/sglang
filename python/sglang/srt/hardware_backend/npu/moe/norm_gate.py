@@ -107,9 +107,16 @@ class MXFP8GateMethod(QuantizeMethodBase):
 
     @torch.no_grad()
     def process_weights_after_loading(self, layer):
-        if layer.weight.dtype != torch.float32 or layer.weight.shape != (256, 6144):
-            raise ValueError("GLM-5.2 MXFP8 gate requires FP32 [256,6144] weights")
-        # Match NPUMXFP8LinearMethod's strided views, retaining FP32 checkpoint data.
+        if layer.weight.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ) or layer.weight.shape != (256, 6144):
+            raise ValueError(
+                "GLM-5.2 MXFP8 gate requires FP16/BF16/FP32 [256,6144] weights; "
+                f"got {layer.weight.dtype} {tuple(layer.weight.shape)}"
+            )
+        # Retain the loaded gate dtype/values for the production reference.
         q, scale = self.quantize(
             layer.weight.data,
             dst_type=torch.float8_e4m3fn,
@@ -126,7 +133,9 @@ class MXFP8GateMethod(QuantizeMethodBase):
             persistent=False,
         )
 
-    def apply(self, layer, hidden_states):
+    def apply(self, layer, hidden_states, *, output_dtype=torch.float32):
+        if output_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("MXFP8 gate replay supports BF16 or FP32 output")
         if not hasattr(layer, "mxfp8_weight"):
             raise RuntimeError("MXFP8 gate weights were not prepared after loading")
         operand = (
@@ -145,11 +154,11 @@ class MXFP8GateMethod(QuantizeMethodBase):
             pertoken_scale=mx_scale_layout(scale, q.shape[0], q.shape[1]),
             scale_dtype=_require_e8m0_dtype(),
             pertoken_scale_dtype=_require_e8m0_dtype(),
-            output_dtype=torch.float32,
+            output_dtype=output_dtype,
             group_sizes=[1, 1, 32],
         )
-        if logits.dtype != torch.float32:
-            raise RuntimeError("MXFP8 gate did not return FP32 logits")
+        if logits.dtype != output_dtype:
+            raise RuntimeError(f"MXFP8 gate did not return {output_dtype} logits")
         return logits
 
 
@@ -213,7 +222,7 @@ def install_input_capture(norm, moe):
     from pathlib import Path
 
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     if (
         envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get()
@@ -242,6 +251,7 @@ def install_input_capture(norm, moe):
             else cfg.correction_bias.detach().cpu(),
             "tp_size": moe.tp_size,
             "layer_id": moe.layer_id,
+            "deterministic": get_exec().deterministic.enable_deterministic_inference,
             "topk": {
                 key: getattr(cfg, key)
                 for key in (
