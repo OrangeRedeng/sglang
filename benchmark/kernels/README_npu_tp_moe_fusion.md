@@ -5,6 +5,8 @@ H=6144, 256 routed experts, routed TopK=8, I=2048, TP4/TP8, EP1 and the native
 TP dispatcher. The existing `deepep` and `allreduce-deepep` paths are preserved.
 The requested compatibility target is torch_npu 2.10.0.post6 / CANN 9.2.beta1;
 the installed operator schemas and numerical behavior still require A5 probes.
+Routing weights remain FP32 through dispatch and finalization, independently
+of the hidden-state quantization or fusion switches.
 
 | Switch (prefix `SGLANG_NPU_TP_MOE_`) | Implemented boundary | Constraints |
 | --- | --- | --- |
@@ -16,6 +18,11 @@ the installed operator schemas and numerical behavior still require A5 probes.
 | `NORM_MXFP8` | Custom residual/RMSNorm/bias with BF16 and MXFP8 outputs | Requires `PREQUANT_INPUT`; contiguous H=6144 inputs |
 | `SHARED_GMM1` | E=1 shared W13/SwiGLU/MX quant | Bias-free, unclamped MX-compatible shared projections |
 | `FUSED_SHARED_EXPERT` | Expert 256 always selected with weight 1; E=257/K=9 grouped execution | All shared projections and routed descriptors must be W4A8_MXFP; no EPLB, Waterfill or SBO/TBO |
+
+GMM2/finalize requests FP32 output for compatibility with deployed wrappers
+that reject BF16, then casts to BF16 before TP reduction. This adds a cast and
+changes the rounding boundary relative to standalone BF16 GMM2/finalize;
+the captured-tail comparison and serving accuracy checks remain required.
 
 `FUSE_SHARED_EXPERT` merges a separately computed shared output;
 `FUSED_SHARED_EXPERT` instead uses the existing shared-to-grouped weight loader.

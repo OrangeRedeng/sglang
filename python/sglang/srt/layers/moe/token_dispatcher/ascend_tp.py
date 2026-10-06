@@ -126,7 +126,7 @@ class AscendTPDispatcher(BaseDispatcher):
         pre_quant_input=None,
     ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
         input_scale = None
