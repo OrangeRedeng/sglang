@@ -1001,6 +1001,10 @@ class Envs:
     SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
+    SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR = EnvStr("")
+    SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS = EnvInt(1024)
     SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
