@@ -249,7 +249,9 @@ def main():
         "baseline_norm": baseline_norm,
         "native_norm_quant": native_norm,
         "baseline_gate": lambda: baseline_gate(normalized),
-        "native_fp32_gate": lambda: method.apply(gate, operand1),
+        "native_fp32_gate": lambda: method.apply(
+            gate, operand1, output_dtype=torch.float32
+        ),
         "native_bf16_gate": lambda: method.apply(
             gate, operand1, output_dtype=torch.bfloat16
         ),

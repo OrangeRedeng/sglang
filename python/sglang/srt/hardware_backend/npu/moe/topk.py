@@ -99,8 +99,14 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
+        gate_method = getattr(router_logits, "_npu_mxfp8_gate_method", None)
+        topk_logits = (
+            gate_method.prepare_topk_logits(router_logits)
+            if gate_method is not None
+            else router_logits.to(torch.float32)
+        )
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
+            topk_logits,
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
