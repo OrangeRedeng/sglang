@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -642,7 +643,11 @@ class DSANPUIndexerMixin:
             num_query_tokens = query.shape[0]
             shard = (
                 _get_indexer_query_shard(forward_batch, num_query_tokens)
-                if is_prefill and _shard_indexer_queries
+                if is_prefill
+                and _shard_indexer_queries
+                and threshold_allows(
+                    "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS", num_query_tokens
+                )
                 else None
             )
             if shard is not None:

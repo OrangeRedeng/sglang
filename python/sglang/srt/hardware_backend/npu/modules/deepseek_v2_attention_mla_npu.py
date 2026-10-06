@@ -10,6 +10,7 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -439,6 +440,9 @@ def forward_dsa_prepare_npu(
     needs_indexer = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
     overlap_qnope_rope = (
         envs.SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE.get()
+        and threshold_allows(
+            "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS", hidden_states.shape[0]
+        )
         and _use_dsa_eager_streams(forward_batch)
     )
     get_dsa_cp_plan(
@@ -447,6 +451,9 @@ def forward_dsa_prepare_npu(
     )
     eager_indexer = (
         envs.SGLANG_NPU_DSA_EAGER_INDEXER.get()
+        and threshold_allows(
+            "SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS", hidden_states.shape[0]
+        )
         and _use_dsa_eager_streams(forward_batch)
         and needs_indexer
         and not dsa_use_prefill_cp(forward_batch)
@@ -807,7 +814,14 @@ def _dcp_extend_gather_scratch(name: str, slot: int, ref: torch.Tensor, rows: in
     same buffers it always did, and a bf16 cache -- two keys, so two scratches
     -- gets a second slot for each.
     """
-    return dcp_extend_gather_buffer(name if slot == 0 else name + "_b", ref, rows)
+    exact_size = (
+        envs.SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS.get()
+        and not envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.is_set()
+        and not envs.SGLANG_NPU_AUTOTUNE_DRY_RUN.get()
+    )
+    return dcp_extend_gather_buffer(
+        name if slot == 0 else name + "_b", ref, rows, exact_size=exact_size
+    )
 
 
 def _dcp_extend_gather_scratches(slot: int, k_nope, k_pe, rows: int, packed_kv: bool):
@@ -891,12 +905,45 @@ def _dcp_gather_extend_kv_npu(
         # The shared planner's context-sized buffer is for CUDA's kernels and is
         # never read here, so drop it rather than hold it through every layer.
         md.dcp_kv_buffer = None
+        piece_rows = _dcp_extend_gather_piece_rows
+        if (
+            envs.SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS.get()
+            and not envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.is_set()
+        ):
+            from sglang.srt.distributed import get_dcp_group
+            from sglang.srt.hardware_backend.npu.autotune import auto_dcp_gather_rows
+
+            pool = get_token_to_kv_pool()
+            packed = getattr(pool, "dsa_kv_cache_store_fp8", False)
+            row_bytes = (
+                pool.kv_cache_dim
+                if packed
+                else (m.kv_lora_rank + m.qk_rope_head_dim) * k_nope.element_size()
+            )
+            free, _ = torch.npu.mem_get_info()
+            free_min = torch.tensor(free, dtype=torch.int64, device=k_nope.device)
+            torch.distributed.all_reduce(
+                free_min,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_dcp_group().device_group,
+            )
+            auto_rows = auto_dcp_gather_rows(
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                dcp_size=parallel.dcp_size,
+                alignment=forward_context.get_attn_backend().page_size,
+                bytes_per_row=row_bytes,
+                free_bytes=int(free_min.item()),
+                prefetch=_prefetch_dcp_extend_gather,
+                extend_rows=sum(forward_batch.extend_seq_lens_cpu),
+            )
+            if auto_rows is not None:
+                piece_rows = auto_rows
         plan = plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens_cpu,
             parallel.dcp_size,
             parallel.dcp_rank,
-            _dcp_extend_gather_piece_rows,
+            piece_rows,
             interleave_size=forward_context.get_attn_backend().page_size,
         )
         plan = plan._replace(

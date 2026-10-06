@@ -13,6 +13,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -615,7 +616,14 @@ class AscendAttnBackend(AttentionBackend):
         if not self.quant_indexer_enabled:
             return
         if forward_batch.forward_mode.is_extend() and (
-            forward_batch.attn_cp_metadata is not None or _shard_indexer_queries
+            forward_batch.attn_cp_metadata is not None
+            or (
+                _shard_indexer_queries
+                and threshold_allows(
+                    "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
+                    sum(forward_batch.extend_seq_lens_cpu or []),
+                )
+            )
         ):
             return
         base_q = self.forward_metadata.actual_seq_lengths_q

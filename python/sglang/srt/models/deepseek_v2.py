@@ -1440,6 +1440,8 @@ class DeepseekV2MoE(nn.Module):
             )
             shared_async = (
                 self._npu_tp_shared_stream is not None
+                and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
+                <= hidden_states.shape[0]
                 and not skip_shared_experts
                 and not get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()

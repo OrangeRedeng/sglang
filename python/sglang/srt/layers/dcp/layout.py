@@ -307,7 +307,9 @@ def plan_dcp_owner_write(
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 
 
-def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
+def dcp_extend_gather_buffer(
+    name: str, ref: torch.Tensor, rows: int, *, exact_size: bool = False
+) -> torch.Tensor:
     """Return a reusable ``rows``-row buffer shaped and typed like ``ref``.
 
     The extend gather's context-sized tensors were allocated fresh on each of
@@ -323,7 +325,7 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
     """
     key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
     buf = _dcp_extend_gather_buffers.get(key)
-    if buf is None or buf.shape[0] < rows:
+    if buf is None or buf.shape[0] < rows or (exact_size and buf.shape[0] != rows):
         # Release the old buffer before asking for the new one, or the peak is
         # briefly both of them.
         _dcp_extend_gather_buffers.pop(key, None)

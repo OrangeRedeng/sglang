@@ -927,6 +927,10 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.autotune import log_memory_diagnostics
+
+            log_memory_diagnostics(self.model, self.token_to_kv_pool)
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
