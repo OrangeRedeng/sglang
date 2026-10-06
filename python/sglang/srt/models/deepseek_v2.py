@@ -335,12 +335,12 @@ class DeepseekV2MLP(nn.Module):
             return x
         if (
             getattr(self, "_npu_tp_shared", False)
-            and envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get()
+            and self._npu_tp_shared_mode != "baseline"
             and x.shape[0]
         ):
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_gmm1
 
-            return shared_gmm1(self, x, gateup_pre_quant)
+            return shared_gmm1(self, x, gateup_pre_quant, mode=self._npu_tp_shared_mode)
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -931,11 +931,46 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_npu_tp_shared &= not (
             self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
         )
+        self._npu_tp_shared_stream = None
         if _is_npu and hasattr(self, "shared_experts"):
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                shared_gmm1_mode,
+                supports_mxfp8_linear,
+            )
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUW4A8MXFP4MoEMethod,
+            )
+            from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                AscendTPDispatcher,
+            )
+
             self.shared_experts._npu_tp_shared = (
                 not (self._enable_a2a_moe or self._shared_expert_tp1)
                 and self.experts.moe_ep_size == 1
             )
+            self.shared_experts._npu_tp_shared_mode = shared_gmm1_mode()
+            if (
+                envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM.get()
+                and self.shared_experts._npu_tp_shared
+                and self.num_fused_shared_experts == 0
+                and not self._fuse_shared_experts_inside_sbo
+                and isinstance(self.experts.dispatcher, AscendTPDispatcher)
+                and not self.experts.dispatcher.local_ep
+                and not self.experts.dispatcher.fuse_gmm2_finalize
+                and isinstance(
+                    getattr(self.experts, "w2_kernel", None), NPUW4A8MXFP4MoEMethod
+                )
+                and not self.experts.reduce_results
+                and not self.shared_experts.down_proj.reduce_results
+                and not self.shared_experts.gate_up_proj.gather_output
+                and self.shared_experts.down_proj.input_is_parallel
+                and supports_mxfp8_linear(self.shared_experts.gate_up_proj)
+                and supports_mxfp8_linear(self.shared_experts.down_proj)
+            ):
+                from sglang.srt.runtime_context import get_stream
+
+                self._npu_tp_shared_stream = get_stream("npu_tp_moe_shared")
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1360,6 +1395,7 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        shared_ready = None
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1369,6 +1405,24 @@ class DeepseekV2MoE(nn.Module):
                 else self._maybe_quant_moe_input_once(hidden_states)
             )
             if (
+                self._npu_tp_shared_stream is not None
+                and not skip_shared_experts
+                and not get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
+                and not is_in_tc_piecewise_cuda_graph()
+                and not get_forward().sp_active
+                and not self.shared_experts.down_proj.use_decode_attn_tp
+            ):
+                # Shared compute is independent; all collectives stay on the caller.
+                input_ready = torch.npu.current_stream().record_event()
+                with torch.npu.stream(self._npu_tp_shared_stream):
+                    self._npu_tp_shared_stream.wait_event(input_ready)
+                    hidden_states.record_stream(self._npu_tp_shared_stream)
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, pre_quant_input=pre_quant_input
+                    )
+                    shared_ready = self._npu_tp_shared_stream.record_event()
+            elif (
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
@@ -1453,6 +1507,11 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
                 pre_quant_input=pre_quant_input,
                 shared_output=shared_output,
+                shared_output_ready=(
+                    None
+                    if shared_ready is None
+                    else lambda: torch.npu.current_stream().wait_event(shared_ready)
+                ),
             )
             shared_output = None
         elif pre_quant_input is not None:
@@ -1478,6 +1537,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             defer_shared
+            and shared_ready is None
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
@@ -1488,6 +1548,9 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
+        if shared_ready is not None and shared_output is not None:
+            torch.npu.current_stream().wait_event(shared_ready)
+            shared_output.record_stream(torch.npu.current_stream())
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
