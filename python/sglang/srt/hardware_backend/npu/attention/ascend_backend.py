@@ -13,7 +13,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -24,6 +23,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
+)
+from sglang.srt.hardware_backend.npu.autotune import (
+    effective_prefill_query_tokens,
+    threshold_allows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -39,8 +42,8 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dcp.layout import (
     dcp_crop_free_extend,
     dcp_local_kv_block_table,
-    get_dcp_lens,
     get_dcp_chain_spec_lens,
+    get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -621,7 +624,7 @@ class AscendAttnBackend(AttentionBackend):
                 _shard_indexer_queries
                 and threshold_allows(
                     "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
-                    sum(forward_batch.extend_seq_lens_cpu or []),
+                    effective_prefill_query_tokens(forward_batch),
                 )
             )
         ):
@@ -1597,9 +1600,13 @@ class AscendAttnBackend(AttentionBackend):
             # Must keep mirroring is_dcp_mla_decode_phase (forward_mla.py),
             # where the caller decides to unpack (attn_output, lse). Restated
             # rather than imported: a backend importing a model inverts layering.
-            dcp_decode = get_parallel().dcp_enabled and not self.is_draft_worker and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
+            dcp_decode = (
+                get_parallel().dcp_enabled
+                and not self.is_draft_worker
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
             )
             if dcp_decode:
                 return forward_dcp_sparse_attention(

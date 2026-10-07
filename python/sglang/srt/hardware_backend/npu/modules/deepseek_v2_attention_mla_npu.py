@@ -10,12 +10,12 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_cp import (
     dsa_cp_redistribute_heads,
@@ -814,14 +814,7 @@ def _dcp_extend_gather_scratch(name: str, slot: int, ref: torch.Tensor, rows: in
     same buffers it always did, and a bf16 cache -- two keys, so two scratches
     -- gets a second slot for each.
     """
-    exact_size = (
-        envs.SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS.get()
-        and not envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.is_set()
-        and not envs.SGLANG_NPU_AUTOTUNE_DRY_RUN.get()
-    )
-    return dcp_extend_gather_buffer(
-        name if slot == 0 else name + "_b", ref, rows, exact_size=exact_size
-    )
+    return dcp_extend_gather_buffer(name if slot == 0 else name + "_b", ref, rows)
 
 
 def _dcp_extend_gather_scratches(slot: int, k_nope, k_pe, rows: int, packed_kv: bool):
@@ -911,7 +904,10 @@ def _dcp_gather_extend_kv_npu(
             and not envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.is_set()
         ):
             from sglang.srt.distributed import get_dcp_group
-            from sglang.srt.hardware_backend.npu.autotune import auto_dcp_gather_rows
+            from sglang.srt.hardware_backend.npu.autotune import (
+                auto_dcp_gather_rows,
+                dcp_scratch_budget,
+            )
 
             pool = get_token_to_kv_pool()
             packed = getattr(pool, "dsa_kv_cache_store_fp8", False)
@@ -920,11 +916,9 @@ def _dcp_gather_extend_kv_npu(
                 if packed
                 else (m.kv_lora_rank + m.qk_rope_head_dim) * k_nope.element_size()
             )
-            free, _ = torch.npu.mem_get_info()
-            free_min = torch.tensor(free, dtype=torch.int64, device=k_nope.device)
-            torch.distributed.all_reduce(
-                free_min,
-                op=torch.distributed.ReduceOp.MIN,
+            budget = dcp_scratch_budget(
+                device=k_nope.device,
+                dcp_size=parallel.dcp_size,
                 group=get_dcp_group().device_group,
             )
             auto_rows = auto_dcp_gather_rows(
@@ -932,7 +926,7 @@ def _dcp_gather_extend_kv_npu(
                 dcp_size=parallel.dcp_size,
                 alignment=forward_context.get_attn_backend().page_size,
                 bytes_per_row=row_bytes,
-                free_bytes=int(free_min.item()),
+                budget_bytes=budget,
                 prefetch=_prefetch_dcp_extend_gather,
                 extend_rows=sum(forward_batch.extend_seq_lens_cpu),
             )

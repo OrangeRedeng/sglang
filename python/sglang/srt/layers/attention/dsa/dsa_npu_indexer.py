@@ -7,7 +7,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
+from sglang.srt.hardware_backend.npu.autotune import (
+    effective_prefill_query_tokens,
+    threshold_allows,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -640,7 +643,7 @@ class DSANPUIndexerMixin:
                 else block_table
             )
             query = q.view(-1, self.n_heads, self.head_dim)
-            num_query_tokens = query.shape[0]
+            num_query_tokens = effective_prefill_query_tokens(forward_batch, query)
             shard = (
                 _get_indexer_query_shard(forward_batch, num_query_tokens)
                 if is_prefill
