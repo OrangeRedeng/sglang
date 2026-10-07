@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -63,6 +64,98 @@ def context():
 class TestNpuAutotune(unittest.TestCase):
     def test_hccl_current_shape(self):
         self.assertEqual(auto.hccl_buffer_mb(16384, 6144, 2), 256)
+
+    def test_representative_prefill_rows(self):
+        for chunk in (16384, -1, 0):
+            c = replace(context(), chunked_prefill_size=chunk, max_prefill_tokens=16384)
+            self.assertEqual(auto.representative_prefill_rows(c), 16384)
+            self.assertEqual(
+                tuner.candidates("buffer", c, None)[1], [128, 192, 256, 384, 512]
+            )
+        self.assertEqual(
+            auto.representative_prefill_rows(
+                replace(context(), chunked_prefill_size=8192)
+            ),
+            8192,
+        )
+        for chunk, maximum in ((16384, 0), (0, 0), (-1, -1)):
+            with (
+                self.subTest(chunk=chunk, maximum=maximum),
+                self.assertRaises(ValueError),
+            ):
+                auto.representative_prefill_rows(
+                    replace(
+                        context(),
+                        chunked_prefill_size=chunk,
+                        max_prefill_tokens=maximum,
+                    )
+                )
+
+    def test_restart_hccl_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "context.json").write_text(json.dumps(context().key_data()))
+            (root / "server.txt").write_text("--tp-size 4")
+            argv = [
+                "autotune",
+                "--model-path",
+                "/model",
+                "--context-file",
+                str(root / "context.json"),
+                "--server-args-file",
+                str(root / "server.txt"),
+                "--benchmark-command-file",
+                str(root / "benchmark.txt"),
+                "--output",
+                str(root / "plan.json"),
+                "--stages",
+                "buffer",
+                "--dry-run",
+            ]
+            for explicit, tune_explicit in (
+                (None, False),
+                ("1000", False),
+                ("1000", True),
+            ):
+                env = {} if explicit is None else {"HCCL_BUFFSIZE": explicit}
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(
+                        sys,
+                        "argv",
+                        argv + (["--tune-explicit"] if tune_explicit else []),
+                    ),
+                    patch.object(tuner.policy, "load_profile", return_value={}),
+                    patch("builtins.print"),
+                ):
+                    tuner.main()
+                stage = json.loads((root / "plan.json").read_text())["stages"][0]
+                if explicit and not tune_explicit:
+                    self.assertEqual(stage["status"], "explicit value preserved")
+                    self.assertEqual(stage["value"], "1000")
+                else:
+                    self.assertEqual(
+                        stage["candidates"], [explicit, 128, 192, 256, 384, 512]
+                    )
+
+    def test_restart_child_unsets_hccl(self):
+        args = SimpleNamespace(
+            model_path="/model", port=30088, host="127.0.0.1", python=sys.executable
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"HCCL_BUFFSIZE": "1000"}),
+            patch.object(
+                tuner.socket, "create_connection", side_effect=ConnectionRefusedError
+            ),
+            patch.object(
+                tuner.subprocess,
+                "Popen",
+                side_effect=RuntimeError("stop after env capture"),
+            ) as popen,
+        ):
+            tuner.run_case(args, [], {"HCCL_BUFFSIZE": None}, Path(directory), 2)
+            self.assertNotIn("HCCL_BUFFSIZE", popen.call_args.kwargs["env"])
 
     def test_hccl_rounding_and_clamping(self):
         self.assertEqual(auto.hccl_buffer_mb(1, 1, 2), 64)
@@ -165,13 +258,122 @@ class TestNpuAutotune(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ownership cycle"):
             auto.dcp_piece_rows(100, 656, 4, 2, 128, 1000)
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "CPU torch required")
+    def test_dcp_grow_only_buffers(self):
+        import torch
+
+        runtime = ModuleType("sglang.srt.runtime_context")
+        runtime.get_parallel = Mock()
+        utils = ModuleType("sglang.srt.utils")
+        utils.print_info_once = Mock()
+        spec = importlib.util.spec_from_file_location(
+            "dcp_layout_policy_test", ROOT / "python/sglang/srt/layers/dcp/layout.py"
+        )
+        layout = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules, {runtime.__name__: runtime, utils.__name__: utils}
+        ):
+            spec.loader.exec_module(layout)
+        ref = torch.empty((1, 8))
+        with patch.object(torch, "empty", wraps=torch.empty) as allocate:
+            large = layout.dcp_extend_gather_buffer("scratch", ref, 256)
+            small = layout.dcp_extend_gather_buffer("scratch", ref, 128)
+            self.assertEqual(small.shape, (128, 8))
+            self.assertEqual(small.data_ptr(), large.data_ptr())
+            self.assertEqual(allocate.call_count, 1)
+            grown = layout.dcp_extend_gather_buffer("scratch", ref, 512)
+            self.assertEqual(grown.shape, (512, 8))
+            self.assertNotEqual(grown.data_ptr(), large.data_ptr())
+            self.assertEqual(allocate.call_count, 2)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "CPU torch required")
+    def test_dcp_cached_common_memory_budget(self):
+        import torch
+
+        auto._cached_dcp_scratch_budget.cache_clear()
+        self.addCleanup(auto._cached_dcp_scratch_budget.cache_clear)
+        device = torch.device("cpu")
+        group = object()
+        npu = SimpleNamespace(
+            mem_get_info=Mock(return_value=(512 * auto.MIB, 1024 * auto.MIB))
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS": "1"},
+                clear=True,
+            ),
+            patch.object(torch, "npu", npu, create=True),
+            patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=lambda tensor, **kw: tensor.fill_(256 * auto.MIB),
+            ) as reduce,
+            self.assertLogs(auto.logger, level="INFO") as logs,
+        ):
+            sizes = []
+            for prefix in (1000, 1 << 20):
+                budget = auto.dcp_scratch_budget(device=device, dcp_size=4, group=group)
+                self.assertEqual(budget, 128 * auto.MIB)
+                sizes.append(
+                    auto.auto_dcp_gather_rows(
+                        prefix_lens=[prefix],
+                        dcp_size=4,
+                        alignment=128,
+                        bytes_per_row=656,
+                        budget_bytes=budget,
+                        prefetch=True,
+                    )
+                )
+            self.assertEqual(npu.mem_get_info.call_count, 1)
+            self.assertEqual(reduce.call_count, 1)
+            self.assertEqual(reduce.call_args.kwargs["group"], group)
+            self.assertEqual(
+                reduce.call_args.kwargs["op"], torch.distributed.ReduceOp.MIN
+            )
+            self.assertLess(sizes[0], sizes[1])
+            self.assertEqual(
+                sum("NPU DCP scratch budget:" in line for line in logs.output), 1
+            )
+            with patch.dict(os.environ, {"SGLANG_NPU_DCP_SCRATCH_BUDGET_MB": "64"}):
+                self.assertEqual(
+                    auto.dcp_scratch_budget(device=device, dcp_size=4, group=group),
+                    64 * auto.MIB,
+                )
+            auto.dcp_scratch_budget(device=device, dcp_size=2, group=group)
+            auto.dcp_scratch_budget(device=device, dcp_size=4, group=object())
+            self.assertEqual(reduce.call_count, 4)
+
+    def test_indexer_threshold_includes_padding(self):
+        batch = SimpleNamespace(
+            input_ids=SimpleNamespace(shape=(1024,)), extend_seq_lens_cpu=[1023]
+        )
+        query = SimpleNamespace(shape=(1024, 64, 128))
+        self.assertEqual(
+            auto.effective_prefill_query_tokens(batch),
+            auto.effective_prefill_query_tokens(batch, query),
+        )
+        self.assertEqual(
+            auto.effective_prefill_query_tokens(batch, SimpleNamespace(shape=(1023,))),
+            1023,
+        )
+        with patch.dict(
+            os.environ, {"SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS": "1024"}
+        ):
+            self.assertTrue(
+                auto.threshold_allows(
+                    "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
+                    auto.effective_prefill_query_tokens(batch),
+                )
+            )
+
     def test_dcp_explicit_and_dry_run(self):
         kwargs = dict(
             prefix_lens=[1000],
             dcp_size=4,
             alignment=128,
             bytes_per_row=656,
-            free_bytes=1 << 30,
+            budget_bytes=256 * auto.MIB,
             prefetch=True,
         )
         with patch.dict(
@@ -193,7 +395,7 @@ class TestNpuAutotune(unittest.TestCase):
             dcp_size=4,
             alignment=128,
             bytes_per_row=656,
-            free_bytes=1 << 30,
+            budget_bytes=256 * auto.MIB,
             prefetch=True,
             extend_rows=16384,
         )
@@ -213,7 +415,7 @@ class TestNpuAutotune(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaises(ValueError):
-                auto.auto_dcp_gather_rows(**kwargs)
+                auto.auto_dcp_gather_rows(**{**kwargs, "budget_bytes": auto.MIB})
 
     def test_threshold_independence(self):
         with patch.dict(
@@ -285,6 +487,28 @@ class TestNpuAutotune(unittest.TestCase):
                     auto.initialize(SimpleNamespace())
                     self.assertEqual(os.environ["HCCL_BUFFSIZE"], "128")
                     self.assertEqual(os.environ["SGLANG_NPU_DSA_CP_MIN_TOKENS"], "0")
+
+    def test_current_shape_dry_run_does_not_set_hccl(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_NPU_TUNING_CACHE_DIR": directory,
+                    "SGLANG_NPU_AUTO_HCCL_BUFFSIZE": "1",
+                    "SGLANG_NPU_AUTOTUNE_DRY_RUN": "1",
+                },
+                clear=True,
+            ),
+            patch.object(auto, "context_from_server_args", return_value=context()),
+            self.assertLogs(auto.logger, level="INFO") as logs,
+        ):
+            auto.initialize(SimpleNamespace())
+            self.assertNotIn("HCCL_BUFFSIZE", os.environ)
+            output = "\n".join(logs.output)
+            self.assertIn("HCCL_BUFFSIZE=256", output)
+            self.assertIn("source=deterministic-auto", output)
+            self.assertIn("collective_bytes=201326592", output)
 
     def test_disabled_initialization(self):
         with (

@@ -6,7 +6,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
+from sglang.srt.hardware_backend.npu.autotune import (
+    effective_prefill_query_tokens,
+    threshold_allows,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

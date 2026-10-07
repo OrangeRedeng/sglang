@@ -72,6 +72,20 @@ class NpuTuningContext:
         return asdict(self)
 
 
+def representative_prefill_rows(context: NpuTuningContext) -> int:
+    if context.max_prefill_tokens <= 0:
+        raise ValueError("max_prefill_tokens must be positive for NPU autotuning")
+    if context.chunked_prefill_size > 0:
+        return min(context.chunked_prefill_size, context.max_prefill_tokens)
+    return context.max_prefill_tokens
+
+
+def effective_prefill_query_tokens(forward_batch, query=None) -> int:
+    # Before query projection, input_ids carries the same serving padding.
+    tokens = forward_batch.input_ids if query is None else query
+    return tokens.shape[0]
+
+
 @dataclass(frozen=True)
 class NpuTuningDecision:
     name: str
@@ -230,7 +244,6 @@ def _version(package):
 
 def context_from_server_args(server_args):
     from sglang.srt.arg_groups.model_override_base import model_config_of
-
     from sglang.srt.environ import envs
 
     model = model_config_of(server_args)
@@ -436,9 +449,7 @@ def initialize(server_args):
                     os.environ.setdefault(name, str(decision.value))
     dry = enabled("SGLANG_NPU_AUTOTUNE_DRY_RUN")
     if enabled("SGLANG_NPU_AUTO_HCCL_BUFFSIZE") or enabled("SGLANG_NPU_TUNING_PROFILE"):
-        rows = min(context.chunked_prefill_size, context.max_prefill_tokens)
-        if rows <= 0:
-            rows = context.max_prefill_tokens
+        rows = representative_prefill_rows(context)
         element = 4 if context.dtype in ("float32", "torch.float32") else 2
         headroom = float(os.environ.get("SGLANG_NPU_HCCL_HEADROOM", "1.25"))
         quantum = int(os.environ.get("SGLANG_NPU_HCCL_QUANTUM_MB", "32"))
@@ -486,13 +497,46 @@ def threshold_allows(name, rows):
     return rows >= value
 
 
+def dcp_scratch_budget(*, device, dcp_size, group):
+    configured = int(os.environ.get("SGLANG_NPU_DCP_SCRATCH_BUDGET_MB", "256")) * MIB
+    return _cached_dcp_scratch_budget(device, dcp_size, configured, group)
+
+
+def _common_dcp_free_bytes(device, group):
+    import torch
+
+    free, _ = torch.npu.mem_get_info(device)
+    free_min = torch.tensor(free, dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(
+        free_min, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    return int(free_min.item())
+
+
+@lru_cache(maxsize=None)
+def _cached_dcp_scratch_budget(device, dcp_size, configured, group):
+    # Cache the rank-agreed limit, never the prefix-dependent piece size.
+    free = _common_dcp_free_bytes(device, group)
+    budget = min(configured, free // 2)
+    logger.info(
+        "NPU DCP scratch budget: device=%s dcp=%s configured_bytes=%s "
+        "common_free_bytes=%s budget_bytes=%s",
+        device,
+        dcp_size,
+        configured,
+        free,
+        budget,
+    )
+    return budget
+
+
 def auto_dcp_gather_rows(
     *,
     prefix_lens,
     dcp_size,
     alignment,
     bytes_per_row,
-    free_bytes,
+    budget_bytes,
     prefetch,
     extend_rows=0,
 ):
@@ -502,9 +546,7 @@ def auto_dcp_gather_rows(
         or name in os.environ
     ):
         return None
-    budget = int(os.environ.get("SGLANG_NPU_DCP_SCRATCH_BUDGET_MB", "256")) * MIB
-    # Each rank supplies a common free-memory minimum, avoiding mismatched collectives.
-    budget = min(budget, int(free_bytes * 0.5))
+    budget = budget_bytes
     cycle = dcp_size * alignment
     local_rows = sum(math.ceil(p / cycle) * alignment for p in prefix_lens)
     slots = 2 if prefetch else 1
@@ -517,7 +559,7 @@ def auto_dcp_gather_rows(
         name,
         rows * dcp_size,
         "deterministic-auto",
-        f"local_rows={rows} row_bytes={bytes_per_row} dcp={dcp_size} slots={slots} alignment={alignment} extend_rows={extend_rows} scratch_bytes={footprint} budget_bytes={budget} free_bytes={free_bytes}",
+        f"local_rows={rows} row_bytes={bytes_per_row} dcp={dcp_size} slots={slots} alignment={alignment} extend_rows={extend_rows} scratch_bytes={footprint} budget_bytes={budget}",
     )
     log_decision(decision)
     return None if enabled("SGLANG_NPU_AUTOTUNE_DRY_RUN") else decision.value
@@ -541,11 +583,9 @@ def log_memory_diagnostics(model, kv_pool):
     context = active_context()
     activation = None
     if context is not None:
-        rows = min(context.chunked_prefill_size, context.max_prefill_tokens)
+        rows = representative_prefill_rows(context)
         activation = (
-            max(0, rows)
-            * context.hidden_size
-            * (4 if "float32" in context.dtype else 2)
+            rows * context.hidden_size * (4 if "float32" in context.dtype else 2)
         )
     logger.info(
         "NPU memory diagnostic: total_bytes=%s weight_tensor_bytes=%s "

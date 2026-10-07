@@ -13,7 +13,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -24,6 +23,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
+)
+from sglang.srt.hardware_backend.npu.autotune import (
+    effective_prefill_query_tokens,
+    threshold_allows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -551,7 +554,7 @@ class AscendAttnBackend(AttentionBackend):
                 _shard_indexer_queries
                 and threshold_allows(
                     "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
-                    sum(forward_batch.extend_seq_lens_cpu or []),
+                    effective_prefill_query_tokens(forward_batch),
                 )
             )
         ):

@@ -115,7 +115,7 @@ def set_option(argv, name, value):
 
 def candidates(stage, context, args):
     estimate = policy.hccl_buffer_mb(
-        min(context.chunked_prefill_size, context.max_prefill_tokens),
+        policy.representative_prefill_rows(context),
         context.hidden_size,
         4 if "float32" in context.dtype else 2,
     )
@@ -401,8 +401,6 @@ def main():
             name,
             option_value(argv, name) if name.startswith("--") else os.environ.get(name),
         )
-        if name == "HCCL_BUFFSIZE" and baseline is None:
-            baseline = 200  # Existing runtime default.
         values = [baseline, *[v for v in values if str(v) != str(baseline)]]
         plan = {"stage": stage, "parameter": name, "candidates": values}
         if args.dry_run:

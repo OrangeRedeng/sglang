@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.autotune import (
     enabled,
     log_decision,
     profile_key,
+    representative_prefill_rows,
     save_profile,
 )
 
@@ -141,10 +142,8 @@ def _measure(method, layer, q_weight, scale_weight, context, selected, missing):
     )
 
     cfg = method.topk_config
-    primary = min(context.chunked_prefill_size, context.max_prefill_tokens)
-    if primary <= 0:
-        primary = context.max_prefill_tokens
-    if primary <= 0 or cfg.scoring_func not in ("sigmoid", "softmax"):
+    primary = representative_prefill_rows(context)
+    if cfg.scoring_func not in ("sigmoid", "softmax"):
         raise ValueError("unsupported serving shape or router scoring function")
     points = [(primary, 0.9), (min(1024, primary), 0.1)]
     operands = []

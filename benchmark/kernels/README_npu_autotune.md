@@ -160,8 +160,12 @@ server. `--help` works without torch/NPU dependencies.
 
 Default search is staged: expansion unset/AIV, buffers around the deterministic
 estimate (0.5/0.75/1/1.5/2 times, aligned/clamped), task queue unset/2, page 64/128.
-Each stage includes the current baseline; it carries the conservative winner
-into the next stage. No Cartesian product is formed. Explicit env/CLI settings
+Each stage includes the current baseline. An unset `HCCL_BUFFSIZE` baseline
+remains absent from the child environment; no runtime default is guessed. For
+16K rows / H6144 BF16 the buffer stage compares unset, 128, 192, 256, 384 and
+512 MiB. With `HCCL_BUFFSIZE=1000`, the stage is skipped unless `--tune-explicit`
+is supplied, in which case 1000 is the baseline. The tool carries the conservative
+winner into the next stage. No Cartesian product is formed. Explicit env/CLI settings
 are skipped unless `--tune-explicit` explicitly authorizes varying them.
 
 Use `--stages expansion buffer task_queue page chunk --chunk-max 32768` to
