@@ -96,6 +96,100 @@ if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
 
 _enable_dsa_cp_multi_request = envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
 
+# D1v3: the full token-sharded rebuild (see SGLANG_NPU_DSA_CP_TOKEN_SHARDED).
+# Read once, at import, like the other flags here.
+_enable_dsa_cp_token_sharded = envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+
+
+def dsa_cp_token_sharded_enabled() -> bool:
+    """The process-level flag. The per-forward state is
+    ``forward_batch.npu_dsa_cp_token_sharded`` (see
+    ``dsa_cp_token_sharded_active``)."""
+    return _enable_dsa_cp_token_sharded
+
+
+def dsa_cp_token_sharded(forward_batch) -> bool:
+    """Whether THIS forward runs the token-sharded rebuild.
+
+    The value is stashed on the batch by the attention prepare (the first
+    place in a forward that has both the resolved plan and the layer's
+    weights), before the prepare_mlp / MoE / logits consumers read it.
+    """
+    return bool(getattr(forward_batch, "npu_dsa_cp_token_sharded", False))
+
+
+def dsa_cp_set_token_sharded(forward_batch, active: bool) -> None:
+    """Stash the per-forward decision; a mismatch across layers is a wiring
+    bug (the condition depends on nothing that varies by layer once the plan
+    exists), so it is an error rather than a second guess."""
+    prev = getattr(forward_batch, "npu_dsa_cp_token_sharded", _MISSING)
+    if prev is not _MISSING and bool(prev) != bool(active):
+        raise RuntimeError(
+            "DSA-CP token sharding disagrees within one forward "
+            f"(earlier {prev}, now {active}); the per-layer condition must "
+            "depend only on the batch and the process, not the layer"
+        )
+    forward_batch.npu_dsa_cp_token_sharded = active
+
+
+def dsa_cp_reduce_scatter_tokens(x: torch.Tensor) -> torch.Tensor:
+    """``[rows * tp, ...]`` -> ``[rows, ...]`` over the attention-TP group.
+
+    The inverse ownership of ``dsa_cp_slice``: each rank holds the complete
+    (summed) tensor and keeps this rank's row block. The MoE output under the
+    token-sharded rebuild takes this instead of the all-reduce: the reduce is
+    the same sum the all-reduce computes, and the scatter drops the other
+    ranks' rows, which nobody consumes (the residual stays token-sharded).
+    """
+    parallel = get_parallel()
+    tp = parallel.attn_tp_size
+    if x.shape[0] % tp:
+        raise RuntimeError(
+            f"DSA-CP token sharding: {x.shape[0]} rows do not divide by the "
+            f"attention-TP size {tp}; the batch padding is wider than the plan"
+        )
+    rows = x.shape[0] // tp
+    out = x.new_empty((rows,) + x.shape[1:])
+    parallel.attn_tp_group.reduce_scatter_tensor(out, x)
+    return out
+
+
+def dsa_cp_gather_last_token_rows(x: torch.Tensor, forward_batch) -> torch.Tensor:
+    """``[rows, hidden]`` (this rank's slice after the final norm) ->
+    ``[num_requests, hidden]`` with each request's last-token row.
+
+    The end of the token-sharded forward: the logits path indexes
+    ``hidden_states[cumsum(extend_seq_lens) - 1]`` (logits_processor.py),
+    which needs every request's last row on every rank. Only the owners of
+    those rows have real data, so each rank contributes its own rows and
+    zeros elsewhere, the group all-gathers the small ``[bs, hidden]``
+    buffers, and the sum keeps exactly one non-zero row per request.
+    """
+    parallel = get_parallel()
+    tp = parallel.attn_tp_size
+    plan = get_dsa_cp_plan(forward_batch)
+    if plan is None:
+        raise RuntimeError(
+            "DSA-CP token sharding: the logits gather needs the forward's "
+            "plan but it is gone"
+        )
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    # Request i's last new token sits at the EXCLUSIVE END minus one; cumsum
+    # alone is the first token of the NEXT request (and past the end for the
+    # last one), so using it as the index shifts every request by one and
+    # zeroes the final request's logits row.
+    last_rows = list(
+        (torch.cumsum(torch.tensor(extend_lens), dim=0) - 1).tolist()
+    )
+    bs = len(last_rows)
+    mine = x.new_zeros((bs,) + x.shape[1:])
+    for i, row in enumerate(last_rows):
+        if plan.local_start <= row < plan.local_end:
+            mine[i] = x[row - plan.local_start]
+    full = mine.new_empty((tp * bs,) + mine.shape[1:])
+    parallel.attn_tp_group.all_gather_into_tensor(full, mine)
+    return full.view(tp, bs, -1).sum(dim=0)
+
 
 def dsa_cp_multi_request_enabled() -> bool:
     """Whether DSA-CP also shards batches carrying more than one request.
@@ -399,6 +493,65 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
     parallel.attn_tp_group.all_to_all_single(recv, send)
+    return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
+
+
+def dsa_cp_redistribute_heads_async(
+    x: torch.Tensor, plan: DsaCpPlan
+) -> Tuple[torch.Tensor, Optional[object], torch.Tensor]:
+    """Async sibling of ``dsa_cp_redistribute_heads``.
+
+    Returns ``(recv, work, send)``. Same padding, same send layout -- only the
+    collective is enqueued without a host block, so the LightningIndexer (or
+    whatever the caller queues next) runs while the bytes move. ``work`` is the
+    handle to ``wait()`` on before the result is read; it is None when the
+    group has one rank (nothing was exchanged) and the caller skips the wait.
+
+    ``recv`` is the RAW all-to-all output, ``[tp, rows, h, d]``, and it must be
+    handed to ``dsa_cp_redistribute_heads_recv`` only AFTER the wait. The
+    synchronous function's final ``permute+reshape`` is a COPY (the permuted
+    layout is not viewable), and a copy enqueued here would run on the
+    compute stream while the collective is still writing ``recv`` on the
+    communication stream -- so the materialisation deliberately waits for the
+    collective to be waited on.
+
+    ``send`` is the padded, laid-out send buffer: it is returned because the
+    async collective reads ``send`` on the communication stream at execution
+    time, and the caller must keep it alive (with the work handle) until after
+    the wait -- the caching allocator would otherwise be free to hand the
+    block to the next allocation the moment this function returns.
+    """
+    parallel = get_parallel()
+    tp = parallel.attn_tp_size
+    h, d = x.shape[1], x.shape[2]
+    assert x.shape[0] <= plan.num_tokens_pad, (
+        f"DSA-CP was handed {x.shape[0]} rows but planned for at most "
+        f"{plan.num_tokens_pad} ({plan.num_tokens} tokens aligned to {tp}). "
+        "The batch is padded by a wider rule than attn_tp_size; the plan must "
+        "be built from the padded width, not from extend_seq_lens_cpu."
+    )
+    missing = plan.num_tokens_pad - x.shape[0]
+    if missing > 0:
+        x = torch.cat([x, x.new_zeros((missing, h, d))], dim=0)
+    send = x.reshape(tp, plan.rows, h, d).contiguous()
+    recv = torch.empty_like(send)
+    work = parallel.attn_tp_group.all_to_all_single_async(recv, send)
+    return recv, work, send
+
+
+def dsa_cp_redistribute_heads_recv(
+    recv: torch.Tensor, plan: DsaCpPlan
+) -> torch.Tensor:
+    """``[tp, rows, h, d]`` -> ``[rows, h * tp, d]``, after the wait.
+
+    The post-wait half of ``dsa_cp_redistribute_heads_async``: the same
+    permute-plus-reshape the synchronous function applies to its completed
+    receive buffer. Doing it here, once the communication stream has finished
+    writing ``recv``, is what keeps the copy out of the collective's window.
+    """
+    parallel = get_parallel()
+    tp = parallel.attn_tp_size
+    h, d = recv.shape[2], recv.shape[3]
     return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
 
 

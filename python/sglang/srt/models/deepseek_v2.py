@@ -92,7 +92,11 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -927,6 +931,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
                     num_token_non_padded=num_token_non_padded,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -1056,11 +1061,37 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         num_token_non_padded: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
+        # D1v3: the MoE input is this rank's row slice. The TP-over-experts
+        # GEMM needs every token on every rank, so quantize the slice
+        # (per-token int8, the same op the int8 MoE path quantizes with),
+        # all-gather the quantized payload + per-token scale back to full
+        # width, and dequantize. Everything from here on (gate, topk,
+        # dispatch, GEMM, finalize) runs on the full tensor exactly as
+        # without the rebuild -- and the trailing all-reduce below becomes a
+        # reduce-scatter onto this rank's slice.
+        token_sharded = forward_batch is not None and getattr(
+            forward_batch, "npu_dsa_cp_token_sharded", False
+        )
+        if token_sharded:
+            import torch_npu
+
+            group = get_parallel().attn_tp_group
+            x_q, x_scale = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.int8
+            )
+            x_q_full = x_q.new_empty((x_q.shape[0] * group.world_size,) + x_q.shape[1:])
+            group.all_gather_into_tensor(x_q_full, x_q)
+            x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
+            group.all_gather_into_tensor(x_scale_full, x_scale)
+            hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
+                -1
+            ).to(hidden_states.dtype)
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -1180,12 +1211,37 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if self.tp_size > 1:
+            if token_sharded:
+                # D1v3: the residual is token-sharded, so each rank only
+                # needs its own rows of the summed MoE output. The reduce is
+                # the same sum the all-reduce computes; the scatter drops the
+                # other ranks' rows, which nobody consumes. The shared expert
+                # (TP-sharded here -- the TP1 variant is refused at startup)
+                # contributed its partial BEFORE this point, so it is reduced
+                # in the same collective.
+                from sglang.srt.layers.attention.dsa.dsa_cp import (
+                    dsa_cp_reduce_scatter_tokens,
+                )
+                from sglang.srt.utils.common import print_info_once
+
+                print_info_once(
+                    "D1v3: the MoE output reduce-scatters the token-sharded "
+                    "rows instead of all-reducing (each rank keeps its own "
+                    "rows; the shared-expert partial is reduced in the same "
+                    "collective)."
+                )
+                final_hidden_states = dsa_cp_reduce_scatter_tokens(
+                    final_hidden_states
+                )
+            elif not should_skip_post_experts_all_reduce(is_tp_path=True):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
+        # avoid summing the same shared output once per TP rank. (The TP1
+        # variant is refused at startup under the token-sharded rebuild: its
+        # full-width output has no row to match the scattered rows.)
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
@@ -2908,6 +2964,26 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                    # D1v3: the residual stream ended token-sharded, so the
+                    # last-token rows the logits path indexes by
+                    # cumsum(extend_seq_lens)-1 are split across the ranks.
+                    # Gather them (a [num_requests, hidden] all-gather, not
+                    # the full [N, hidden]) so the logits code below sees the
+                    # shape it always did.
+                    from sglang.srt.layers.attention.dsa.dsa_cp import (
+                        dsa_cp_gather_last_token_rows,
+                    )
+                    from sglang.srt.utils.common import print_info_once
+
+                    print_info_once(
+                        "D1v3: the logits path gathers only the last-token "
+                        "rows across the ranks (a [num_requests, hidden] "
+                        "all-gather, not the full token grid) before the LM head."
+                    )
+                    hidden_states = dsa_cp_gather_last_token_rows(
+                        hidden_states, forward_batch
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -3089,11 +3165,62 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                # D1v3: the residual stream ran token-sharded, so the model
+                # forward already gathered the last-token rows and
+                # hidden_states is [num_requests, hidden] -- already pruned.
+                # The shared processor would index it with the FULL batch's
+                # cumsum(extend_seq_lens)-1 and run out of range, so the LM
+                # head runs on the rows directly.
+                return self._token_sharded_logits(
+                    hidden_states, forward_batch, aux_hidden_states
+                )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
+
+    def _token_sharded_logits(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        aux_hidden_states,
+    ) -> LogitsProcessorOutput:
+        # D1v3 logits tail for the token-sharded rebuild: hidden_states is the
+        # gathered [num_requests, hidden] last-token rows, so it IS the pruned
+        # states the normal path builds with cumsum(extend_seq_lens)-1.
+        if aux_hidden_states is not None:
+            raise RuntimeError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is on but the forward "
+                "captured auxiliary hidden states (speculative decoding); the "
+                "startup gate must keep the two apart"
+            )
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is on and this forward asks "
+                "for input logprobs, which the last-token-row gather cannot "
+                "serve; the extend gate must have kept this forward unsharded"
+            )
+        logits = self.logits_processor._get_logits(
+            hidden_states, self.lm_head, logits_metadata
+        )
+        hidden_states_to_store = None
+        if logits_metadata.capture_hidden_mode.need_capture():
+            if logits_metadata.capture_hidden_mode.is_last():
+                hidden_states_to_store = hidden_states
+            else:
+                raise RuntimeError(
+                    "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is on and full hidden "
+                    "state capture was requested, but the token-sharded "
+                    "forward only gathered the last-token rows"
+                )
+        return LogitsProcessorOutput(
+            next_token_logits=logits,
+            hidden_states=hidden_states_to_store,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     @property
     def start_layer(self):

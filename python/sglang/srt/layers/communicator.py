@@ -1240,6 +1240,31 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+            # D1v3: the attention output is already the COMPLETE result for
+            # this rank's row slice (the o_proj ran on the full W_O, there is
+            # no partial), so there is no all-reduce to do. The residual is
+            # still full width on the first layer and already sliced from the
+            # second on; take this rank's rows when needed, then the per-row
+            # layernorm. Lazy import: dsa_cp imports ScatterMode from this
+            # module, so the edge may only be crossed at call time.
+            from sglang.srt.layers.attention.dsa.dsa_cp import (
+                dsa_cp_slice,
+                get_dsa_cp_plan,
+            )
+            from sglang.srt.utils.common import print_info_once
+
+            print_info_once(
+                "D1v3: prepare_mlp skips the MLP/attention all-reduce (the "
+                "o_proj output is already complete for this rank's rows) and "
+                "slices the residual to this rank's rows."
+            )
+            plan = get_dsa_cp_plan(forward_batch)
+            if residual is not None and residual.shape[0] == plan.num_tokens_pad:
+                residual = dsa_cp_slice(residual, plan)
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
                 hidden_states,

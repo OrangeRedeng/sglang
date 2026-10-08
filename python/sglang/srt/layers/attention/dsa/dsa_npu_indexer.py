@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -25,6 +26,7 @@ if is_npu():
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _shard_indexer_queries = envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+_dsa_cp_local_topk = envs.SGLANG_NPU_DSA_CP_LOCAL_TOPK.get()
 
 
 @lru_cache(maxsize=1)
@@ -201,7 +203,27 @@ def _get_indexer_query_shard(
         )
     shard = forward_batch.npu_indexer_query_shard
     if shard is None:
+        if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+            raise RuntimeError(
+                "DSA-CP token sharding: the indexer's query shard plan is "
+                "None but the forward is token-sharded; both are decided from "
+                "the same batch metadata, so this is a wiring bug"
+            )
         return None
+    if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+        # D1v3: the query arrived PRE-SLICED to this rank's rows (the
+        # token-sharded rebuild cuts the residual in prepare), so the shard
+        # plan's length vectors describe this call, but its width check --
+        # written for the full-width query the sharding slices itself --
+        # would decline. Accept exactly the rank's row count; anything else
+        # means the plan and the tensor disagree.
+        if num_tokens != shard.rows:
+            raise RuntimeError(
+                "DSA-CP token sharding: the indexer's query tensor carries "
+                f"{num_tokens} rows but the shard plan's rows are "
+                f"{shard.rows}; the prepare slice and the plan must agree"
+            )
+        return shard
     # ``num_tokens`` is the query tensor's width. SGLang pads that up to a
     # multiple of attn_tp_size for the MLP reduce-scatter
     # (``ForwardBatch.prepare_mlp_sync_batch``, ``ceil_align(n, attn_tp_size)``)
@@ -247,6 +269,7 @@ class DSANPUIndexerMixin:
         )
 
         bs = q_lora.shape[0]
+        token_sharded = getattr(forward_batch, "npu_dsa_cp_token_sharded", False)
 
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
@@ -390,6 +413,26 @@ class DSANPUIndexerMixin:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
+        if token_sharded:
+            # D1v3 seam S2: this rank computed the index-K for its own [rows]
+            # tokens only, but the pool write below scatters into the FULL
+            # out_cache_loc and the lightning indexer reads the whole pool, so
+            # the rows have to go back to full width before the write. Small
+            # traffic: [rows, 128] of k plus one float per row, per rank.
+            k_send = k.reshape(-1, k.shape[-1]).contiguous()
+            k_gathered = k_send.new_empty(
+                (k_send.shape[0] * get_parallel().attn_tp_size, k_send.shape[-1])
+            )
+            attn_tp_all_gather_into_tensor(k_gathered, k_send)
+            k = k_gathered
+            if use_quant_indexer:
+                scale_send = k_scale.reshape(-1).contiguous()
+                scale_gathered = scale_send.new_empty(
+                    scale_send.numel() * get_parallel().attn_tp_size
+                )
+                attn_tp_all_gather_into_tensor(scale_gathered, scale_send)
+                k_scale = scale_gathered
+        if use_quant_indexer:
             pool.set_index_k_scale_buffer(
                 layer_id, forward_batch.out_cache_loc, k_scale
             )
@@ -495,12 +538,22 @@ class DSANPUIndexerMixin:
                 _get_indexer_query_shard(
                     forward_batch, num_query_tokens, layer_scatter_modes
                 )
-                if is_prefill and _shard_indexer_queries
+                # Token sharding needs the plan's length vectors even when the
+                # standalone indexer-sharding switch is off, because the full
+                # batch's cumsum below would not describe this rank's [rows]
+                # query tensor.
+                if is_prefill and (token_sharded or _shard_indexer_queries)
                 else None
             )
             if shard is not None:
-                query = shard.take(query)
-                weights = shard.take(weights)
+                if not token_sharded:
+                    # The token-sharded query and weights already ARE this
+                    # rank's rows (the prepare sliced them), so take()'s
+                    # absolute offsets would read past a tensor that only has
+                    # rows left. The plan's length vectors are still exactly
+                    # right for those rows and come from it either way.
+                    query = shard.take(query)
+                    weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
@@ -544,7 +597,27 @@ class DSANPUIndexerMixin:
                     sparse_mode=3,
                 )[0].squeeze(1)
             if shard is not None:
-                topk_indices = shard.gather(topk_indices, num_query_tokens)
+                if (
+                    token_sharded or _dsa_cp_local_topk
+                ) and get_dsa_cp_plan(forward_batch) is not None:
+                    # DSA-CP local top-k: the plan's token split is
+                    # byte-identical to this shard's query split (both cut the
+                    # padded batch into equal position slices), so the sparse
+                    # operator takes this rank's rows directly and the
+                    # full-width round-trip gather -- measured 8.42/15.83 ms,
+                    # 100% exposed between the LightningIndexer and the next
+                    # SparseFlashAttention -- is dead weight. The marker tells
+                    # the core the returned top-k is local rather than full
+                    # width; every reuse layer below inherits the same layout
+                    # through prev_topk_indices.
+                    forward_batch.npu_dsa_topk_local = True
+                    print_info_once(
+                        "DSA-CP local top-k is ON: the indexer's top-k stays in "
+                        "this rank's query rows; the full-width round-trip "
+                        "all-gather is skipped"
+                    )
+                else:
+                    topk_indices = shard.gather(topk_indices, num_query_tokens)
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
 

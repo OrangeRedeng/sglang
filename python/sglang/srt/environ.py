@@ -1014,6 +1014,107 @@ class Envs:
     # against ~1.43 GiB without either flag. A mixed workload -- which is the
     # serving case -- pays ~+2.25 GiB and OOM'd at --mem-fraction-static 0.70.
     SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
+    # DCP extend on NPU: start the layer's prefix all-gather BEFORE the
+    # LightningIndexer runs, so the SFA KV communication overlaps the top-k
+    # computation, and wait for the gather only right before the sparse
+    # operator. The vLLM-Ascend pattern, ported: the collective is enqueued on
+    # the compute stream with async_op=True (the HCCL engine moves bytes
+    # alongside AIC/AIV compute) and the Work handle is waited on before the
+    # operator reads the buffer.
+    #
+    # Why: measured on the 09-24 phase-2 profiles (base and branch A, tp8/dcp8,
+    # chunk 32k), the all-gather is enqueued only AFTER the indexer finishes
+    # (first-AG offset after the indexer end: +0.002 ms, overlap(gather,
+    # indexer) = 0.0 ms), so the collective sits exposed on the critical path
+    # between the top-k and the SFA (gather exclusive 5.01 s of an 83.2 s
+    # phase on base). The vLLM-Ascend profile of the same workload has the
+    # gather started right after the layer's KV write and waited just before
+    # attention, with ~95% of the DCP all-gather hidden under the same layer's
+    # compute (0.345 s exposed of a 1.070 s comm step). The prefix KV was
+    # written by earlier forwards and this chunk's own KV arrives as
+    # k_nope/k_pe after the QKV projection, so the gather depends on nothing
+    # the indexer computes and may be enqueued first.
+    #
+    # OFF, pending box. Correctness (bitwise A/B against the sync path) and the
+    # phase-2 timing are not measured yet. Cost: on the permuting path (the
+    # default) each piece keeps its own gather scratch instead of one shared
+    # widest-piece scratch -- roughly +0.8-1.1 GiB at a ~1M context, reserved
+    # once on the first extend (the warm-up forward). On the packed path the
+    # gather already lands in the operator's buffer, so there is no extra
+    # memory. If the existing side-stream prefetch is on
+    # (SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH), the packed path keeps that
+    # behaviour (it starts the gather a layer earlier, so this flag is a no-op
+    # there).
+    SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP = EnvBool(False)
+    # DSA-CP local top-k: keep the indexer's top-k in this rank's query rows
+    # instead of gathering it back to full width across the attention-TP
+    # group. The DSA-CP plan's token split is byte-identical to the indexer's
+    # query shard split (both cut the padded batch into equal position slices),
+    # so the sparse operator can take this rank's rows directly and the
+    # round-trip all-gather -- measured 8.42/15.83 ms, 100% exposed between
+    # the LightningIndexer and the next SparseFlashAttention -- goes away.
+    # Inert (top-k stays full width) when the indexer query sharding is off or
+    # the DSA-CP plan declines the forward.
+    SGLANG_NPU_DSA_CP_LOCAL_TOPK = EnvBool(True)
+    # DSA-CP token sharding (D1v3, the full rebuild of the DSA-CP query swap):
+    # the residual stream becomes token-sharded across the attention-TP group
+    # (rank r owns rows [r*rows, (r+1)*rows), rows = ceil(N/attn_tp) -- the
+    # same grid the DSA-CP plan and the indexer query shard use) and the
+    # head-sharded attention weights (q_b_proj, o_proj, w_vc, w_kc) become
+    # replicated, so every rank computes every head for its own token slice.
+    # The per-layer collectives of the DSA-CP path change from
+    #   3 allToAll (Q x2 + token restore) + O-proj allReduce + topk allGather
+    # to
+    #   1 allGather (the int8-quantized MoE input, issued after the local
+    #   dynamic quant and before the MoE dispatch) + 1 reduce-scatter (the MoE
+    #   output, onto this rank's token slice; replaces the MoE allReduce).
+    # SparseFlashAttention is untouched: it already consumes this rank's
+    # [rows, all heads] queries and the rank-local top-k (D1v2_2).
+    #
+    # OFF. Requires (checked at startup, a refusal is an error rather than a
+    # fallback): NPU; a DSA model; attention TP size > 1; MoE running TP
+    # (a2a backend none/ascend_tp -- expert parallelism dispatches the MoE
+    # input instead of gathering it, a different design); no speculative
+    # decoding; no DP attention; no prefill context parallelism; MLA
+    # preprocess off. Graph capture of an extend forward is not supported (the
+    # first extend capture raises); decode capture is unaffected because the
+    # rebuild is extend-only. Memory: +~2.6 GiB (full bf16 w_vc) + ~3.9 GiB
+    # (full dequantized o_proj) per rank on top of the version B full-head Q
+    # weights (SGLANG_NPU_DSA_CP_Q_FULL_WIDTH), which this reuses. The exact
+    # delta is logged at startup.
+    SGLANG_NPU_DSA_CP_TOKEN_SHARDED = EnvBool(False)
+    # DSA-CP Q all-to-all, version A: issue the two head-redistribution
+    # all-to-alls (q_nope, q_pe) in prepare, under the LightningIndexer,
+    # instead of in the core between the indexer and the SparseFlashAttention
+    # (measured ~3.6 ms per indexer layer exposed there at extend). The core
+    # waits on the work handles right before the sparse operator. Independent
+    # of the DCP SFA gather overlap flag; mutually exclusive with
+    # SGLANG_NPU_DSA_CP_Q_FULL_WIDTH (version B, the default). Set this to 1
+    # and the other to 0 to profile version A.
+    SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE = EnvBool(False)
+    # DSA-CP Q all-to-all, version B: gather each layer's q_b_proj and w_kc to
+    # full head width once, pre-capture, so the extend DSA-CP path computes
+    # every head for this rank's tokens locally and the per-layer Q all-to-all
+    # does not exist at all in steady state (only the post-attention token
+    # restore remains). q_b_proj is dequantized through an identity GEMM, so
+    # W4A8-quantized checkpoints are supported, unlike the bf16-only
+    # --dcp-replicate-q-proj. The full q runs at 8x the heads but is sliced to
+    # this rank's rows before the w_kc batch-matmul, which keeps that FLOP
+    # count equal to the sharded path. Version B is the default (it costs
+    # +1.4-3.6 GiB of static full-head weights per rank, so the preparation
+    # is skipped entirely when DCP is off). Mutually exclusive with
+    # SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE -- enabling both fails at startup;
+    # set this to 0 and the other to 1 to profile version A.
+    SGLANG_NPU_DSA_CP_Q_FULL_WIDTH = EnvBool(True)
+    # DCP decode Q all-gather pre-issue: issue the decode-phase Q all-gather
+    # (q_pe/q_nope over the DCP group) in prepare, right after the QKV, so it
+    # starts while the layer's LightningIndexer runs and overlaps it instead
+    # of starting only after the indexer (measured 4-24 ms exposed at decode,
+    # growing with the batch). The dcp_a2a LSE reduce after the attention
+    # stays where it is: its output feeds the w_vc matmul and nothing runs
+    # between the two. Under graph capture the synchronous gather is kept
+    # (see the pre-issue site), so captured decode is unaffected.
+    SGLANG_NPU_DCP_DECODE_Q_PREISSUE = EnvBool(True)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps

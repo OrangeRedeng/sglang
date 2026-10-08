@@ -1423,8 +1423,8 @@ class AscendAttnBackend(AttentionBackend):
                     topk_indices.shape[-1] if topk_indices is not None else None,
                 )
                 if packed_plan is not None:
-                    # C1. The buffer is the all-gather's own rank-major output,
-                    # so a row's index no longer says anything about its
+                    # Packed read. The buffer is the all-gather's own rank-major
+                    # output, so a row's index no longer says anything about its
                     # position -- and both of the conventions above are about
                     # position. The top-k was remapped to rows by the model, the
                     # whole buffer is one request, and the operator's causal
