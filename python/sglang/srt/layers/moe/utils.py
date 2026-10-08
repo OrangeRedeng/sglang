@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
-    ALLREDUCE_DEEPEP = "allreduce-deepep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
@@ -62,9 +61,6 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
-
-    def is_allreduce_deepep(self):
-        return self == MoeA2ABackend.ALLREDUCE_DEEPEP
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
@@ -712,10 +708,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
 def is_moe_input_scattered_across_dp_ranks() -> bool:
     """Whether sparse MoE routing runs on a DP-local token shard."""
     return (
-        not (
-            get_moe_a2a_backend().is_none()
-            or get_moe_a2a_backend().is_allreduce_deepep()
-        )
+        not get_moe_a2a_backend().is_none()
         or should_use_flashinfer_cutlass_moe_fp4_allgather()
         or get_parallel().dwdp_size > 1
     )

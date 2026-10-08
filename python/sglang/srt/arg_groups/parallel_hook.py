@@ -732,7 +732,6 @@ def handle_eplb_and_dispatch(server_args: Any):
     # sum their partial outputs, so the pick has to agree across ranks.
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend in (
         "none",
-        "allreduce-deepep",
     )
 
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (

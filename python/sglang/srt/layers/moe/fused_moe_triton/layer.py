@@ -167,11 +167,7 @@ def create_moe_dispatcher(
     if is_building_neighbour_layer():
         return StandardDispatcher(moe_runner_config)
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_allreduce_deepep():
-        if not is_npu():
-            raise ValueError("allreduce-deepep requires Ascend NPU")
-        return AscendTPDispatcher(moe_runner_config, local_ep=True)
-    elif a2a_backend.is_none() and is_npu():
+    if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
@@ -585,7 +581,6 @@ class FusedMoE(torch.nn.Module):
 
         eligible = (
             isinstance(self.dispatcher, AscendTPDispatcher)
-            and not self.dispatcher.local_ep
             and self.moe_ep_size == 1
             and self.num_fused_shared_experts in (0, 1)
             and not self.reduce_results
@@ -1591,9 +1586,7 @@ class FusedMoE(torch.nn.Module):
         shared_output_ready: Optional[Callable[[], None]] = None,
     ):
         if shared_output is not None and (
-            not isinstance(self.dispatcher, AscendTPDispatcher)
-            or self.dispatcher.local_ep
-            or self.reduce_results
+            not isinstance(self.dispatcher, AscendTPDispatcher) or self.reduce_results
         ):
             raise ValueError("Shared finalization requires unreduced TP expert output")
         origin_hidden_states_dim = hidden_states.shape[-1]

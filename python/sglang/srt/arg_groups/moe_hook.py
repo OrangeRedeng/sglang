@@ -242,9 +242,6 @@ def handle_a2a_moe(server_args: Any):
     # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
 
     cfg = resolving_view(server_args)
-    if cfg.moe_a2a_backend == "allreduce-deepep" and cfg.enable_waterfill:
-        raise ValueError("allreduce-deepep does not support Waterfill")
-
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 
@@ -254,15 +251,6 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
-    if a2a_backend == "allreduce-deepep":
-        if not get_platform().is_npu:
-            raise ValueError("allreduce-deepep requires Ascend NPU")
-        if cfg.moe_dp_size != 1:
-            raise ValueError("allreduce-deepep requires --moe-dp-size 1")
-        if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
-            raise ValueError("allreduce-deepep does not support MoE batch overlap")
-        if cfg.enforce_shared_experts_fusion:
-            raise ValueError("allreduce-deepep requires separate shared experts")
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True

@@ -24,10 +24,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.autotune import (
-    effective_prefill_query_tokens,
-    threshold_allows,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -619,14 +615,7 @@ class AscendAttnBackend(AttentionBackend):
         if not self.quant_indexer_enabled:
             return
         if forward_batch.forward_mode.is_extend() and (
-            forward_batch.attn_cp_metadata is not None
-            or (
-                _shard_indexer_queries
-                and threshold_allows(
-                    "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
-                    effective_prefill_query_tokens(forward_batch),
-                )
-            )
+            forward_batch.attn_cp_metadata is not None or _shard_indexer_queries
         ):
             return
         base_q = self.forward_metadata.actual_seq_lengths_q

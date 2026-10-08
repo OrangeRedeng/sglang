@@ -964,7 +964,6 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and not self._fuse_shared_experts_inside_sbo
                 and isinstance(self.experts.dispatcher, AscendTPDispatcher)
-                and not self.experts.dispatcher.local_ep
                 and isinstance(
                     getattr(self.experts, "w2_kernel", None), NPUW4A8MXFP4MoEMethod
                 )
@@ -1426,8 +1425,6 @@ class DeepseekV2MoE(nn.Module):
             )
             shared_async = (
                 self._npu_tp_shared_stream is not None
-                and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
-                <= hidden_states.shape[0]
                 and not skip_shared_experts
                 and not get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
@@ -2904,17 +2901,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.post_attention_layernorm = NativeMXFP8MoENorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-
-        if (
-            _is_npu
-            and self.is_layer_sparse
-            and envs.SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR.get()
-        ):
-            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
-                install_input_capture,
-            )
-
-            install_input_capture(self.post_attention_layernorm, self.mlp)
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 

@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.autotune import threshold_allows
 from sglang.srt.layers.attention.dsa.dsa_cp_layout import (
     DsaCpPlan,
     cumulative,
@@ -172,9 +171,6 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     prefix_lens = forward_batch.extend_prefix_lens_cpu
     if not extend_lens or prefix_lens is None:
         print_info_once("DSA-CP is off: this extend carries no CPU length metadata")
-        return None
-
-    if not threshold_allows("SGLANG_NPU_DSA_CP_MIN_TOKENS", sum(extend_lens)):
         return None
 
     plan = plan_dsa_cp_shard(

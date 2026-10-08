@@ -178,7 +178,6 @@ class Spec(msgspec.Struct):
             choices=[
                 "none",
                 "deepep",
-                "allreduce-deepep",
                 "mooncake",
                 "nixl",
                 "mori",

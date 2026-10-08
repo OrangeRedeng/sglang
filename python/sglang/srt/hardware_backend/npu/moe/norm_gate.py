@@ -1,11 +1,9 @@
 """Opt-in native MXFP8 input and router for GLM-5.2 TP MoE."""
 
-import logging
 from functools import lru_cache
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
     mxfp8_input,
     record_mxfp8_operand,
@@ -15,41 +13,6 @@ from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import _require_e8m0_dtype
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
-
-logger = logging.getLogger(__name__)
-
-
-def _gate_option(name, choices):
-    value = getattr(envs, name).get()
-    if value not in choices:
-        raise ValueError(f"{name} must be one of {choices}; got {value!r}")
-    return value
-
-
-def _tensor_layout(tensor):
-    import torch_npu
-
-    return (
-        f"dtype={tensor.dtype} shape={tuple(tensor.shape)} stride={tensor.stride()} "
-        f"contiguous={tensor.is_contiguous()} format={torch_npu.get_npu_format(tensor)}"
-    )
-
-
-@lru_cache(maxsize=None)
-def _log_gate_config(output_dtype, weight_layout, topk_layout, scale_alg):
-    logger.info(
-        "MXFP8 gate: output_dtype=%s weight_layout=%s topk_layout=%s "
-        "weight_scale_alg=%s; grouped TopK uses FP32 logits/bias",
-        output_dtype,
-        weight_layout,
-        topk_layout,
-        scale_alg,
-    )
-
-
-@lru_cache(maxsize=None)
-def _log_gate_output(output_dtype):
-    logger.info("MXFP8 gate actual QuantMatmul output_dtype=%s", output_dtype)
 
 
 @lru_cache(maxsize=None)
@@ -136,26 +99,10 @@ class NativeMXFP8MoENorm(RMSNorm):
 
 class MXFP8GateMethod(QuantizeMethodBase):
     def __init__(self):
-        self.output_dtype = torch.float32
-        _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE", ("fp32",))
-        self.weight_layout = _gate_option(
-            "SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT",
-            ("transposed",),
-        )
-        self.topk_layout = _gate_option(
-            "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT",
-            ("default",),
-        )
-        self.scale_alg = _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG", (0,))
-        self.diagnostics = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS.get()
-        self._topk_layout_logged = set()
         self.matmul = mxfp8_gate_op()
         self.quantize = require_npu_op(
             "npu_dynamic_mx_quant",
             ("dst_type", "block_size", "scale_alg", "round_mode"),
-        )
-        _log_gate_config(
-            self.output_dtype, self.weight_layout, self.topk_layout, self.scale_alg
         )
 
     @torch.no_grad()
@@ -174,7 +121,7 @@ class MXFP8GateMethod(QuantizeMethodBase):
             layer.weight.data,
             dst_type=torch.float8_e4m3fn,
             block_size=32,
-            scale_alg=self.scale_alg,
+            scale_alg=0,
             round_mode="rint",
         )
         if q.dtype != torch.float8_e4m3fn or q.shape != layer.weight.shape:
@@ -183,26 +130,8 @@ class MXFP8GateMethod(QuantizeMethodBase):
         weight_scale = mx_scale_layout(scale, 256, 6144).transpose(0, 1)
         layer.register_buffer("mxfp8_weight", weight, persistent=False)
         layer.register_buffer("mxfp8_weight_scale", weight_scale, persistent=False)
-        if self.diagnostics:
-            logger.info("MXFP8 gate weight: %s", _tensor_layout(weight))
-            logger.info("MXFP8 gate weight scale: %s", _tensor_layout(weight_scale))
 
-    def prepare_topk_logits(self, logits):
-        # Correction-bias routing requires FP32 logits.
-        topk_logits = logits.to(torch.float32)
-        if self.diagnostics:
-            key = (tuple(logits.shape), logits.dtype, logits.stride())
-            if key not in self._topk_layout_logged:
-                logger.info("MXFP8 gate output: %s", _tensor_layout(logits))
-                logger.info("MXFP8 grouped TopK input: %s", _tensor_layout(topk_logits))
-                self._topk_layout_logged.add(key)
-        return topk_logits
-
-    def apply(self, layer, hidden_states, *, output_dtype=None):
-        if output_dtype is None:
-            output_dtype = self.output_dtype
-        if output_dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("MXFP8 gate supports BF16 or FP32 logits")
+    def apply(self, layer, hidden_states):
         if not hasattr(layer, "mxfp8_weight"):
             raise RuntimeError("MXFP8 gate weights were not prepared after loading")
         operand = (
@@ -221,14 +150,11 @@ class MXFP8GateMethod(QuantizeMethodBase):
             pertoken_scale=mx_scale_layout(scale, q.shape[0], q.shape[1]),
             scale_dtype=_require_e8m0_dtype(),
             pertoken_scale_dtype=_require_e8m0_dtype(),
-            output_dtype=output_dtype,
+            output_dtype=torch.float32,
             group_sizes=[1, 1, 32],
         )
-        if logits.dtype != output_dtype:
-            raise RuntimeError(f"MXFP8 gate did not return {output_dtype} logits")
-        _log_gate_output(logits.dtype)
-        if self.diagnostics:
-            logits._npu_mxfp8_gate_method = self
+        if logits.dtype != torch.float32:
+            raise RuntimeError("MXFP8 gate did not return FP32 logits")
         return logits
 
 
@@ -260,7 +186,6 @@ def configure_native_norm_gate(moe):
         and not moe._fuse_shared_experts_inside_sbo
         and moe.num_fused_shared_experts == 0
         and isinstance(moe.experts.dispatcher, AscendTPDispatcher)
-        and not moe.experts.dispatcher.local_ep
         and isinstance(getattr(moe.experts, "w2_kernel", None), NPUW4A8MXFP4MoEMethod)
         and envs.SGLANG_NPU_TP_MOE_PREQUANT_INPUT.get()
         and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get()
@@ -276,65 +201,4 @@ def configure_native_norm_gate(moe):
             raise ValueError("Native MXFP8 norm requires MXFP8_GATE=1")
         native_norm_op()
     moe.gate.quant_method = MXFP8GateMethod()
-    moe.gate.quant_method.topk_config = moe.topk.topk_config
     moe.gate._npu_mxfp8_gate = True
-
-
-def install_input_capture(norm, moe):
-    """Capture one real prefill per sparse layer/rank, outside timed serving runs."""
-    from pathlib import Path
-
-    from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_exec, get_parallel
-
-    if (
-        envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get()
-        or envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get()
-    ):
-        raise ValueError("Capture norm/gate inputs with both experiments disabled")
-    directory = Path(envs.SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR.get())
-
-    def capture(module, args, kwargs):
-        x = args[0] if args else kwargs["x"]
-        if x.shape[0] < envs.SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS.get():
-            return
-        residual = args[1] if len(args) > 1 else kwargs.get("residual")
-        extra = args[2] if len(args) > 2 else kwargs.get("post_residual_addition")
-        if extra is not None:
-            raise ValueError("Capture requires the plain sparse-MoE norm boundary")
-        cfg = moe.topk.topk_config
-        data = {
-            "x": x.detach().cpu(),
-            "residual": None if residual is None else residual.detach().cpu(),
-            "gamma": module.weight.detach().cpu(),
-            "eps": module.variance_epsilon,
-            "gate_weight": moe.gate.weight.detach().cpu(),
-            "correction_bias": None
-            if cfg.correction_bias is None
-            else cfg.correction_bias.detach().cpu(),
-            "tp_size": moe.tp_size,
-            "layer_id": moe.layer_id,
-            "deterministic": get_exec().deterministic.enable_deterministic_inference,
-            "topk": {
-                key: getattr(cfg, key)
-                for key in (
-                    "top_k",
-                    "renormalize",
-                    "use_grouped_topk",
-                    "num_expert_group",
-                    "topk_group",
-                    "scoring_func",
-                    "routed_scaling_factor",
-                    "apply_routed_scaling_factor_on_output",
-                )
-            },
-        }
-        directory.mkdir(parents=True, exist_ok=True)
-        path = (
-            directory
-            / f"rank{get_parallel().tp_rank}-layer{moe.layer_id}-tokens{x.shape[0]}.pt"
-        )
-        torch.save(data, path)
-        handle.remove()
-
-    handle = norm.register_forward_pre_hook(capture, with_kwargs=True)

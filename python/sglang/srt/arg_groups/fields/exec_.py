@@ -724,7 +724,6 @@ class ExecMoe(msgspec.Struct):
         Literal[
             "none",
             "deepep",
-            "allreduce-deepep",
             "mooncake",
             "nixl",
             "mori",
@@ -737,12 +736,10 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A. allreduce-deepep uses local "
-            "Ascend routing over replicated inputs and an EP AllReduce.",
+            help="Choose the backend for MoE A2A.",
             choices=[
                 "none",
                 "deepep",
-                "allreduce-deepep",
                 "mooncake",
                 "nixl",
                 "mori",
