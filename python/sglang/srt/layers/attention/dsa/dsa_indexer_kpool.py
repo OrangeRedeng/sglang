@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -24,12 +25,6 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-if is_npu():
-    try:
-        import custom_ops  # noqa: F401
-    except ImportError:
-        pass
-
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -46,6 +41,17 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_device
+
+logger = logging.getLogger(__name__)
+
+if is_npu():
+    try:
+        if envs.SGLANG_NPU_INDEXER_INT8.get():
+            logger.warning("SGLANG_NPU_INDEXER_INT8 is True and it force to call torch_npu.npu_quant_lightning_indexer that is crashed after custom_ops  overrides it. So  custom_ops is disabled for SGLANG_NPU_INDEXER_INT8==True ")
+        else:
+            import custom_ops  # noqa: F401
+    except ImportError:
+        pass
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
