@@ -154,7 +154,7 @@ class MXFP8GateMethod(QuantizeMethodBase):
         )
         self.topk_layout = _gate_option(
             "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT",
-            ("default", "contiguous", "clone", "nd", "auto"),
+            ("default", "contiguous", "clone", "nd", "materialized_nd", "auto"),
         )
         self.scale_alg = _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG", (0, 1))
         self.diagnostics = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS.get()
@@ -165,7 +165,7 @@ class MXFP8GateMethod(QuantizeMethodBase):
             ("dst_type", "block_size", "scale_alg", "round_mode"),
         )
         self.format_cast = None
-        if self.weight_layout == "nz" or self.topk_layout == "nd":
+        if self.weight_layout == "nz" or self.topk_layout in ("nd", "materialized_nd"):
             self.format_cast = require_npu_op("npu_format_cast")
         elif "auto" in (self.weight_layout, self.topk_layout):
             try:
@@ -228,6 +228,9 @@ class MXFP8GateMethod(QuantizeMethodBase):
         elif self.topk_layout == "clone":
             topk_logits = topk_logits.clone(memory_format=torch.contiguous_format)
         elif self.topk_layout == "nd":
+            topk_logits = self.format_cast(topk_logits, 2)
+        elif self.topk_layout == "materialized_nd":
+            topk_logits = topk_logits.clone(memory_format=torch.contiguous_format)
             topk_logits = self.format_cast(topk_logits, 2)
         if self.diagnostics:
             key = (tuple(logits.shape), logits.dtype, logits.stride())

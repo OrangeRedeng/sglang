@@ -1631,6 +1631,15 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                current_shared_pipeline,
+            )
+
+            pipeline = current_shared_pipeline()
+            if pipeline is not None and pipeline.fuse_shared:
+                shared_output = pipeline.wait_output()
+
         if shared_output is not None:
             # Join at the finalizer; fused GMM2 also consumes the shared input.
             if shared_output_ready is not None:

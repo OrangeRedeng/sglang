@@ -1001,6 +1001,7 @@ class Envs:
     SGLANG_NPU_DCP_SCRATCH_BUDGET_MB = EnvInt(256)
     SGLANG_NPU_MEMORY_DIAGNOSTICS = EnvBool(False)
     SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
@@ -1018,6 +1019,8 @@ class Envs:
     SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_TP_MOE_SHARED_STREAM_START = EnvStr("pre_gate")
+    SGLANG_NPU_TP_MOE_SHARED_PIPELINE = EnvStr("legacy")
+    SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS = EnvBool(False)
     SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
@@ -1053,7 +1056,11 @@ class Envs:
     # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
     SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE = EnvBool(False)
+    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM = EnvBool(False)
     SGLANG_NPU_DSA_EAGER_INDEXER = EnvBool(False)
+    # Isolate indexer scheduling from unrelated global multistream features.
+    SGLANG_NPU_DSA_INDEXER_STREAM_MODE = EnvStr("legacy")
+    SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE = EnvStr("matmul")
     # DSA prefill: shard the attention block's tokens across attention-TP, so
     # every rank computes every head for its own slice, with the query
     # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.

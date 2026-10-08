@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
@@ -82,6 +83,24 @@ def _use_dsa_eager_streams(forward_batch: "ForwardBatch") -> bool:
         and not get_is_capture_mode()
         and not is_in_breakable_cuda_graph()
         and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
+def _use_dsa_qproj_kvnorm_overlap(forward_batch: "ForwardBatch", num_tokens: int):
+    return (
+        envs.SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM.get()
+        and threshold_allows("SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS", num_tokens)
+        and _use_dsa_eager_streams(forward_batch)
+    )
+
+
+@lru_cache(maxsize=None)
+def _log_qproj_kvnorm_overlap(active):
+    logger.info(
+        "DSA qproj/KV norm overlap is ACTIVE"
+        if active
+        else "DSA qproj/KV norm overlap REQUESTED but is OFF: "
+        "requires non-NeoX eager extend without qlora gather and token threshold"
     )
 
 
@@ -437,6 +456,14 @@ def forward_dsa_prepare_npu(
     dynamic_scale = None
     pending_indexer = None
     q_nope_ready = None
+    q_proj_ready = None
+    overlap_qproj_kvnorm = (
+        _use_dsa_qproj_kvnorm_overlap(forward_batch, hidden_states.shape[0])
+        and not m.rotary_emb.is_neox_style
+        and not (_use_ag_after_qlora and input_on_attn_tp_slices)
+    )
+    if envs.SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM.get():
+        _log_qproj_kvnorm_overlap(overlap_qproj_kvnorm)
     needs_indexer = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
     overlap_qnope_rope = (
         envs.SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE.get()
@@ -527,7 +554,38 @@ def forward_dsa_prepare_npu(
                 if eager_indexer or overlap_qnope_rope:
                     q.record_stream(torch.npu.current_stream())
         else:
-            if (
+            if overlap_qproj_kvnorm:
+                q_raw, latent_cache = fused_qkv_a_proj_out.split(
+                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+                )
+                q_lora = m.q_a_layernorm(q_raw).clone()
+                main = torch.npu.current_stream()
+                stream = get_stream("npu_dsa_qproj")
+                input_ready = main.record_event()
+                with torch.npu.stream(stream):
+                    stream.wait_event(input_ready)
+                    q_lora.record_stream(stream)
+                    for tensor in m.q_b_proj.parameters():
+                        tensor.record_stream(stream)
+                    for tensor in m.q_b_proj.buffers():
+                        tensor.record_stream(stream)
+                    q = m.q_b_proj(q_lora)[0].view(
+                        -1, m.num_local_heads, m.qk_head_dim
+                    )
+                    q.record_stream(stream)
+                    q_proj_ready = stream.record_event()
+                k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+                )
+                k_nope = m.kv_a_layernorm(k_nope)
+                # Launch indexer only after enqueueing KV norm; its q_lora input
+                # is independent of q_b_proj and retains its own stream lifetime.
+                if eager_indexer:
+                    pending_indexer = m.indexer.forward_npu_eager(
+                        hidden_states, q_lora, positions, forward_batch,
+                        m.layer_id, input_on_attn_tp_slices,
+                    )
+            elif (
                 fused_qkv_a_proj_out.shape[0] < 65535
                 and not dsa_use_prefill_cp(forward_batch)
                 and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
@@ -573,8 +631,12 @@ def forward_dsa_prepare_npu(
                     [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
                 )
                 k_nope = m.kv_a_layernorm(k_nope)
-            q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            if q_proj_ready is None:
+                q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
+        if q_proj_ready is not None:
+            torch.npu.current_stream().wait_event(q_proj_ready)
+            q.record_stream(torch.npu.current_stream())
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
         if overlap_qnope_rope:
