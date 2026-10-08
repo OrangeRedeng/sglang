@@ -1,5 +1,8 @@
 # A5 resource scheduling / indexer Hadamard audit — 2026-10-08
 
+The runner and target eligibility described below are the original audit snapshot.
+For the current NeoX/CP/DCP patch and commands, see [the target guide](a5_resource_overlap_target.md).
+
 Audited the existing uncommitted patch in `sglang-a5-merge`, based on
 `731252c7d07a56255c7369b00158e751804ec72f`, against the supplied handoff.
 Phase 1 has substantial implementation, but the full shared-expert schedule and

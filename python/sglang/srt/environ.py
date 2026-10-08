@@ -1056,6 +1056,7 @@ class Envs:
     # on a side stream (opt-in A/B experiments).
     SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE = EnvBool(False)
     SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM = EnvBool(False)
+    SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL = EnvBool(False)
     SGLANG_NPU_DSA_EAGER_INDEXER = EnvBool(False)
     # Isolate indexer scheduling from unrelated global multistream features.
     SGLANG_NPU_DSA_INDEXER_STREAM_MODE = EnvStr("legacy")
