@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -9,7 +10,7 @@ import uuid
 from collections import OrderedDict
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -95,6 +96,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.managers.chat_encode_memo import ChatEncodeMemo, MIN_PREFIX_CHARS
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
@@ -120,6 +122,9 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+# E2a (branch E): how long a sibling may block on the in-flight family
+# creation before falling back to the exact full render+encode.
+_MEMO_BOOTSTRAP_TIMEOUT_S = 30.0
 
 
 def normalize_tool_content(role: str, content):
@@ -1675,6 +1680,42 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
     ) -> tuple[str, List[int], Optional[str]]:
+        # E2a (branch E): the render+encode memo is engaged when the
+        # chat-encode pool + memo are on; it bypasses the local template
+        # cache below (the memo keeps its own full-prompt LRU + family
+        # prefix assembly on the tokenizer manager).
+        memo = getattr(self.tokenizer_manager, "chat_encode_memo", None)
+        if memo is not None:
+            try:
+                memo_key = orjson.dumps(
+                    (
+                        getattr(
+                            self.tokenizer_manager.tokenizer,
+                            "chat_template",
+                            None,
+                        ),
+                        messages,
+                        tools,
+                        template_kwargs,
+                        encode_kwargs,
+                    ),
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            except TypeError:
+                memo_key = None
+            if memo_key is not None:
+                rendered_prompt, prompt_ids = self._memo_render_and_encode(
+                    messages,
+                    tools=tools,
+                    template_kwargs=template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                    cache_key=memo_key,
+                    memo=memo,
+                )
+                # The memo returns fresh ids; a multimodal caller decodes
+                # them on demand (decoded_prompt stays None).
+                return rendered_prompt, prompt_ids, None
+
         cache_key = None
         if use_cache:
             try:
@@ -1729,6 +1770,125 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._chat_template_cache.popitem(last=False)
 
         return rendered_prompt, prompt_ids, decoded_prompt
+
+    @staticmethod
+    def _memo_anchor(
+        messages: List[Dict[str, Any]]
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """E2a (branch E): the family anchor -- the last message whose string
+        content is long enough to be the shared-prefix carrier."""
+        anchor_i: Optional[int] = None
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) >= MIN_PREFIX_CHARS:
+                anchor_i = i
+        if anchor_i is None:
+            return None, None
+        return anchor_i, messages[anchor_i]["content"]
+
+    @staticmethod
+    def _family_shape_key(
+        template: Any,
+        messages: List[Dict[str, Any]],
+        anchor_i: int,
+        tools: Optional[List[Dict]],
+        template_kwargs: Dict[str, Any],
+        encode_kwargs: Dict[str, Any],
+    ) -> Any:
+        """E2a (branch E): identity of everything that makes two prompts the
+        same family -- template, message roles, every non-anchor content
+        (hashed when long), tools, kwargs."""
+        parts = []
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if i == anchor_i:
+                parts.append((msg.get("role"), "<ANCHOR>"))
+            elif isinstance(content, str) and len(content) >= MIN_PREFIX_CHARS:
+                parts.append(
+                    (msg.get("role"), hashlib.sha256(content.encode()).hexdigest())
+                )
+            else:
+                parts.append((msg.get("role"), content))
+        return orjson.dumps(
+            (template, parts, tools, template_kwargs, encode_kwargs),
+            option=orjson.OPT_SORT_KEYS,
+        )
+
+    def _memo_render_and_encode(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict]],
+        template_kwargs: Dict[str, Any],
+        encode_kwargs: Dict[str, Any],
+        cache_key: Any,
+        memo: ChatEncodeMemo,
+    ) -> Tuple[str, List[int]]:
+        """E2a (branch E): render+encode with the ChatEncodeMemo. Exact
+        repeats return the stored ids; a request in the family is assembled
+        from the family's rendered prefix + its tail (no Jinja render) and
+        re-encodes only tail + postlude. First-family requests are
+        serialized: one claims the creation, siblings wait."""
+        tokenizer = self.tokenizer_manager.tokenizer
+
+        cached = memo.get_full(cache_key)
+        if cached is not None:
+            rendered_prompt, prompt_ids = cached
+            return rendered_prompt, list(prompt_ids)
+
+        anchor_i, content = self._memo_anchor(messages)
+        shape_key = (
+            self._family_shape_key(
+                getattr(self.tokenizer_manager.tokenizer, "chat_template", None),
+                messages,
+                anchor_i,
+                tools,
+                template_kwargs,
+                encode_kwargs,
+            )
+            if anchor_i is not None
+            else None
+        )
+        encode_kwargs_key = orjson.dumps(encode_kwargs, option=orjson.OPT_SORT_KEYS)
+        encode = lambda text: tokenizer.encode(text, **encode_kwargs)
+
+        rendered_prompt: Optional[str] = None
+        prompt_ids: Optional[List[int]] = None
+
+        assembled = memo.begin_assembly(shape_key, content)
+        if assembled is None and shape_key is not None:
+            if not memo.claim_creation(shape_key):
+                if memo.wait_family(shape_key, _MEMO_BOOTSTRAP_TIMEOUT_S):
+                    assembled = memo.begin_assembly(shape_key, content)
+
+        if assembled is not None:
+            rendered_prefix, cut, postlude, version = assembled
+            rendered_prompt = rendered_prefix + content[cut:] + postlude
+            prefix_ids = memo.prefix_ids(
+                version, encode_kwargs_key, lambda: encode(rendered_prefix)
+            )
+            if prefix_ids is not None:
+                prompt_ids = list(prefix_ids) + list(
+                    encode(rendered_prompt[len(rendered_prefix):])
+                )
+            else:
+                prompt_ids = list(encode(rendered_prompt))
+
+        if rendered_prompt is None:
+            rendered_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **template_kwargs,
+            )
+            prompt_ids, _ = memo.commit_full(
+                shape_key, content, rendered_prompt, encode_kwargs_key, encode
+            )
+
+        memo.store_full(cache_key, rendered_prompt, prompt_ids)
+        return rendered_prompt, prompt_ids
 
     def _apply_conversation_template(
         self,

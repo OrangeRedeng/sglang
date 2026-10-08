@@ -67,6 +67,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.chat_encode_memo import ChatEncodeMemo
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -578,6 +579,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # text path (whose template-cache ops are single GIL-atomic dict
         # operations -- a benign last-write-wins race on identical keys).
         self.chat_encode_executor = None
+        self.chat_encode_memo = None
         if (
             envs.SGLANG_ENABLE_CHAT_ENCODE_POOL.get()
             and self.tokenizer is not None
@@ -593,6 +595,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "blocking chat render+encode runs off the asyncio loop",
                 _chat_encode_workers,
             )
+            if envs.SGLANG_CHAT_ENCODE_MEMO.get():
+                self.chat_encode_memo = ChatEncodeMemo()
+                logger.info(
+                    "[chat-encode] memo engaged (branch E E2a): full-prompt "
+                    "dedup + verified rendered-prefix reuse, serialized "
+                    "family bootstrap",
+                )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":

@@ -345,6 +345,17 @@ class Envs:
     # Default ON; =0 restores the exact base path. Engaged only for text-only
     # models (see tokenizer_manager.init_tokenizer_and_processor).
     SGLANG_ENABLE_CHAT_ENCODE_POOL = EnvBool(True)
+    # E2a (branch E): render+encode memo for the chat ingest. Exact
+    # (template, messages, tools, kwargs) repeats skip render+encode, and a
+    # sibling of the first long prompt assembles from the encoded rendered
+    # prefix and re-encodes only its tail (verified rendered-prefix reuse;
+    # a few-token BPE-boundary skew at the cut, documented in
+    # managers/chat_encode_memo.py). Concurrent first-family requests are
+    # serialized: one full render per burst instead of one per request
+    # (removes the GIL wave that inflated 16 concurrent 1M-token ingests to
+    # a 17 s wall and starved the event loop). Engaged only with the
+    # chat-encode pool (text-only models).
+    SGLANG_CHAT_ENCODE_MEMO = EnvBool(True)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
