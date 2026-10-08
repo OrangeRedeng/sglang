@@ -242,7 +242,6 @@ def handle_a2a_moe(server_args: Any):
     # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
 
     cfg = resolving_view(server_args)
-
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 

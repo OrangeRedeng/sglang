@@ -1325,7 +1325,9 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         nnodes=view.nnodes,
     ):
         backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
+    # NPU joins the a2a branch: ``ag_rs`` costs three collectives per layer
+    # where ``a2a`` packs output and LSE into one, as vLLM-Ascend does.
+    elif platform.is_cuda or platform.is_hip or platform.is_npu:
         backend = "a2a"
     else:
         backend = "ag_rs"
@@ -1499,12 +1501,12 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
         )
         return {"disable_shared_experts_fusion": True}
     if view.moe_a2a_backend == "deepep_v2":
-        # Fused shared experts are not validated with DeepEP v2.
+        # These dispatchers require shared experts outside the routed expert range.
         return {"disable_shared_experts_fusion": True}
     return {}
 
 
-# Every A2A backend that forces expert parallelism to span the TP group.
+# Backends whose expert parallelism spans the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",

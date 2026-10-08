@@ -58,7 +58,6 @@ def prequantize_tp_input(experts, hidden_states):
         or hidden_states.shape[0] == 0
         or hidden_states.dtype != torch.bfloat16
         or not isinstance(dispatcher, AscendTPDispatcher)
-        or dispatcher.local_ep
         or experts.moe_ep_size != 1
         or dispatcher.ascend_dispatcher_output_dtype != DispatcherOutputDtype.MXFP8
     ):

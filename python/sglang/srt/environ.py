@@ -993,16 +993,6 @@ class Envs:
     SGLANG_NPU_HCCL_QUANTUM_MB = EnvInt(32)
     SGLANG_NPU_HCCL_MIN_MB = EnvInt(64)
     SGLANG_NPU_HCCL_MAX_MB = EnvInt(1024)
-    SGLANG_NPU_TUNING_PROFILE = EnvBool(False)
-    SGLANG_NPU_TUNING_CACHE_DIR = EnvStr("~/.cache/sglang/npu_tuning")
-    SGLANG_NPU_AUTOTUNE_DRY_RUN = EnvBool(False)
-    SGLANG_NPU_AUTO_STREAM_THRESHOLDS = EnvBool(False)
-    SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS = EnvBool(False)
-    SGLANG_NPU_DCP_SCRATCH_BUDGET_MB = EnvInt(256)
-    SGLANG_NPU_MEMORY_DIAGNOSTICS = EnvBool(False)
-    SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
-    SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
-    SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Opt-in A/B stages; shared finalization also requires scaled routing weights.
@@ -1016,13 +1006,6 @@ class Envs:
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
-    SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE = EnvStr("fp32")
-    SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT = EnvStr("transposed")
-    SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT = EnvStr("default")
-    SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG = EnvInt(0)
-    SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS = EnvBool(False)
-    SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR = EnvStr("")
-    SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS = EnvInt(1024)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
@@ -1054,21 +1037,10 @@ class Envs:
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
-    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
-    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
     # the scratch a layer holds beside the gathered context. The default is
     # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
-    # DCP extend on NPU: run each layer's prefix all-gather one layer ahead, on
-    # a side stream, so it overlaps the previous layer's compute. Profiles show
-    # compute and communication never running at the same time -- the gather is
-    # issued and immediately awaited -- while the prefix it reads was written by
-    # earlier forwards and so does not depend on the current one. Costs a second
-    # context-sized scratch, and needs a single-piece plan
-    # (SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0); it silently stays off
-    # otherwise.
-    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
