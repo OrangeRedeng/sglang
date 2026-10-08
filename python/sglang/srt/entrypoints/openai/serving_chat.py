@@ -96,7 +96,11 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
-from sglang.srt.managers.chat_encode_memo import ChatEncodeMemo, MIN_PREFIX_CHARS
+from sglang.srt.managers.chat_encode_memo import (
+    ChatEncodeMemo,
+    MIN_PREFIX_CHARS,
+    encode_chat_text,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
@@ -1751,8 +1755,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_dict=False,
             **template_kwargs,
         )
-        prompt_ids = self.tokenizer_manager.tokenizer.encode(
-            rendered_prompt, **encode_kwargs
+        prompt_ids = encode_chat_text(
+            self.tokenizer_manager.tokenizer,
+            rendered_prompt,
+            encode_kwargs,
+            envs.SGLANG_CHAT_ENCODE_RAW.get(),
         )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -1850,7 +1857,10 @@ class OpenAIServingChat(OpenAIServingBase):
             else None
         )
         encode_kwargs_key = orjson.dumps(encode_kwargs, option=orjson.OPT_SORT_KEYS)
-        encode = lambda text: tokenizer.encode(text, **encode_kwargs)
+        raw_encode = envs.SGLANG_CHAT_ENCODE_RAW.get()
+        encode = lambda text: encode_chat_text(
+            tokenizer, text, encode_kwargs, raw_encode
+        )
 
         rendered_prompt: Optional[str] = None
         prompt_ids: Optional[List[int]] = None

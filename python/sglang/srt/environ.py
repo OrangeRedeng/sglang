@@ -356,6 +356,12 @@ class Envs:
     # a 17 s wall and starved the event loop). Engaged only with the
     # chat-encode pool (text-only models).
     SGLANG_CHAT_ENCODE_MEMO = EnvBool(True)
+    # E2d (branch E): encode the chat prompt through the raw Rust tokenizer
+    # (tokenizer._tokenizer.encode) instead of the HF wrapper. Default OFF:
+    # the wrapper is the reference. Requires E2a (memo) to be beneficial:
+    # without memo, raw encode holds the GIL during encoding, serializing
+    # all pool workers. With memo, only 1 full encode + 15 tail encodes.
+    SGLANG_CHAT_ENCODE_RAW = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is

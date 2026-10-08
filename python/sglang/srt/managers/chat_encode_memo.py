@@ -296,3 +296,23 @@ class ChatEncodeMemo:
                 "family_prefix_chars": len(self._fam_content_prefix or ""),
             }
 
+
+# ---------------------------------------------------------------------------
+# E2d (branch E): gated fastpath helper for the chat ingest path.
+# Reduces to the exact HF wrapper behavior when the flag is off.
+# ---------------------------------------------------------------------------
+
+def encode_chat_text(tokenizer: Any, text: str, encode_kwargs: Dict[str, Any], raw_enabled: bool) -> list:
+    """E2d (branch E): encode `text` for the chat ingest path. When
+    raw_enabled and the tokenizer exposes `_tokenizer` (the Rust tokenizers
+    object), use the raw Rust encode -- it bypasses the HF wrapper overhead.
+    Otherwise (flag off, or no `_tokenizer`): the exact wrapper call."""
+    if raw_enabled:
+        rust = getattr(tokenizer, "_tokenizer", None)
+        if rust is not None:
+            return rust.encode(
+                text,
+                add_special_tokens=encode_kwargs.get("add_special_tokens", True),
+            ).ids
+    return tokenizer.encode(text, **encode_kwargs)
+

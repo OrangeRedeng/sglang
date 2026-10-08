@@ -717,5 +717,66 @@ class TestChatEncodeMemoBehavior(_MemoCase):
         self.assertEqual(lcp("x" * 100000, "x" * 99999 + "y"), 99999)
 
 
+class TestChatEncodeFastpath(_BaseCase):
+    """E2d: the gated raw-Rust encode. Default OFF; the flag and wiring
+    are pinned, and the encode dispatch is proven with fake tokenizers."""
+
+    def _source(self, relpath):
+        with open(os.path.join(REPO_ROOT, relpath), encoding="utf-8") as f:
+            return f.read()
+
+    def test_e2d_raw_encode_env_defined_default_off(self):
+        self.assertRegex(
+            self._source(ENVIRON),
+            r"SGLANG_CHAT_ENCODE_RAW\s*=\s*EnvBool\(False\)",
+        )
+
+    def test_e2d_encode_dispatch(self):
+        module = _load_memo_module()
+
+        class _RustEncoding:
+            def __init__(self, ids):
+                self.ids = ids
+
+        class _RustTokenizer:
+            def __init__(self, saw):
+                self.saw = saw
+
+            def encode(self, text, add_special_tokens=True):
+                self.saw.append(("raw", add_special_tokens, len(text)))
+                return _RustEncoding([9000, add_special_tokens * 10, len(text) % 100])
+
+        class _WrapperTokenizer:
+            def __init__(self):
+                self.saw = []
+                self._tokenizer = _RustTokenizer(self.saw)
+
+            def encode(self, text, **kwargs):
+                self.saw.append(("wrapper", kwargs))
+                return [100, 200, 300]
+
+        tok = _WrapperTokenizer()
+        ids = module.encode_chat_text(tok, "abc", {"add_special_tokens": False}, True)
+        self.assertEqual(ids, [9000, 0, 3])
+        self.assertEqual(tok.saw, [("raw", False, 3)])
+        ids = module.encode_chat_text(tok, "xy", {}, True)
+        self.assertEqual(ids, [9000, 10, 2])
+        self.assertEqual(tok.saw, [("raw", False, 3), ("raw", True, 2)])
+        tok.saw.clear()
+        ids = module.encode_chat_text(tok, "abc", {"add_special_tokens": False}, False)
+        self.assertEqual(ids, [100, 200, 300])
+        self.assertEqual(tok.saw, [("wrapper", {"add_special_tokens": False})])
+        class _NoRust:
+            def encode(self, text, **kwargs):
+                return [7]
+        self.assertEqual(module.encode_chat_text(_NoRust(), "x", {}, True), [7])
+
+    def test_e2d_wired_in_serving_chat(self):
+        src = self._source(SERVING_CHAT)
+        self.assertIn("encode_chat_text", src)
+        self.assertRegex(src, r"envs\.SGLANG_CHAT_ENCODE_RAW\.get\(\)")
+        self.assertGreaterEqual(src.count("encode_chat_text("), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
