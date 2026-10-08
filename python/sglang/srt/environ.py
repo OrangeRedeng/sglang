@@ -339,6 +339,12 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # E1 (branch E): run the blocking chat render+encode (apply_chat_template
+    # + tokenizer.encode, ~3.6 s per ~1M-token prompt on the AISBench box) off
+    # the asyncio loop, on a ThreadPoolExecutor owned by the TokenizerManager.
+    # Default ON; =0 restores the exact base path. Engaged only for text-only
+    # models (see tokenizer_manager.init_tokenizer_and_processor).
+    SGLANG_ENABLE_CHAT_ENCODE_POOL = EnvBool(True)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is

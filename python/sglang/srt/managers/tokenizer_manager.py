@@ -29,6 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -562,6 +563,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        # E1 (branch E): off-loop pool for the blocking chat render+encode.
+        # The /v1/chat/completions path renders + encodes the full prompt in
+        # serving_chat._render_and_encode_chat_template (blocking
+        # apply_chat_template + tokenizer.encode, ~3.6 s per ~1M-token prompt
+        # on the AISBench box) and passes input_ids downstream, so
+        # _tokenize_texts never runs for it. Serial encodes on the asyncio
+        # loop feed the scheduler one phase-2 request per ~3.6 s while each
+        # forward takes ~1.4 s, idling the NPU ~2.2 s per request.
+        # OpenAIServingBase.handle_request offloads _convert_to_internal_request
+        # to this pool when it is not None. Text-only models only: the
+        # multimodal processor path carries more shared mutable state than the
+        # text path (whose template-cache ops are single GIL-atomic dict
+        # operations -- a benign last-write-wins race on identical keys).
+        self.chat_encode_executor = None
+        if (
+            envs.SGLANG_ENABLE_CHAT_ENCODE_POOL.get()
+            and self.tokenizer is not None
+            and not self.model_config.is_multimodal
+        ):
+            _chat_encode_workers = max(1, min(8, (os.cpu_count() or 2) // 2))
+            self.chat_encode_executor = ThreadPoolExecutor(
+                max_workers=_chat_encode_workers,
+                thread_name_prefix="chat-encode",
+            )
+            logger.info(
+                "[chat-encode] pool engaged (branch E E1): %d workers, "
+                "blocking chat render+encode runs off the asyncio loop",
+                _chat_encode_workers,
+            )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
