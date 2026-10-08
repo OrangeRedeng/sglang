@@ -21,15 +21,13 @@ MIB = 1 << 20
 SCHEMA_VERSION = 1
 _UNSET = object()
 THRESHOLDS = {
-    "qnope_rope_overlap_min_tokens": "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS",
-    "eager_indexer_min_tokens": "SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS",
     "moe_eager_multi_stream_min_tokens": "SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS",
     "indexer_sharding_min_tokens": "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS",
     "dsa_cp_min_tokens": "SGLANG_NPU_DSA_CP_MIN_TOKENS",
 }
 LAYOUTS = {
-    "gate_weight_layout": ("transposed", "contiguous", "nz"),
-    "gate_topk_layout": ("default", "contiguous", "nd"),
+    "gate_weight_layout": ("transposed",),
+    "gate_topk_layout": ("default",),
 }
 
 
@@ -349,13 +347,8 @@ def context_from_server_args(server_args):
                         "SGLANG_NPU_TP_MOE_MXFP8_GATE",
                         "SGLANG_NPU_TP_MOE_PREQUANT_INPUT",
                         "SGLANG_NPU_TP_MOE_REUSE_MXFP8",
-                        "SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT",
-                        "SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE",
                         "SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE",
                         "SGLANG_NPU_TP_MOE_SHARED_GMM1",
-                        "SGLANG_NPU_TP_MOE_SHARED_STREAM_START",
-                        "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE",
-                        "SGLANG_NPU_DSA_EAGER_INDEXER",
                         "SGLANG_NPU_ENABLE_DSA_CP",
                         "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING",
                         "SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH",
@@ -398,12 +391,6 @@ def initialize(server_args):
             "SGLANG_NPU_TUNING_PROFILE",
             "SGLANG_NPU_MEMORY_DIAGNOSTICS",
         )
-    ) or any(
-        os.environ.get(name) == "auto"
-        for name in (
-            "SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT",
-            "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT",
-        )
     )
     if not requested:
         return
@@ -417,24 +404,8 @@ def initialize(server_args):
         for key, name in (
             ("hccl_op_expansion_mode", "HCCL_OP_EXPANSION_MODE"),
             ("task_queue_enable", "TASK_QUEUE_ENABLE"),
-            ("gate_weight_layout", "SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT"),
-            ("gate_topk_layout", "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT"),
         ):
             if key in profile:
-                if (
-                    key == "gate_weight_layout"
-                    and profile[key] == "nz"
-                    and enabled("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
-                ):
-                    log_decision(
-                        NpuTuningDecision(
-                            name,
-                            "transposed",
-                            "default",
-                            "cached NZ conflicts with DISABLE_ACL_FORMAT_WEIGHT",
-                        )
-                    )
-                    continue
                 decision = resolve(
                     name,
                     explicit=os.environ.get(name, _UNSET),

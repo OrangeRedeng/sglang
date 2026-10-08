@@ -18,9 +18,6 @@ from sglang.srt.hardware_backend.npu.moe.init_routing import (
     NPUMoEInitRouting_v2,
 )
 from sglang.srt.hardware_backend.npu.moe.tp_fusion import require_npu_op
-from sglang.srt.hardware_backend.npu.triton_kernel.tp_moe_fusion import (
-    add_rmsnorm_mxfp8,
-)
 
 
 @torch.inference_mode()
@@ -71,16 +68,12 @@ def main():
         return out.to(x.dtype), residual_out
 
     def run_case(mode):
-        if mode == "dual_norm_routing":
-            out, residual_out = add_rmsnorm_mxfp8(x, residual, weight, bias, eps)
-            operand = out._npu_mxfp8_operand
-        else:
-            out, residual_out = normalize()
-            operand = None
-            if mode == "quant_before_routing":
-                operand = torch.ops.npu.npu_dynamic_mx_quant(
-                    out, dst_type=torch.float8_e4m3fn
-                )
+        out, residual_out = normalize()
+        operand = None
+        if mode == "quant_before_routing":
+            operand = torch.ops.npu.npu_dynamic_mx_quant(
+                out, dst_type=torch.float8_e4m3fn
+            )
         routed = routing._init_routing(
             out if operand is None else operand[0],
             ids,
@@ -91,7 +84,7 @@ def main():
         return out, residual_out, routed
 
     reference = run_case("baseline")
-    for mode in ("baseline", "quant_before_routing", "dual_norm_routing"):
+    for mode in ("baseline", "quant_before_routing"):
         out, residual_out, routed = run_case(mode)
         torch.testing.assert_close(out, reference[0], atol=args.atol, rtol=args.rtol)
         if residual is not None:

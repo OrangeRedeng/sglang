@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.moe.tp_fusion import current_shared_pipeline
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
@@ -27,31 +26,6 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
-
-
-def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
-    """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
-    # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
-    # SiLU with no clamp. Models whose activation is SiLU-with-clamp
-    # (swiglu_limit, e.g. DSV4) must keep the unfused path so the clamp is
-    # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
-    has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
-
-    if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
-        return False
-    if has_clamp:
-        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
-        # checkpoint cannot be served by it.
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            raise NotImplementedError(
-                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
-                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
-                "checkpoint cannot be served by this method."
-            )
-        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
-    if isinstance(kernel, NPUMXFP8MoEMethod):
-        return True
-    return kernel.use_fused_gmm1
 
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -82,6 +56,31 @@ from sglang.srt.layers.moe.utils import (
 )
 
 
+def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
+    """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
+    # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
+    # SiLU with no clamp. Models whose activation is SiLU-with-clamp
+    # (swiglu_limit, e.g. DSV4) must keep the unfused path so the clamp is
+    # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
+    has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
+
+    if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
+        return False
+    if has_clamp:
+        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
+        # checkpoint cannot be served by it.
+        if isinstance(kernel, NPUMXFP8MoEMethod):
+            raise NotImplementedError(
+                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
+                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
+                "checkpoint cannot be served by this method."
+            )
+        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
+    if isinstance(kernel, NPUMXFP8MoEMethod):
+        return True
+    return kernel.use_fused_gmm1
+
+
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
 # ---------------------------------------------------------------------------
@@ -104,7 +103,6 @@ class AscendRunnerOutput(RunnerOutput):
     """Output bundle from the NPU runner."""
 
     hidden_states: torch.Tensor
-    hidden_states_scale: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -220,9 +218,6 @@ class AscendRunnerCore(MoeRunnerCore):
         group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
-        shared_pipeline = current_shared_pipeline()
-        if shared_pipeline is not None:
-            shared_pipeline.before_routed_gmm1()
 
         if _uses_fused_gmm1(w13_kernel, self.config):
             # --- w13 projection + activation, fused into one kernel ---
@@ -269,8 +264,6 @@ class AscendRunnerCore(MoeRunnerCore):
                 )
 
         # --- w2 (down) projection ---
-        if running_state.get("ascend_tp_fused_gmm2") and hidden_states.shape[0] > 0:
-            return AscendRunnerOutput(hidden_states, pertoken_scale)
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
             hidden_states,
@@ -280,8 +273,6 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-        if shared_pipeline is not None:
-            shared_pipeline.after_routed_gmm2()
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
@@ -316,9 +307,6 @@ def pre_permute_ascend_tp_to_ascend(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
-    running_state["ascend_tp_fused_gmm2"] = getattr(
-        runner_config.layer, "_npu_tp_fuse_gmm2_finalize", False
-    )
     return AscendRunnerInput(
         hidden_states=dispatch_output.hidden_states,
         hidden_states_scale=dispatch_output.hidden_states_scale,
@@ -392,13 +380,6 @@ def post_permute_ascend_to_ascend_tp(
 ) -> AscendTPCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
 
-    if runner_output.hidden_states_scale is not None:
-        return AscendTPCombineInput(
-            hidden_states=runner_output.hidden_states,
-            gmm2_input_scale=runner_output.hidden_states_scale,
-            gmm2_weight=quant_info.w2_weight,
-            gmm2_weight_scale=quant_info.w2_weight_scale,
-        )
     return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
 
 

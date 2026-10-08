@@ -842,12 +842,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        if _is_npu and self.is_layer_sparse and envs.SGLANG_NPU_TP_MOE_NORM_MXFP8.get():
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                configure_tp_mxfp8_norm,
-            )
-
-            configure_tp_mxfp8_norm(self.post_attention_layernorm, self.mlp.experts)
 
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
@@ -1089,12 +1083,6 @@ class Glm4MoeForCausalLM(nn.Module):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
-        if _is_npu and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get():
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                tp_fused_shared_expert_reason,
-            )
-
-            return tp_fused_shared_expert_reason(hf_config, quant_config)
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):

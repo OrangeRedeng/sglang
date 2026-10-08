@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional
 
 import torch
 
@@ -14,65 +13,25 @@ from sglang.srt.hardware_backend.npu.autotune import (
 )
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-    is_in_breakable_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
+    # Registers the CANN ops-transformer kernels under
+    # torch.ops.cann_ops_transformer; without this import the
+    # torch.ops namespace is empty and op calls raise AttributeError.
+    import cann_ops_transformer  # noqa: F401
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-
-
-def _indexer_stream_mode():
-    mode = envs.SGLANG_NPU_DSA_INDEXER_STREAM_MODE.get()
-    if mode not in ("legacy", "inline", "resource"):
-        raise ValueError(f"Unknown SGLANG_NPU_DSA_INDEXER_STREAM_MODE: {mode!r}")
-    return mode
-
-
-def _indexer_resource_reason(indexer, forward_batch, input_on_attn_tp_slices):
-    mode = forward_batch.forward_mode
-    if not mode.is_extend() or mode.is_draft_extend_v2() or mode.is_target_verify():
-        return "requires prefill extend"
-    if get_is_capture_mode():
-        return "capture_mode=1"
-    if is_in_breakable_cuda_graph():
-        return "breakable_graph=1"
-    if is_in_tc_piecewise_cuda_graph():
-        return "piecewise_graph=1"
-    if not indexer.rotary_emb.is_neox_style:
-        if forward_batch.attn_cp_metadata is not None or get_parallel().dcp_enabled:
-            return "non-NeoX CP/DCP paired RoPE is unsupported"
-        if _use_ag_after_qlora and input_on_attn_tp_slices:
-            return "non-NeoX sliced qlora gather is unsupported"
-    return None
-
-
-def _use_indexer_resource_stream(indexer, forward_batch, input_on_attn_tp_slices):
-    return (
-        _indexer_resource_reason(indexer, forward_batch, input_on_attn_tp_slices)
-        is None
-    )
-
-
-def _record_indexer_tensors(stream, *tensors):
-    for tensor in tensors:
-        if isinstance(tensor, torch.Tensor):
-            tensor.record_stream(stream)
+_shard_indexer_queries = envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
 
 
 @lru_cache(maxsize=1)
@@ -91,39 +50,24 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type, *, tensor_name="activation"):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type):
     # Hadamard-rotate x and MX-quantize its 128-dim vectors.
     # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
     # and scale holds one E8M0 byte per 32-element block, shaped
     # x.shape[:-1] + (d/64, 2) == x.shape[:-1] + (2, 2) — the descale layout
     # quant_lightning_indexer (v2) expects for quant_mode 3 (MXFP8).
-    mode = envs.SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE.get()
-    if mode != "matmul":
-        raise ValueError(
-            "SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE supports only matmul; "
-            "FHT requires a separately accuracy-validated existing NPU primitive"
-        )
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.zeros(x.shape[:-1] + (2, 2), dtype=torch.uint8, device=x.device).view(
+                torch.float8_e8m0fnu
+            ),
         )
-    trace = envs.SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS.get()
-    with (
-        torch.profiler.record_function(f"npu_dsa_indexer.{tensor_name}.hadamard.matmul")
-        if trace
-        else nullcontext()
-    ):
-        rotated = x @ hadamard
-    with (
-        torch.profiler.record_function(f"npu_dsa_indexer.{tensor_name}.mx_quant")
-        if trace
-        else nullcontext()
-    ):
-        quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
-            rotated.reshape(-1, 128), dst_type=dst_type, axis=-1
-        )
+    rotated = x @ hadamard
+    quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
+        rotated.reshape(-1, 128), dst_type=dst_type, axis=-1
+    )
     # npu_dynamic_mx_quant may return the block scales as [N, 4] or [N, 2, 2];
     # normalize to the kernel's (d/64, 2) == (2, 2) layout.
     scale = scale.reshape(x.shape[:-1] + (4,)).view(x.shape[:-1] + (2, 2))
@@ -293,222 +237,41 @@ def _get_indexer_query_shard(
     return shard
 
 
-@dataclass
-class _PendingIndexerTopk:
-    indices: torch.Tensor
-    ready: object
-    shard: Optional[_IndexerQueryShard]
-    num_tokens: int
-
-    def wait_and_gather(self) -> torch.Tensor:
-        stream = torch.npu.current_stream()
-        stream.wait_event(self.ready)
-        self.indices.record_stream(stream)
-        # HCCL retains the caller's collective order and stream.
-        if self.shard is not None:
-            return self.shard.gather(self.indices, self.num_tokens)
-        return self.indices
-
-
 class DSANPUIndexerMixin:
-    def _neox_sin_cos(self, positions, forward_batch):
-        if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
-            cos, sin = self.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
-            cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-            sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-            forward_batch.npu_indexer_sin_cos_cache = (sin, cos)
-        return forward_batch.npu_indexer_sin_cos_cache
-
-    def _resource_projections_neox(
+    def _plan_quant_lightning_indexer(
         self,
-        x,
-        q_lora,
-        positions,
-        forward_batch,
-        input_on_attn_tp_slices,
-        dynamic_scale,
+        cum_query_lens: torch.Tensor,
+        key_lens: torch.Tensor,
+        device,
     ):
-        main = torch.npu.current_stream()
-        vector = get_stream("npu_dsa_indexer_vector")
-        bs = q_lora.shape[0]
-        x = x.view(-1, self.hidden_size)
-        sin, cos = self._neox_sin_cos(positions, forward_batch)
-        operand = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-        q_raw = self.wq_b(operand)[0]
-        q_ready = main.record_event()
-        with torch.npu.stream(vector):
-            vector.wait_event(q_ready)
-            _record_indexer_tensors(vector, q_raw, sin, cos)
-            q_pe, q_nope = torch.split(
-                q_raw.view(bs, self.n_heads, self.head_dim),
-                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                dim=-1,
-            )
-            q_pe = torch_npu.npu_rotary_mul(
-                q_pe.view(bs, self.n_heads, 1, self.rope_head_dim),
-                cos,
-                sin,
-            ).view(bs, self.n_heads, self.rope_head_dim)
-            q = torch.cat([q_pe, q_nope], dim=-1)
+        """``(cu_seqlens_q, seqused_k, metadata)`` for one quant indexer call.
 
-        weights_raw = self.weights_proj(x.float())[0]
-        weights_ready = main.record_event()
-        with torch.npu.stream(vector):
-            vector.wait_event(weights_ready)
-            _record_indexer_tensors(vector, weights_raw)
-            weights = weights_raw.to(torch.bfloat16)
-
-        k_raw = self.wk(x)[0]
-        k_ready = main.record_event()
-        gather_k = _use_ag_after_qlora and input_on_attn_tp_slices
-        with torch.npu.stream(vector):
-            vector.wait_event(k_ready)
-            _record_indexer_tensors(vector, k_raw)
-            for tensor in (*self.k_norm.parameters(), *self.k_norm.buffers()):
-                tensor.record_stream(vector)
-            k = self.k_norm(k_raw)
-            if not gather_k:
-                k = self._neox_k_rope(k, cos, sin, bs)
-            ready = vector.record_event()
-        main.wait_event(ready)
-        _record_indexer_tensors(main, q, k, weights)
-        if gather_k:
-            # Retain k-gather before CP and weights-gather, on the caller stream.
-            k = scattered_to_tp_attn_full(k, forward_batch)
-            k = self._neox_k_rope(k, cos, sin, bs)
-        return q, k, weights
-
-    def _neox_k_rope(self, k, cos, sin, bs):
-        k_pe, k_nope = torch.split(
-            k,
-            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-            dim=-1,
-        )
-        k_pe = torch.ops.npu.npu_rotary_mul(
-            k_pe.view(-1, 1, 1, self.rope_head_dim),
-            cos,
-            sin,
-        ).view(bs, 1, self.rope_head_dim)
-        return torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)
-
-    def _resource_projections(self, x, q_lora, positions, layer_id, dynamic_scale):
-        """One projection queue; cast/split/norm/paired RoPE on one side queue.
-
-        The established non-NeoX RoPE consumes q and k together. Keep that op
-        intact rather than replacing it with a numerically different rotation.
+        ``cum_query_lens`` is per-request *cumulative* query rows, as the v1
+        operator's ``actual_seq_lengths_query`` was; the v2 operator instead
+        wants it prefixed with a 0, and its last value is how many rows of
+        ``query`` the kernel will read. ``key_lens`` is per-request and not
+        cumulative. Both must describe the tensors this call actually passes.
         """
-        main = torch.npu.current_stream()
-        vector = get_stream("npu_dsa_indexer_vector")
-        bs = q_lora.shape[0]
-        x = x.view(-1, self.hidden_size)
-        if layer_id == get_token_to_kv_pool().start_layer:
-            self.rotary_emb.sin_cos_cache = self.rotary_emb.cos_sin_cache.index_select(
-                0, positions
-            )
-        weights_raw = self.weights_proj(x.float())[0]
-        weights_ready = main.record_event()
-        with torch.npu.stream(vector):
-            vector.wait_event(weights_ready)
-            _record_indexer_tensors(vector, weights_raw)
-            weights = weights_raw.to(torch.bfloat16)
-
-        operand = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-        q_raw = self.wq_b(operand)[0]
-        q_ready = main.record_event()
-        with torch.npu.stream(vector):
-            vector.wait_event(q_ready)
-            _record_indexer_tensors(vector, q_raw)
-            q_pe, q_nope = torch.split(
-                q_raw.view(bs, self.n_heads, self.head_dim),
-                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                dim=-1,
-            )
-
-        k_raw = self.wk(x)[0]
-        k_ready = main.record_event()
-        with torch.npu.stream(vector):
-            vector.wait_event(k_ready)
-            _record_indexer_tensors(vector, k_raw, positions)
-            for tensor in self.k_norm.parameters():
-                tensor.record_stream(vector)
-            for tensor in self.k_norm.buffers():
-                tensor.record_stream(vector)
-            for tensor in self.rotary_emb.buffers():
-                tensor.record_stream(vector)
-            _record_indexer_tensors(
-                vector, getattr(self.rotary_emb, "sin_cos_cache", None)
-            )
-            k = self.k_norm(k_raw)
-            k_pe, k_nope = torch.split(
-                k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-            q = torch.cat([q_pe, q_nope], dim=-1)
-            k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
-            _record_indexer_tensors(vector, q, k, weights)
-            ready = vector.record_event()
-        # Cache writes, Hadamard Cube work and all collectives stay on the caller.
-        main.wait_event(ready)
-        _record_indexer_tensors(main, q, k, weights)
-        return q, k, weights
-
-    def can_forward_npu_eager(
-        self, forward_batch: ForwardBatch, input_on_attn_tp_slices: bool
-    ) -> bool:
-        return (
-            forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.attn_cp_metadata is None
-            and not get_parallel().dcp_enabled
-            and not (_use_ag_after_qlora and input_on_attn_tp_slices)
+        cum_q = cum_query_lens.to(device=device, dtype=torch.int32)
+        cu_seqlens_q = torch.cat([cum_q.new_zeros(1), cum_q])
+        seqused_k = key_lens.to(device=device, dtype=torch.int32)
+        metadata = torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
+            self.n_heads,
+            1,
+            self.head_dim,
+            self.index_topk,
+            3,  # QUANT_MODE_MXFP8 (5 == QUANT_MODE_MXFP4)
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            batch_size=int(cum_q.numel()),
+            max_seqlen_q=-1,
+            max_seqlen_k=-1,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=1,
         )
-
-    def forward_npu_eager(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        input_on_attn_tp_slices: bool = False,
-    ) -> _PendingIndexerTopk:
-        stream = get_stream("npu_dsa_indexer")
-        input_ready = torch.npu.current_stream().record_event()
-        metadata = get_attn_backend().forward_metadata
-        with torch.npu.stream(stream):
-            stream.wait_event(input_ready)
-            tensors = [
-                x,
-                q_lora,
-                positions,
-                forward_batch.seq_lens,
-                forward_batch.extend_seq_lens,
-                forward_batch.out_cache_loc,
-                metadata.seq_lens,
-                metadata.seq_lens_cpu_int,
-                metadata.block_tables,
-                getattr(metadata, "quant_indexer_cu_seqlens_q", None),
-                getattr(metadata, "quant_indexer_seqused_k", None),
-                getattr(metadata, "quant_indexer_metadata", None),
-                getattr(self.rotary_emb, "sin_cos_cache", None),
-            ]
-            tensors.extend(getattr(forward_batch, "npu_indexer_sin_cos_cache", ()))
-            for tensor in tensors:
-                if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
-                    tensor.record_stream(stream)
-            indices, _, num_tokens = self.forward_npu(
-                x,
-                q_lora,
-                positions,
-                forward_batch,
-                layer_id,
-                input_on_attn_tp_slices,
-                defer_query_gather=True,
-            )
-            indices.record_stream(stream)
-            ready = stream.record_event()
-        return _PendingIndexerTopk(indices, ready, None, num_tokens)
+        return cu_seqlens_q, seqused_k, metadata
 
     def forward_npu(
         self,
@@ -519,9 +282,7 @@ class DSANPUIndexerMixin:
         layer_id: int,
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
-        *,
-        defer_query_gather: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[_IndexerQueryShard], int]]:
+    ) -> torch.Tensor:
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
@@ -533,51 +294,20 @@ class DSANPUIndexerMixin:
         )
 
         bs = q_lora.shape[0]
-        stream_mode = _indexer_stream_mode()
-        weight_multistream = (
-            stream_mode == "legacy" and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-        )
-        resource_stream = stream_mode == "resource" and _use_indexer_resource_stream(
-            self, forward_batch, input_on_attn_tp_slices
-        )
-        if stream_mode == "resource":
-            reason = _indexer_resource_reason(
-                self, forward_batch, input_on_attn_tp_slices
-            )
-            print_info_once(
-                "DSA indexer resource stream is ACTIVE (serialized projections, "
-                "Vector tails; CP/DCP collectives on caller)"
-                if resource_stream
-                else f"DSA indexer resource stream REQUESTED but is OFF: {reason}"
-            )
-        elif envs.SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS.get():
-            print_info_once(f"DSA indexer stream mode is {stream_mode}")
 
-        if resource_stream and self.rotary_emb.is_neox_style:
-            q, k, weights = self._resource_projections_neox(
-                x,
-                q_lora,
-                positions,
-                forward_batch,
-                input_on_attn_tp_slices,
-                dynamic_scale,
-            )
-        elif resource_stream:
-            q, k, weights = self._resource_projections(
-                x, q_lora, positions, layer_id, dynamic_scale
-            )
-        elif self.rotary_emb.is_neox_style:
-            sin, cos = self._neox_sin_cos(positions, forward_batch)
+        if self.rotary_emb.is_neox_style:
+            if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
+                cos_sin = self.rotary_emb.cos_sin_cache[positions]
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+                sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+                forward_batch.npu_indexer_sin_cos_cache = (sin, cos)
+            else:
+                sin, cos = forward_batch.npu_indexer_sin_cos_cache
 
             if self.alt_stream is not None:
                 self.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(self.alt_stream):
-                    if defer_query_gather:
-                        q_lora.record_stream(self.alt_stream)
-                        cos.record_stream(self.alt_stream)
-                        sin.record_stream(self.alt_stream)
-                        if dynamic_scale is not None:
-                            dynamic_scale.record_stream(self.alt_stream)
                     q_lora = (
                         (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
                     )
@@ -616,12 +346,10 @@ class DSANPUIndexerMixin:
                 )  # [bs, n, d]
                 q = torch.cat([q_pe, q_nope], dim=-1)
 
-            if weight_multistream:
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
                 indexer_weight_stream = get_indexer_weight_stream()
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
-                    if defer_query_gather:
-                        x.record_stream(indexer_weight_stream)
                     x = x.view(-1, self.hidden_size)
                     weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
                     weights.record_stream(indexer_weight_stream)
@@ -647,12 +375,10 @@ class DSANPUIndexerMixin:
             k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
         else:
-            if weight_multistream:
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
                 indexer_weight_stream = get_indexer_weight_stream()
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
-                    if defer_query_gather:
-                        x.record_stream(indexer_weight_stream)
                     x = x.view(-1, self.hidden_size)
                     weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
                     weights.record_stream(indexer_weight_stream)
@@ -721,8 +447,9 @@ class DSANPUIndexerMixin:
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
+            _check_quant_lightning_indexer_constraints(pool)
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype, tensor_name="k"
+                k, pool.indexer_hadamard_128, pool.dtype
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -789,18 +516,10 @@ class DSANPUIndexerMixin:
 
         past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
-        if (
-            self.rotary_emb.is_neox_style
-            and self.alt_stream is not None
-            and not resource_stream
-        ):
+        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
-            if defer_query_gather:
-                q.record_stream(torch.npu.current_stream())
-        if weight_multistream:
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-            if defer_query_gather:
-                weights.record_stream(torch.npu.current_stream())
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
@@ -825,53 +544,122 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
-            num_query_tokens = q.view(-1, self.n_heads, self.head_dim).shape[0]
+            query = q.view(-1, self.n_heads, self.head_dim)
+            num_query_tokens = effective_prefill_query_tokens(forward_batch, query)
+            shard = (
+                _get_indexer_query_shard(forward_batch, num_query_tokens)
+                if is_prefill
+                and _shard_indexer_queries
+                and threshold_allows(
+                    "SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS", num_query_tokens
+                )
+                else None
+            )
+            if shard is not None:
+                query = shard.take(query)
+                weights = shard.take(weights)
+                actual_seq_lengths_q = shard.actual_seq_lengths_q
+                actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
+                    query,
                     pool.indexer_hadamard_128,
                     pool.dtype,
-                    tensor_name="q",
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                # quant_lightning_indexer (v2) contract, quant_mode 3 (MXFP8):
+                #  - layout_q TND: q (q_t, q_n, d) fp8, cu_seqlens_q (b+1,) int32
+                #    required (first value 0, last value q_t)
+                #  - layout_k PA_BBND: k (block_num, block_size, k_n, d) fp8 with
+                #    block_table (b, max_blocks) and seqused_k (b,) both required
+                #  - descales are E8M0: q (q_t, q_n, d/64, 2),
+                #    k (block_num, block_size, k_n, d/64, 2)
+                #  - w is float32 (q_t, q_n)
+                # The metadata op (task list / load balancing) is pre-planned
+                # once per batch by AscendAttnBackend.init_forward_metadata;
+                # fall back to computing it inline when the backend did not
+                # pre-plan it (cuda-graph capture, other backends, CP, spec
+                # draft model), and ALWAYS re-plan when this call was sharded.
+                #
+                # The pre-plan describes the whole batch. A sharded call was
+                # handed 1/attn_tp_size of the query rows, so the batch-wide
+                # cu_seqlens_q ends at the batch's token total and the operator
+                # would walk attn_tp_size times past the end of `query`,
+                # `weights` and `query_scale`. Nothing on the host catches it:
+                # the lengths are device tensors, so the tiling cannot check
+                # them against the query shape, and the kernel reports the
+                # out-of-bounds read as an AICore trap from inside
+                # quant_lightning_indexer. It is a write too: v2's infershape
+                # sizes sparse_indices from queryShape.GetDim(0), not from
+                # cu_seqlens_q.
+                #
+                # That same rule is what lets shard.gather() work here: the
+                # output has one row per row of `query`, so a sharded call
+                # returns shard.rows rows and the all-gather widths line up.
+                # Rows past cu_seqlens_q[-1] are untouched, and gather() slices
+                # them off.
+                _fm = get_attn_backend().forward_metadata
+                if shard is None:
+                    cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
+                    seqused_k = getattr(_fm, "quant_indexer_seqused_k", None)
+                    metadata = getattr(_fm, "quant_indexer_metadata", None)
+                    if metadata is None:
+                        cu_seqlens_q, seqused_k, metadata = (
+                            self._plan_quant_lightning_indexer(
+                                actual_seq_lengths_q, actual_seq_lengths_kv, k.device
+                            )
+                        )
+                else:
+                    # Planned on this forward's first indexer layer and reused
+                    # by the rest, which is what the backend's pre-plan buys.
+                    if shard.quant_indexer_plan is None:
+                        shard.quant_indexer_plan = self._plan_quant_lightning_indexer(
+                            shard.actual_seq_lengths_q,
+                            shard.actual_seq_lengths_kv,
+                            k.device,
+                        )
+                    cu_seqlens_q, seqused_k, metadata = shard.quant_indexer_plan
+                block_table = block_table.to(torch.int32)
+                topk_indices, _ = (
+                    torch.ops.cann_ops_transformer.quant_lightning_indexer(
+                        query,
+                        past_key_states,
+                        weights.to(torch.float32),
+                        query_scale,
+                        pool.get_index_k_scale_buffer(layer_id),
+                        self.index_topk,
+                        3,  # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        metadata=metadata,
+                        max_seqlen_q=-1,
+                        layout_q="TND",
+                        layout_k="PA_BBND",
+                        mask_mode=3,
+                        cmp_ratio=1,
+                    )
+                )
+                topk_indices = topk_indices.squeeze(1)
+            else:
+                topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                        torch.int32
                     ),
                     block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
                     sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                )
-                if defer_query_gather:
-                    return topk_indices, None, num_query_tokens
-                return topk_indices.squeeze(1)
-
-            topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
-                key=past_key_states,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
+                )[0].squeeze(1)
+            if shard is not None:
+                topk_indices = shard.gather(topk_indices, num_query_tokens)
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            return topk_indices
 
     def do_npu_cp_balance_indexer(
         self,

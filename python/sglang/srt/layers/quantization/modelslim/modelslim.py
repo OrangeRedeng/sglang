@@ -67,19 +67,6 @@ def npu_wrapper_rmsnorm_forward(func):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
-        if getattr(self, "_npu_tp_mxfp8", False):
-            from sglang.srt.hardware_backend.npu.triton_kernel.tp_moe_fusion import (
-                add_rmsnorm_mxfp8,
-            )
-
-            if post_residual_addition is not None:
-                raise ValueError(
-                    "Dual MXFP8 norm does not fuse extra residual branches"
-                )
-            out, residual_out = add_rmsnorm_mxfp8(
-                x, residual, self.weight.data, self.bias, self.variance_epsilon
-            )
-            return out if residual is None else (out, residual_out)
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition

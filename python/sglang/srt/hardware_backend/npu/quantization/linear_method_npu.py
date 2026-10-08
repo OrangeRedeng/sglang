@@ -259,9 +259,6 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        operand = getattr(x, "_npu_mxfp8_operand", None)
-        if operand is not None and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get():
-            x = operand
         if isinstance(x, tuple):
             # MLAProlog supplies a [tokens, hidden] quantized query norm.
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
@@ -657,9 +654,6 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
-        operand = getattr(x, "_npu_mxfp8_operand", None)
-        if operand is not None and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get():
-            x = operand
         if isinstance(x, tuple):
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
                 record_mxfp8_operand,

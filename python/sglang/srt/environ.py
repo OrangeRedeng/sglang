@@ -1000,9 +1000,6 @@ class Envs:
     SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS = EnvBool(False)
     SGLANG_NPU_DCP_SCRATCH_BUDGET_MB = EnvInt(256)
     SGLANG_NPU_MEMORY_DIAGNOSTICS = EnvBool(False)
-    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS = EnvInt(0)
-    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS = EnvInt(0)
-    SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
@@ -1011,17 +1008,12 @@ class Envs:
     # Opt-in A/B stages; shared finalization also requires scaled routing weights.
     SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE = EnvBool(False)
     SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT = EnvBool(False)
-    SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE = EnvBool(False)
     SGLANG_NPU_TP_MOE_PREQUANT_INPUT = EnvBool(False)
     SGLANG_NPU_TP_MOE_REUSE_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_SHARED_GMM1 = EnvBool(False)
     # An explicit mode overrides the legacy SHARED_GMM1 switch.
     SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
-    SGLANG_NPU_TP_MOE_SHARED_STREAM_START = EnvStr("pre_gate")
-    SGLANG_NPU_TP_MOE_SHARED_PIPELINE = EnvStr("legacy")
-    SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS = EnvBool(False)
-    SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
     SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
     SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE = EnvStr("fp32")
@@ -1031,7 +1023,6 @@ class Envs:
     SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS = EnvBool(False)
     SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_DIR = EnvStr("")
     SGLANG_NPU_TP_MOE_NORM_GATE_CAPTURE_MIN_TOKENS = EnvInt(1024)
-    SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
@@ -1052,15 +1043,32 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
-    # DSA prefill: overlap the q-nope projection's RoPE with the eager indexer
-    # on a side stream (opt-in A/B experiments).
-    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE = EnvBool(False)
-    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM = EnvBool(False)
-    SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL = EnvBool(False)
-    SGLANG_NPU_DSA_EAGER_INDEXER = EnvBool(False)
-    # Isolate indexer scheduling from unrelated global multistream features.
-    SGLANG_NPU_DSA_INDEXER_STREAM_MODE = EnvStr("legacy")
-    SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE = EnvStr("matmul")
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: shard the attention block's tokens across attention-TP, so
+    # every rank computes every head for its own slice, with the query
+    # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
+    # DSA-CP: also shard batches carrying more than one request, by passing
+    # full per-request KV lengths and dropping the operator's causal crop.
+    # Only engages where every request's prefix reaches index_topk.
+    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
+    # the scratch a layer holds beside the gathered context. The default is
+    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: run each layer's prefix all-gather one layer ahead, on
+    # a side stream, so it overlaps the previous layer's compute. Profiles show
+    # compute and communication never running at the same time -- the gather is
+    # issued and immediately awaited -- while the prefix it reads was written by
+    # earlier forwards and so does not depend on the current one. Costs a second
+    # context-sized scratch, and needs a single-piece plan
+    # (SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0); it silently stays off
+    # otherwise.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

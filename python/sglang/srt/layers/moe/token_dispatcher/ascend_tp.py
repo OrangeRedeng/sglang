@@ -43,9 +43,6 @@ class AscendTPDispatchOutput(NamedTuple):
 class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     shared_output: Optional[torch.Tensor] = None
-    gmm2_input_scale: Optional[torch.Tensor] = None
-    gmm2_weight: Optional[torch.Tensor] = None
-    gmm2_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -53,19 +50,31 @@ class AscendTPCombineInput(NamedTuple):
 
 
 class AscendTPDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, *, local_ep: bool = False):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self.top_k = moe_runner_config.top_k
+        self.local_ep = local_ep
+        self.active_expert_range = None
+        if local_ep:
+            if moe_runner_config.num_fused_shared_experts:
+                raise ValueError("allreduce-deepep requires separate shared experts")
+            parallel = get_parallel()
+            if parallel.moe_tp_size != 1:
+                raise ValueError("allreduce-deepep requires full-width local experts")
+            num_local = moe_runner_config.num_local_experts
+            start = parallel.moe_ep_rank * num_local
+            self.active_expert_range = [start, start + num_local]
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
-        self.fuse_gmm2_finalize = False
 
         # Initialise routing kernels with default (no quant config yet)
         self.set_ascend_dispatcher_output_dtype()
 
     def set_quant_config(self, quant_config: dict) -> None:
+        if self.local_ep and quant_config.get("quant_type") == "gguf":
+            raise ValueError("allreduce-deepep does not support GGUF routing")
         self.quant_config = quant_config
         self.set_ascend_dispatcher_output_dtype()
 
@@ -99,7 +108,10 @@ class AscendTPDispatcher(BaseDispatcher):
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
             )
 
-        self.init.row_idx_type = int(self.fuse_gmm2_finalize)
+        if self.local_ep:
+            self.init.active_expert_range = self.active_expert_range
+            # Mode 3 zeros filtered routes; mode 2 assumes every route is present.
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=3)
 
     def dispatch(
         self,
@@ -152,28 +164,6 @@ class AscendTPDispatcher(BaseDispatcher):
             raise RuntimeError("combine() called before dispatch()")
 
         dispatch_out = self._dispatch_output
-
-        if combine_input.gmm2_input_scale is not None:
-            if self.local_ep or not self.fuse_gmm2_finalize:
-                raise ValueError(
-                    "Fused GMM2 finalization requires token-major TP routing"
-                )
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                fused_gmm2_finalize,
-            )
-
-            final_hidden_states = fused_gmm2_finalize(
-                combine_input.hidden_states,
-                combine_input.gmm2_input_scale,
-                combine_input.gmm2_weight,
-                combine_input.gmm2_weight_scale,
-                dispatch_out.expert_tokens,
-                dispatch_out.topk_weights,
-                dispatch_out.expanded_row_idx,
-                combine_input.shared_output,
-            )
-            self._dispatch_output = None
-            return final_hidden_states
 
         shared_kwargs = {}
         if combine_input.shared_output is not None:
