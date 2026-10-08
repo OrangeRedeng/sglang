@@ -34,15 +34,42 @@ def use_shared_pipeline(pipeline):
         _shared_pipeline.reset(token)
 
 
+def shared_resource_blockers(state):
+    required = {
+        "has_shared_stream": True,
+        "is_extend_in_batch": True,
+        "is_nextn": False,
+        "is_glm_moe_dsa": True,
+        "shared_gmm1_mode": "grouped_fused",
+        "swiglu_limit": None,
+        "runner_inplace": False,
+        "capture_mode": False,
+        "breakable_graph": False,
+        "piecewise_graph": False,
+        "sp_active": False,
+        "down_proj_decode_attn_tp": False,
+        "skip_shared_experts": False,
+        "token_threshold_met": True,
+    }
+    return tuple(key for key, expected in required.items() if state[key] != expected)
+
+
 @lru_cache(maxsize=None)
-def log_shared_pipeline(active):
+def log_shared_pipeline(active, state_items):
+    state = dict(state_items)
+    fields = " ".join(f"{key}={value}" for key, value in state_items)
+    blockers = ",".join(shared_resource_blockers(state)) or "none"
     logger.info(
-        "TP shared resource pipeline is ACTIVE: fused GateUp/activation/quant "
-        "overlaps routing; fused routed GMM1 has no activation boundary; "
-        "shared Down follows routed GMM2 (Cube stages serialized)"
+        "%s: blockers=%s %s",
+        "TP shared resource pipeline is ACTIVE"
         if active
-        else "TP shared resource pipeline REQUESTED but is OFF: requires "
-        "eligible eager GLM native TP MXFP extend with grouped_fused shared GMM1"
+        else (
+            "TP shared resource pipeline REQUESTED but OFF"
+            if state["requested"]
+            else "TP shared resource pipeline is OFF"
+        ),
+        blockers,
+        fields,
     )
 
 

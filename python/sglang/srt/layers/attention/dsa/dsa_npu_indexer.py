@@ -49,13 +49,28 @@ def _indexer_stream_mode():
     return mode
 
 
+def _indexer_resource_reason(indexer, forward_batch, input_on_attn_tp_slices):
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_draft_extend_v2() or mode.is_target_verify():
+        return "requires prefill extend"
+    if get_is_capture_mode():
+        return "capture_mode=1"
+    if is_in_breakable_cuda_graph():
+        return "breakable_graph=1"
+    if is_in_tc_piecewise_cuda_graph():
+        return "piecewise_graph=1"
+    if not indexer.rotary_emb.is_neox_style:
+        if forward_batch.attn_cp_metadata is not None or get_parallel().dcp_enabled:
+            return "non-NeoX CP/DCP paired RoPE is unsupported"
+        if _use_ag_after_qlora and input_on_attn_tp_slices:
+            return "non-NeoX sliced qlora gather is unsupported"
+    return None
+
+
 def _use_indexer_resource_stream(indexer, forward_batch, input_on_attn_tp_slices):
     return (
-        not indexer.rotary_emb.is_neox_style
-        and indexer.can_forward_npu_eager(forward_batch, input_on_attn_tp_slices)
-        and not get_is_capture_mode()
-        and not is_in_breakable_cuda_graph()
-        and not is_in_tc_piecewise_cuda_graph()
+        _indexer_resource_reason(indexer, forward_batch, input_on_attn_tp_slices)
+        is None
     )
 
 
@@ -303,6 +318,86 @@ class _PendingIndexerTopk:
 
 
 class DSANPUIndexerMixin:
+    def _neox_sin_cos(self, positions, forward_batch):
+        if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
+            cos, sin = self.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+            sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+            forward_batch.npu_indexer_sin_cos_cache = (sin, cos)
+        return forward_batch.npu_indexer_sin_cos_cache
+
+    def _resource_projections_neox(
+        self,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        input_on_attn_tp_slices,
+        dynamic_scale,
+    ):
+        main = torch.npu.current_stream()
+        vector = get_stream("npu_dsa_indexer_vector")
+        bs = q_lora.shape[0]
+        x = x.view(-1, self.hidden_size)
+        sin, cos = self._neox_sin_cos(positions, forward_batch)
+        operand = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+        q_raw = self.wq_b(operand)[0]
+        q_ready = main.record_event()
+        with torch.npu.stream(vector):
+            vector.wait_event(q_ready)
+            _record_indexer_tensors(vector, q_raw, sin, cos)
+            q_pe, q_nope = torch.split(
+                q_raw.view(bs, self.n_heads, self.head_dim),
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )
+            q_pe = torch_npu.npu_rotary_mul(
+                q_pe.view(bs, self.n_heads, 1, self.rope_head_dim),
+                cos,
+                sin,
+            ).view(bs, self.n_heads, self.rope_head_dim)
+            q = torch.cat([q_pe, q_nope], dim=-1)
+
+        weights_raw = self.weights_proj(x.float())[0]
+        weights_ready = main.record_event()
+        with torch.npu.stream(vector):
+            vector.wait_event(weights_ready)
+            _record_indexer_tensors(vector, weights_raw)
+            weights = weights_raw.to(torch.bfloat16)
+
+        k_raw = self.wk(x)[0]
+        k_ready = main.record_event()
+        gather_k = _use_ag_after_qlora and input_on_attn_tp_slices
+        with torch.npu.stream(vector):
+            vector.wait_event(k_ready)
+            _record_indexer_tensors(vector, k_raw)
+            for tensor in (*self.k_norm.parameters(), *self.k_norm.buffers()):
+                tensor.record_stream(vector)
+            k = self.k_norm(k_raw)
+            if not gather_k:
+                k = self._neox_k_rope(k, cos, sin, bs)
+            ready = vector.record_event()
+        main.wait_event(ready)
+        _record_indexer_tensors(main, q, k, weights)
+        if gather_k:
+            # Retain k-gather before CP and weights-gather, on the caller stream.
+            k = scattered_to_tp_attn_full(k, forward_batch)
+            k = self._neox_k_rope(k, cos, sin, bs)
+        return q, k, weights
+
+    def _neox_k_rope(self, k, cos, sin, bs):
+        k_pe, k_nope = torch.split(
+            k,
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+            dim=-1,
+        )
+        k_pe = torch.ops.npu.npu_rotary_mul(
+            k_pe.view(-1, 1, 1, self.rope_head_dim),
+            cos,
+            sin,
+        ).view(bs, 1, self.rope_head_dim)
+        return torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)
+
     def _resource_projections(self, x, q_lora, positions, layer_id, dynamic_scale):
         """One projection queue; cast/split/norm/paired RoPE on one side queue.
 
@@ -495,30 +590,33 @@ class DSANPUIndexerMixin:
             self, forward_batch, input_on_attn_tp_slices
         )
         if stream_mode == "resource":
+            reason = _indexer_resource_reason(
+                self, forward_batch, input_on_attn_tp_slices
+            )
             print_info_once(
                 "DSA indexer resource stream is ACTIVE (serialized projections, "
-                "cast/split/norm/paired RoPE tail; hardware resource class requires "
-                "profiling)"
+                "Vector tails; CP/DCP collectives on caller)"
                 if resource_stream
-                else "DSA indexer resource stream REQUESTED but is OFF: "
-                "requires non-NeoX eager extend without CP/DCP or qlora gather"
+                else f"DSA indexer resource stream REQUESTED but is OFF: {reason}"
             )
         elif envs.SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS.get():
             print_info_once(f"DSA indexer stream mode is {stream_mode}")
 
-        if resource_stream:
+        if resource_stream and self.rotary_emb.is_neox_style:
+            q, k, weights = self._resource_projections_neox(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                input_on_attn_tp_slices,
+                dynamic_scale,
+            )
+        elif resource_stream:
             q, k, weights = self._resource_projections(
                 x, q_lora, positions, layer_id, dynamic_scale
             )
         elif self.rotary_emb.is_neox_style:
-            if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
-                cos_sin = self.rotary_emb.cos_sin_cache[positions]
-                cos, sin = cos_sin.chunk(2, dim=-1)
-                cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-                sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-                forward_batch.npu_indexer_sin_cos_cache = (sin, cos)
-            else:
-                sin, cos = forward_batch.npu_indexer_sin_cos_cache
+            sin, cos = self._neox_sin_cos(positions, forward_batch)
 
             if self.alt_stream is not None:
                 self.alt_stream.wait_stream(torch.npu.current_stream())
@@ -741,7 +839,11 @@ class DSANPUIndexerMixin:
 
         past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        if (
+            self.rotary_emb.is_neox_style
+            and self.alt_stream is not None
+            and not resource_stream
+        ):
             torch.npu.current_stream().wait_event(q_rope_event)
             if defer_query_gather:
                 q.record_stream(torch.npu.current_stream())

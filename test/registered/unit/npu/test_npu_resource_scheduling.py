@@ -1,6 +1,9 @@
 """CPU scheduling/experiment policy checks; no NPU execution is simulated."""
 
 import ast
+import csv
+import json
+import tempfile
 import importlib.util
 import os
 import sys
@@ -85,6 +88,7 @@ class TestResourceScheduling(unittest.TestCase):
     def test_defaults_preserve_baseline(self):
         for name, expected in (
             ("SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM", False),
+            ("SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL", False),
             ("SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS", 0),
             ("SGLANG_NPU_DSA_INDEXER_STREAM_MODE", "legacy"),
             ("SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE", "matmul"),
@@ -148,17 +152,70 @@ class TestResourceScheduling(unittest.TestCase):
         ):
             ns["_indexer_stream_mode"]()
 
-    def test_resource_indexer_collective_and_capture_fallbacks(self):
+    def test_neox_serial_path_eligibility(self):
+        ns = definitions(
+            ATTENTION,
+            {"_use_dsa_eager_streams", "_neox_qproj_serial_reason"},
+            **self.namespace,
+        )
+        m = SimpleNamespace(
+            rotary_emb=SimpleNamespace(is_neox_style=True), alt_stream=object()
+        )
+        batch = SimpleNamespace(forward_mode=modes.EXTEND)
+        decision = ns["_neox_qproj_serial_reason"]
+        self.assertIsNone(decision(m, batch))
+        m.rotary_emb.is_neox_style = False
+        self.assertIn("not NeoX", decision(m, batch))
+        m.rotary_emb.is_neox_style = True
+        m.alt_stream = None
+        self.assertIn("no asynchronous", decision(m, batch))
+        m.alt_stream = object()
+        batch.forward_mode = modes.DECODE
+        self.assertIsNotNone(decision(m, batch))
+        batch.forward_mode = modes.EXTEND
+        for kind in vars(self.capture):
+            setattr(self.capture, kind, True)
+            self.assertIsNotNone(decision(m, batch))
+            setattr(self.capture, kind, False)
+
+    def test_resource_indexer_target_cp_dcp_and_sliced_gather(self):
         parallel = SimpleNamespace(dcp_enabled=False)
         ns = definitions(
             INDEXER,
-            {"_use_indexer_resource_stream", "can_forward_npu_eager"},
+            {"_use_indexer_resource_stream", "_indexer_resource_reason"},
+            **self.namespace,
+            get_parallel=lambda: parallel,
+            _use_ag_after_qlora=True,
+        )
+        indexer = SimpleNamespace(rotary_emb=SimpleNamespace(is_neox_style=True))
+        batch = SimpleNamespace(forward_mode=modes.EXTEND, attn_cp_metadata=None)
+        decision = ns["_use_indexer_resource_stream"]
+        # No eager-indexer method is provided: scheduling must be independent.
+        for cp in (None, object()):
+            for dcp in (False, True):
+                for sliced in (False, True):
+                    batch.attn_cp_metadata = cp
+                    parallel.dcp_enabled = dcp
+                    self.assertTrue(decision(indexer, batch, sliced))
+        for kind in vars(self.capture):
+            setattr(self.capture, kind, True)
+            self.assertFalse(decision(indexer, batch, False))
+            self.assertIn("=1", ns["_indexer_resource_reason"](indexer, batch, False))
+            setattr(self.capture, kind, False)
+        for mode in (modes.DECODE, modes.TARGET_VERIFY, modes.DRAFT_EXTEND_V2):
+            batch.forward_mode = mode
+            self.assertFalse(decision(indexer, batch, False))
+
+    def test_non_neox_resource_fallbacks_preserved(self):
+        parallel = SimpleNamespace(dcp_enabled=False)
+        ns = definitions(
+            INDEXER,
+            {"_use_indexer_resource_stream", "_indexer_resource_reason"},
             **self.namespace,
             get_parallel=lambda: parallel,
             _use_ag_after_qlora=True,
         )
         indexer = SimpleNamespace(rotary_emb=SimpleNamespace(is_neox_style=False))
-        indexer.can_forward_npu_eager = MethodType(ns["can_forward_npu_eager"], indexer)
         batch = SimpleNamespace(forward_mode=modes.EXTEND, attn_cp_metadata=None)
         decision = ns["_use_indexer_resource_stream"]
         self.assertTrue(decision(indexer, batch, False))
@@ -168,14 +225,139 @@ class TestResourceScheduling(unittest.TestCase):
         batch.attn_cp_metadata = None
         parallel.dcp_enabled = True
         self.assertFalse(decision(indexer, batch, False))
-        parallel.dcp_enabled = False
-        indexer.rotary_emb.is_neox_style = True
-        self.assertFalse(decision(indexer, batch, False))
-        indexer.rotary_emb.is_neox_style = False
-        for kind in vars(self.capture):
-            setattr(self.capture, kind, True)
-            self.assertFalse(decision(indexer, batch, False))
-            setattr(self.capture, kind, False)
+
+    def test_resource_projections_queue_and_caller_gather(self):
+        trace, current = [], ["main"]
+
+        class Tensor:
+            shape = (4,)
+
+            def __init__(self, name):
+                self.name = name
+
+            def view(self, *args):
+                return self
+
+            def float(self):
+                return self
+
+            def to(self, dtype):
+                trace.append(("cast", current[0]))
+                return Tensor("weights")
+
+            def record_stream(self, stream):
+                trace.append(("record:" + self.name, stream.name))
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def record_event(self):
+                event = len(trace)
+                trace.append(("event", self.name))
+                return event
+
+            def wait_event(self, event):
+                trace.append(("wait", self.name))
+
+        main, vector = Stream("main"), Stream("vector")
+
+        @contextmanager
+        def stream_context(stream):
+            previous = current[0]
+            current[0] = stream.name
+            try:
+                yield
+            finally:
+                current[0] = previous
+
+        def projection(name):
+            def apply(operand):
+                trace.append((name, current[0]))
+                return (Tensor(name),)
+
+            return apply
+
+        def norm(value):
+            trace.append(("k_norm", current[0]))
+            return Tensor("k")
+
+        norm.parameters = lambda: [Tensor("norm_weight")]
+        norm.buffers = lambda: []
+
+        def gather(k, batch):
+            trace.append(("gather", current[0]))
+            return k
+
+        ns = definitions(
+            INDEXER,
+            {"_resource_projections_neox", "_record_indexer_tensors"},
+            torch=SimpleNamespace(
+                Tensor=Tensor,
+                bfloat16=object(),
+                npu=SimpleNamespace(current_stream=lambda: main, stream=stream_context),
+                split=lambda *args, **kwargs: (Tensor("q_pe"), Tensor("q_nope")),
+                cat=lambda *args, **kwargs: Tensor("q"),
+            ),
+            torch_npu=SimpleNamespace(npu_rotary_mul=lambda *args: Tensor("q_pe")),
+            get_stream=lambda name: vector,
+            _use_ag_after_qlora=True,
+            scattered_to_tp_attn_full=gather,
+        )
+        indexer = SimpleNamespace(
+            hidden_size=128,
+            n_heads=2,
+            head_dim=128,
+            rope_head_dim=64,
+            wq_b=projection("wq_b"),
+            weights_proj=projection("weights_proj"),
+            wk=projection("wk"),
+            k_norm=norm,
+            _neox_sin_cos=lambda *args: (Tensor("sin"), Tensor("cos")),
+            _neox_k_rope=lambda k, *args: k,
+        )
+        method = MethodType(ns["_resource_projections_neox"], indexer)
+        q, k, weights = method(
+            Tensor("x"), Tensor("q_lora"), Tensor("positions"), object(), True, None
+        )
+        self.assertEqual(
+            [item for item in trace if item[0] in ("wq_b", "weights_proj", "wk")],
+            [("wq_b", "main"), ("weights_proj", "main"), ("wk", "main")],
+        )
+        self.assertIn(("k_norm", "vector"), trace)
+        self.assertEqual(trace[-1], ("gather", "main"))
+        for name in ("wq_b", "weights_proj", "wk", "sin", "cos", "norm_weight"):
+            self.assertIn(("record:" + name, "vector"), trace)
+        for tensor in (q, k, weights):
+            self.assertIn(("record:" + tensor.name, "main"), trace)
+
+    def test_shared_reason_builder_exposes_each_blocker(self):
+        ns = definitions(NPU / "moe/tp_fusion.py", {"shared_resource_blockers"})
+        state = dict(
+            has_shared_stream=True,
+            is_extend_in_batch=True,
+            is_nextn=False,
+            is_glm_moe_dsa=True,
+            shared_gmm1_mode="grouped_fused",
+            swiglu_limit=None,
+            runner_inplace=False,
+            capture_mode=False,
+            breakable_graph=False,
+            piecewise_graph=False,
+            sp_active=False,
+            down_proj_decode_attn_tp=False,
+            skip_shared_experts=False,
+            token_threshold_met=True,
+            fuse_shared=True,
+        )
+        blockers = ns["shared_resource_blockers"]
+        self.assertEqual(blockers(state), ())
+        for key, value in state.items():
+            if key == "fuse_shared":
+                continue
+            wrong = not value if isinstance(value, bool) else "unsupported"
+            self.assertEqual(blockers({**state, key: wrong}), (key,))
+        self.assertEqual(blockers({**state, "fuse_shared": False}), ())
 
     def test_shared_context_restored_after_failure_and_nested_forward(self):
         ns = definitions(
@@ -239,7 +421,7 @@ class TestResourceScheduling(unittest.TestCase):
                 (record(100, correct), record(98, correct), record(100, correct))
                 for _ in range(3)
             ]
-            result = runner.summarize(pairs)
+            result = runner.summarize(pairs, mechanism_confirmed=True)
             self.assertEqual(result["nonregression"], correct)
             self.assertEqual(result["promotion_eligible"], correct)
 
@@ -257,6 +439,101 @@ class TestResourceScheduling(unittest.TestCase):
         self.assertFalse(result["nonregression"])
         pairs[0][1]["status"] = "ineligible"
         self.assertEqual(runner.summarize(pairs)["status"], "FAILED_OR_INELIGIBLE")
+
+    def test_runner_requires_mechanism_and_rejects_profiler_ttft(self):
+        def record(profiled=False):
+            return {
+                "status": "ok",
+                "runs": [{"median_ttft": 100}],
+                "correctness": True,
+                "profiled": profiled,
+            }
+
+        pairs = [
+            (record(), {**record(), "runs": [{"median_ttft": 98}]}, record())
+            for _ in range(3)
+        ]
+        self.assertFalse(runner.summarize(pairs)["promotion_eligible"])
+        pairs[0][1]["profiled"] = True
+        self.assertEqual(
+            runner.summarize(pairs, mechanism_confirmed=True)["status"], "PROFILE_ONLY"
+        )
+
+    def test_runner_minimal_matrix_and_auto_hccl(self):
+        self.assertEqual(
+            runner.DEFAULT_CASES, ["NEOX_QPROJ_SERIAL", "OLD_QNOPE", "IDX_RESOURCE"]
+        )
+        self.assertEqual(runner.BASE["SGLANG_NPU_AUTO_HCCL_BUFFSIZE"], "1")
+        self.assertIsNone(runner.BASE["HCCL_BUFFSIZE"])
+        self.assertEqual(runner.BASE["TASK_QUEUE_ENABLE"], "2")
+        self.assertEqual(runner.BASE["ASCEND_RT_VISIBLE_DEVICES"], "4,5,6,7")
+
+    def test_runner_analyzes_capture_and_keeps_unknown_mixed_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            profile = directory / "profile" / "0"
+            profile.mkdir(parents=True)
+            path = profile / "kernel_details.csv"
+            with path.open("w") as output:
+                writer = csv.writer(output)
+                writer.writerow(
+                    [
+                        "Name",
+                        "Stream ID",
+                        "Task Start Time(us)",
+                        "Task Duration(us)",
+                        "Task Type",
+                    ]
+                )
+                writer.writerows(
+                    [
+                        ["TopK", 1, 0, 1000, "AI_CUBE"],
+                        ["QuantLightningIndexer", 2, 100, 200, "AI_CUBE"],
+                        ["SparseAttention", 3, 200, 400, "AI_VECTOR"],
+                        ["mixed", 4, 50, 700, "MIX_AIC"],
+                        ["unknown", 5, 0, 800, "AI_CORE"],
+                        ["HcomAllGather", 6, 400, 500, "HCCL"],
+                    ]
+                )
+            args = SimpleNamespace(
+                profile_task_glob="**/kernel_details.csv", profile_device_pid=None
+            )
+            result = runner.analyze_capture(args, directory)
+            overlap = result["resource_overlap"]
+            self.assertAlmostEqual(overlap["cube_vector_ms"], 0.4)
+            self.assertAlmostEqual(overlap["cube_cube_ms"], 0.2)
+            self.assertEqual(overlap["vector_vector_ms"], 0)
+            self.assertAlmostEqual(overlap["compute_comm_ms"], 0.5)
+            self.assertEqual(overlap["unknown_compute_calls"], 1)
+            self.assertEqual(overlap["mixed_compute_calls"], 1)
+            self.assertAlmostEqual(overlap["unknown_compute_busy_ms"], 0.8)
+            self.assertAlmostEqual(overlap["mixed_compute_busy_ms"], 0.7)
+            self.assertEqual(result["topk_calls"], 1)
+            self.assertEqual(result["sparse_attn_calls"], 1)
+            self.assertEqual(result["target_ops"]["Indexer wq_b"]["mean_us"], None)
+            runner.write_report(
+                directory, {"AUTO_TQ2": {"status": "ok", "resource_analysis": result}}
+            )
+            self.assertIn(
+                "cube_vector_ms", (directory / "resource_overlap_report.md").read_text()
+            )
+            self.assertEqual(
+                json.loads((directory / "resource_overlap.json").read_text()), result
+            )
+            (profile / "device_1").mkdir()
+            (profile / "device_1" / "kernel_details.csv").write_text(path.read_text())
+            multi = runner.analyze_capture(args, directory)
+            self.assertEqual(len(multi["device_profiles"]), 2)
+            for device in multi["device_profiles"]:
+                self.assertIsNone(device["device_key"])
+                self.assertEqual(device["topk_calls"], 1)
+            runner.write_report(
+                directory, {"AUTO_TQ2": {"status": "ok", "resource_analysis": multi}}
+            )
+            self.assertIn(
+                "unassigned_export_1",
+                (directory / "resource_overlap_report.md").read_text(),
+            )
 
 
 if __name__ == "__main__":

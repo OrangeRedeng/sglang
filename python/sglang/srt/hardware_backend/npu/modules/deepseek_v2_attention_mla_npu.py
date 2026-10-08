@@ -104,6 +104,25 @@ def _log_qproj_kvnorm_overlap(active):
     )
 
 
+def _neox_qproj_serial_reason(m, forward_batch):
+    if not m.rotary_emb.is_neox_style:
+        return "rotary embedding is not NeoX"
+    if m.alt_stream is None:
+        return "no asynchronous q projection stream"
+    if not _use_dsa_eager_streams(forward_batch):
+        return "requires eager prefill outside capture/breakable/piecewise graphs"
+    return None
+
+
+@lru_cache(maxsize=None)
+def _log_neox_qproj_serial(reason):
+    logger.info(
+        "DSA NeoX qproj/KV-norm serial ablation is ACTIVE"
+        if reason is None
+        else f"DSA NeoX qproj/KV-norm serial ablation REQUESTED but OFF: {reason}"
+    )
+
+
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
     return (
         runtime_context.get_parallel().dcp_enabled
@@ -454,6 +473,11 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    neox_qproj_serial = False
+    if envs.SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL.get():
+        reason = _neox_qproj_serial_reason(m, forward_batch)
+        _log_neox_qproj_serial(reason)
+        neox_qproj_serial = reason is None
     pending_indexer = None
     q_nope_ready = None
     q_proj_ready = None
@@ -532,7 +556,7 @@ def forward_dsa_prepare_npu(
                 )
 
             q_event = None
-            if m.alt_stream is not None:
+            if m.alt_stream is not None and not neox_qproj_serial:
                 m.alt_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(m.alt_stream):
                     if eager_indexer or overlap_qnope_rope:

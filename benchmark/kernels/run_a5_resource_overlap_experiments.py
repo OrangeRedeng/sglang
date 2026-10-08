@@ -24,7 +24,9 @@ _spec.loader.exec_module(restart)
 
 BASE = {
     "HCCL_BUFFSIZE": None,
-    "TASK_QUEUE_ENABLE": None,
+    "TASK_QUEUE_ENABLE": "2",
+    "SGLANG_NPU_AUTO_HCCL_BUFFSIZE": "1",
+    "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7",
     "HCCL_OP_EXPANSION_MODE": None,
     "SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE": "1",
     "SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT": "1",
@@ -38,10 +40,14 @@ BASE = {
     "SGLANG_NPU_TP_MOE_SHARED_STREAM_START": "pre_gate",
     "SGLANG_NPU_TP_MOE_SHARED_PIPELINE": "legacy",
     "SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM": "0",
+    "SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL": "0",
     "SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS": "0",
     "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE": "0",
     "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS": "0",
     "SGLANG_NPU_DSA_EAGER_INDEXER": "0",
+    "SGLANG_NPU_ENABLE_DSA_CP": "1",
+    "SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST": "1",
+    "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING": "1",
     "SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS": "0",
     "SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS": "0",
     "SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "legacy",
@@ -50,31 +56,17 @@ BASE = {
     "SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH": "0",
     "SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS": "1",
 }
-BEST = {**BASE, "HCCL_BUFFSIZE": "256", "TASK_QUEUE_ENABLE": "2"}
 SINGLES = {
-    "qproj": {"SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM": "1"},
-    "qnope": {"SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE": "1"},
-    "qproj_qnope": {
-        "SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM": "1",
+    "NEOX_QPROJ_SERIAL": {"SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL": "1"},
+    "OLD_QNOPE": {"SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE": "1"},
+    "IDX_RESOURCE": {"SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "resource"},
+    "MOE_SHARED_RESOURCE": {"SGLANG_NPU_TP_MOE_SHARED_PIPELINE": "resource"},
+    "IDX_RESOURCE_QNOPE": {
+        "SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "resource",
         "SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE": "1",
     },
-    "indexer_inline": {"SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "inline"},
-    "indexer_resource": {"SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "resource"},
-    "eager_indexer_resource": {
-        "SGLANG_NPU_DSA_INDEXER_STREAM_MODE": "resource",
-        "SGLANG_NPU_DSA_EAGER_INDEXER": "1",
-    },
-    "shared_post_gate": {
-        "SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM": "1",
-        "SGLANG_NPU_TP_MOE_SHARED_STREAM_START": "post_gate",
-    },
-    "shared_resource": {"SGLANG_NPU_TP_MOE_SHARED_PIPELINE": "resource"},
-    "dcp_prefetch": {"SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH": "1"},
-    "gate_materialized_nd": {
-        "SGLANG_NPU_TP_MOE_MXFP8_GATE": "1",
-        "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT": "materialized_nd",
-    },
 }
+DEFAULT_CASES = ["NEOX_QPROJ_SERIAL", "OLD_QNOPE", "IDX_RESOURCE"]
 SIGNATURE = {"completed": 17, "input_tokens": 3731608, "output_tokens": 17}
 
 
@@ -102,7 +94,9 @@ def bimodal(samples):
     return any(right / left > 1.025 for left, right in zip(ordered, ordered[1:]))
 
 
-def summarize(pairs):
+def summarize(pairs, *, mechanism_confirmed=False):
+    if any(r.get("profiled", False) for p in pairs for r in p):
+        return {"status": "PROFILE_ONLY", "promotion_eligible": False}
     valid = [p for p in pairs if all(r["status"] == "ok" for r in p)]
     if len(valid) != len(pairs):
         return {"status": "FAILED_OR_INELIGIBLE", "valid_pairs": len(valid)}
@@ -113,7 +107,9 @@ def summarize(pairs):
     ]
     if not values:
         return {"status": "UNMEASURED"}
-    gain = 100 * (1 - statistics.median(values) / statistics.median(anchors))
+    gain = 100 * (
+        1 - statistics.median(value / anchor for value, anchor in zip(values, anchors))
+    )
     wins = sum(value < anchor for value, anchor in zip(values, anchors))
     correct = all(r["correctness"] for p in valid for r in p)
     unstable = bimodal(values) or bimodal(anchors)
@@ -129,17 +125,27 @@ def summarize(pairs):
             not unstable and gain >= 0 and wins * 3 >= len(values) * 2 and correct
         ),
         "promotion_eligible": (
-            not unstable and len(values) >= 3 and gain >= 0.5
-            and wins * 3 >= len(values) * 2 and correct
+            mechanism_confirmed
+            and not unstable
+            and len(values) >= 3
+            and gain >= 0.5
+            and wins * 3 >= len(values) * 2
+            and correct
         ),
     }
 
 
 def engagement(settings, server_log):
     for flag, message in (
-        ("SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM", "DSA qproj/KV norm overlap is ACTIVE"),
+        (
+            "SGLANG_NPU_DSA_NEOX_QPROJ_KVNORM_SERIAL",
+            "DSA NeoX qproj/KV-norm serial ablation is ACTIVE",
+        ),
         ("SGLANG_NPU_DSA_EAGER_INDEXER", "DSA eager indexer is ACTIVE"),
-        ("SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH", "DCP extend gather prefetch is ACTIVE"),
+        (
+            "SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH",
+            "DCP extend gather prefetch is ACTIVE",
+        ),
     ):
         if settings.get(flag) == "1" and message not in server_log:
             return f"Requested path did not engage: {flag}"
@@ -152,13 +158,210 @@ def engagement(settings, server_log):
     return None
 
 
+# Logical projections require launch correlation; anonymous MatMul/GMM rows
+# remain visible with shapes and are never assigned to a projection by guess.
+TARGET_OPS = {
+    "Attention q_b_proj": r"q_b_proj",
+    "Attention KV RMSNorm": r"kv.*(?:norm|rms)",
+    "Attention q_nope BMM": r"q_nope|transpose.*batch.*matmul",
+    "q RoPE": r"q.*rope",
+    "k RoPE": r"k.*rope",
+    "Indexer wq_b": r"wq_b",
+    "Indexer weights_proj": r"weights_proj",
+    "Indexer wk": r"(?:^|[./])wk(?:$|[./])",
+    "Indexer k_norm": r"k_norm",
+    "Hadamard q": r"(?:q.*hadamard|hadamard.*q)",
+    "Hadamard k": r"(?:k.*hadamard|hadamard.*k)",
+    "MX quant q": r"(?:q.*mx_quant|mx_quant.*q)",
+    "MX quant k": r"(?:k.*mx_quant|mx_quant.*k)",
+    "QuantLightningIndexer": r"quant.*lightning.*indexer",
+    "Gate QuantMatmul": r"gate.*quant.*matmul",
+    "TopK": r"topk",
+    "InitRouting": r"init.*routing",
+    "routed GMM1": r"routed.*gmm1",
+    "routed GMM2": r"routed.*gmm2",
+    "shared GateUp": r"shared.*gateup",
+    "shared activation/quant": r"shared.*(?:activation|quant)",
+    "shared Down": r"shared.*down",
+    "FinalizeRouting": r"finalize.*routing",
+    "Unattributed projection GEMMs": r"matmul|gemm|gmm",
+    "Unattributed RMSNorm": r"rms.*norm",
+    "Unattributed RoPE": r"rotary|rope",
+    "Unattributed MX quant": r"dynamic.*mx.*quant",
+}
+
+
+def op_rows(analysis):
+    rows = {}
+    for label, pattern in TARGET_OPS.items():
+        matches = [
+            k for k in analysis["kernels"] if re.search(pattern, k["name"], re.I)
+        ]
+        count = sum(k["calls"] for k in matches)
+        rows[label] = {
+            "calls": count,
+            "mean_us": sum(k["mean_us"] * k["calls"] for k in matches) / count
+            if count
+            else None,
+            "kernels": matches,
+        }
+    return rows
+
+
+def analyze_capture(args, directory):
+    profile_dir = directory / "profile"
+    pattern = args.profile_task_glob
+    matches = (
+        sorted(profile_dir.glob(pattern))
+        if pattern
+        else sorted(profile_dir.rglob("kernel_details.csv"))
+    )
+    if not pattern and not matches:
+        matches = sorted(profile_dir.rglob("op_summary*.csv"))
+    if not matches:
+        raise ValueError(
+            f"No device task export found for {pattern or 'automatic CSV discovery'}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "a5_overlap_analyzer", Path(__file__).with_name("analyze_npu_multistream.py")
+    )
+    analyzer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = analyzer
+    spec.loader.exec_module(analyzer)
+    results = []
+    for path in matches:
+        tasks = analyzer.read_tasks(path, args.profile_device_pid)
+        compute = [task for task in tasks if task.kind == "compute"]
+        if not compute:
+            raise ValueError(f"Profile contains no compute tasks: {path}")
+        # Stream selection affects stream diagnostics, never core classification.
+        main_stream = max(
+            {t.stream for t in compute},
+            key=lambda stream: sum(
+                t.end - t.start for t in compute if t.stream == stream
+            ),
+        )
+        result = analyzer.analyze(tasks, main_stream, {}, None, None, [])
+        result["task_file"] = str(path)
+        ranks = set()
+
+        def find_rank(metadata):
+            if isinstance(metadata, dict):
+                rank = metadata.get("rank_id")
+                if isinstance(rank, int) and rank >= 0:
+                    ranks.add(rank)
+                for value in metadata.values():
+                    find_rank(value)
+            elif isinstance(metadata, list):
+                for value in metadata:
+                    find_rank(value)
+
+        for info in path.parent.parent.glob("profiler_info*.json"):
+            find_rank(json.loads(info.read_text()))
+        result["device_key"] = (
+            f"rank_{next(iter(ranks))}"
+            if len(ranks) == 1
+            else "selected_device"
+            if len(matches) == 1
+            else None
+        )
+        result["target_ops"] = op_rows(result)
+        result["topk_calls"] = result["target_ops"]["TopK"]["calls"]
+        result["topk_mean_us"] = result["target_ops"]["TopK"]["mean_us"]
+        sparse = [
+            k
+            for k in result["kernels"]
+            if re.search(r"sparse.*(?:attn|attention)", k["name"], re.I)
+        ]
+        result["sparse_attn_calls"] = sum(k["calls"] for k in sparse)
+        results.append(result)
+    result = results[0] if len(results) == 1 else {"device_profiles": results}
+    (directory / "resource_overlap.json").write_text(json.dumps(result, indent=2))
+    (directory / "resource_overlap.txt").write_text(json.dumps(result, indent=2))
+    return result
+
+
+def write_report(directory, profiles):
+    fields = [
+        "compute_busy_ms",
+        "comm_total_ms",
+        "comm_busy_ms",
+        "topk_calls",
+        "sparse_attn_calls",
+        "topk_mean_us",
+        "cube_vector_ms",
+        "cube_cube_ms",
+        "vector_vector_ms",
+        "compute_comm_ms",
+        "unknown_compute_calls",
+        "mixed_compute_calls",
+        "unknown_compute_busy_ms",
+        "mixed_compute_busy_ms",
+    ]
+    lines = [
+        "# Resource overlap screening",
+        "",
+        "Profiler TTFT is excluded from ranking. Compare raw totals only with matching call counts.",
+        "Unknown/mixed kernels are excluded from Cube/Vector pairs; compute/COMM includes all compute.",
+        "Missing logical rows need launch correlation; anonymous GEMMs are listed by name/shape in JSON.",
+        "",
+        "| Case | " + " | ".join(fields) + " | Comparable calls |",
+        "|---|" + "---|" * (len(fields) + 1),
+    ]
+
+    def devices(record):
+        result = record.get("resource_analysis", {})
+        return result.get("device_profiles", [result]) if result else []
+
+    base = {
+        r["device_key"]: r
+        for r in devices(profiles.get("AUTO_TQ2", {}))
+        if r["device_key"]
+    }
+    for name, record in profiles.items():
+        if not devices(record):
+            lines += [f"| {name}: {record.get('error', record['status'])} |"]
+        for index, result in enumerate(devices(record)):
+            flat = {**result, **result["resource_overlap"]}
+            reference = base.get(result["device_key"], {})
+            comparable = all(
+                result[k] == reference.get(k) and result[k] > 0
+                for k in ("topk_calls", "sparse_attn_calls")
+            )
+            label = f"{name}/{result['device_key'] or f'unassigned_export_{index}'}"
+            lines += [
+                f"| {label} | "
+                + " | ".join(str(flat[k]) for k in fields)
+                + f" | {comparable} |"
+            ]
+    for name, record in profiles.items():
+        for index, result in enumerate(devices(record)):
+            label = f"{name}/{result['device_key'] or f'unassigned_export_{index}'}"
+            lines += [
+                "",
+                f"## {label} kernel rows",
+                "",
+                f"Task file: `{result['task_file']}`",
+                "",
+                "| Operation | Calls | Mean us |",
+                "|---|---:|---:|",
+            ]
+            for label, row in result["target_ops"].items():
+                lines += [
+                    f"| {label} | {row['calls']} | {row['mean_us'] if row['mean_us'] is not None else 'unavailable'} |"
+                ]
+    (directory / "resource_overlap_report.md").write_text("\n".join(lines) + "\n")
+
+
 def run(args, argv, name, settings, directory, *, profile=False):
     case_args = argparse.Namespace(**vars(args))
     case_args.analyzer_command_file = args.analyzer_command_file if profile else None
     if profile:
         case_args.benchmark_command_file = args.profile_command_file
     record = restart.run_case(case_args, argv, settings, directory, 1)
-    record.update(name=name, profiled=profile)
+    record.update(
+        name=name, profiled=profile, model_path=args.model_path, server_args=argv
+    )
     try:
         if record["status"] == "ok":
             record["signature"] = workload_signature(
@@ -167,7 +370,9 @@ def run(args, argv, name, settings, directory, *, profile=False):
             reason = engagement(settings, (directory / "server.log").read_text())
             if reason:
                 record.update(status="ineligible", error=reason)
-    except (OSError, ValueError) as exc:
+            if profile:
+                record["resource_analysis"] = analyze_capture(args, directory)
+    except (OSError, ValueError, KeyError) as exc:
         record.update(status="failed", error=str(exc))
     (directory / "result.json").write_text(json.dumps(record, indent=2))
     return record
@@ -181,11 +386,26 @@ def main():
     parser.add_argument("--correctness-command-file", type=Path)
     parser.add_argument("--profile-command-file", type=Path)
     parser.add_argument("--analyzer-command-file", type=Path)
-    parser.add_argument("--profile-mode", choices=("none", "best", "all"), default="none")
+    parser.add_argument(
+        "--profile-task-glob",
+        help="One device CSV/trace relative to the case profile directory",
+    )
+    parser.add_argument(
+        "--profile-device-pid", help="Ascend Hardware PID for Chrome traces"
+    )
+    parser.add_argument("--phase", choices=("screen", "confirm"), default="screen")
+    parser.add_argument(
+        "--screen-results-file",
+        type=Path,
+        help="Reviewed profiles.json for confirmation shortlist",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--stages", nargs="+", choices=("A", "B", "C", "sweep"), default=["A", "B", "C"])
-    parser.add_argument("--cases", nargs="+", choices=tuple(SINGLES), default=list(SINGLES))
-    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--cases", nargs="+", choices=tuple(SINGLES), default=DEFAULT_CASES
+    )
+    parser.add_argument(
+        "--runs", type=int, default=3, help="Interleaved confirmation pairs only"
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30088)
@@ -194,17 +414,22 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     args.expected_requests = 17
-    if args.runs < 3:
-        parser.error("at least three fresh-server candidate runs are required")
-    if args.profile_mode != "none" and not args.profile_command_file:
-        parser.error("profiling requires --profile-command-file (separate from unprofiled benchmark)")
-    if "C" in args.stages and "B" not in args.stages:
-        parser.error("Stage C requires measured Stage B in the same invocation")
+    if args.phase == "screen" and not args.profile_command_file and not args.dry_run:
+        parser.error("screening requires --profile-command-file")
+    if args.phase == "confirm" and (
+        args.runs < 3
+        or not args.screen_results_file
+        or not args.correctness_command_file
+    ):
+        parser.error(
+            "confirmation requires >=3 pairs, --screen-results-file and --correctness-command-file"
+        )
     argv = shlex.split(args.server_args_file.read_text(), comments=True)
-    # Preserve topology/geometry; refuse mismatches instead of silently tuning.
     for option, expected in (
-        ("--tp-size", "4"), ("--ep-size", "1"),
-        ("--chunked-prefill-size", "16384"), ("--max-prefill-tokens", "16384"),
+        ("--tp-size", "4"),
+        ("--ep-size", "1"),
+        ("--chunked-prefill-size", "16384"),
+        ("--max-prefill-tokens", "16384"),
         ("--page-size", "128"),
     ):
         value = restart.option_value(argv, option)
@@ -213,66 +438,91 @@ def main():
         argv = restart.set_option(argv, option, expected)
     kv_dtype = restart.option_value(argv, "--kv-cache-dtype")
     if kv_dtype is None or not kv_dtype.startswith("fp8"):
-        parser.error("server args must explicitly select the checkpoint's FP8 KV cache dtype")
+        parser.error(
+            "server args must explicitly select the checkpoint's FP8 KV cache dtype"
+        )
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    summaries, settings_by_name = {}, {"A_BASE": BASE, "BEST_BASE": BEST}
-
-    def experiment(name, settings, baseline):
-        settings_by_name[name] = settings
-        if args.dry_run:
-            summaries[name] = {"status": "DRY_RUN", "settings": settings, "anchor": baseline}
-            return
-        pairs = []
-        for repetition in range(args.runs):
-            trial = args.output_dir / name / str(repetition)
-            pairs.append(tuple(
-                run(args, argv, label, config, trial / suffix)
-                for suffix, label, config in (
-                    ("before", "anchor", baseline),
-                    ("candidate", name, settings),
-                    ("after", "anchor", baseline),
+    settings = {
+        "AUTO_TQ2": BASE,
+        **{name: {**BASE, **SINGLES[name]} for name in args.cases},
+    }
+    summaries, profiles = {}, {}
+    if args.dry_run:
+        summaries = {
+            name: {"status": "DRY_RUN", "settings": config}
+            for name, config in settings.items()
+        }
+    elif args.phase == "screen":
+        for name, config in settings.items():
+            if (
+                name == "IDX_RESOURCE_QNOPE"
+                and profiles.get("IDX_RESOURCE", {}).get("status") != "ok"
+            ):
+                summaries[name] = {
+                    "status": "SKIPPED",
+                    "reason": "Screen IDX_RESOURCE first",
+                }
+                continue
+            sanity = run(args, argv, name, config, args.output_dir / "sanity" / name)
+            if sanity["status"] == "ok":
+                profiles[name] = run(
+                    args,
+                    argv,
+                    name,
+                    config,
+                    args.output_dir / "profiles" / name,
+                    profile=True,
                 )
-            ))
-        summaries[name] = summarize(pairs)
-        (args.output_dir / "summary.json").write_text(json.dumps(summaries, indent=2))
-
-    if "A" in args.stages:
-        experiment("BEST_BASE", BEST, BASE)
-    if "B" in args.stages:
+            summaries[name] = {
+                "status": "SCREENED"
+                if profiles.get(name, {}).get("status") == "ok"
+                else profiles.get(name, sanity)["status"],
+                "sanity": sanity,
+                "promotion_eligible": False,
+            }
+            (args.output_dir / "profiles.json").write_text(
+                json.dumps(profiles, indent=2)
+            )
+            write_report(args.output_dir, profiles)
+    else:
+        if len(args.cases) > 3:
+            parser.error("confirm only the best 2-3 mechanisms from screening")
+        evidence = json.loads(args.screen_results_file.read_text())
         for name in args.cases:
-            # Layout-only gate hypothesis must compare against an enabled gate
-            # control, not conflate a gate implementation change with a layout.
-            control = BEST
-            if name == "gate_materialized_nd":
-                control = {**BEST, "SGLANG_NPU_TP_MOE_MXFP8_GATE": "1"}
-            experiment(name, {**control, **SINGLES[name]}, control)
-    if "sweep" in args.stages:
-        for buffer in (128, 192, 256, 320, 384, 512, None):
-            experiment(f"hccl_{buffer}_taskq2", {**BEST, "HCCL_BUFFSIZE": buffer}, BEST)
-    if "C" in args.stages:
-        ingredients = ("qproj", "qnope", "indexer_resource", "shared_resource")
-        accepted = [name for name in ingredients if summaries.get(name, {}).get("nonregression")]
-        if accepted:
-            combined = dict(BEST)
-            for name in accepted:
-                combined.update(SINGLES[name])
-            experiment("combined_resource", combined, BEST)
-        else:
-            summaries["combined_resource"] = {"status": "SKIPPED", "reason": "No measured nonregression singles"}
-    if not args.dry_run and args.profile_mode != "none":
-        selected = ["A_BASE", "BEST_BASE"]
-        measured = [name for name, data in summaries.items() if data.get("status") == "MEASURED"]
-        if args.profile_mode == "all":
-            selected += measured
-        else:
-            for group in (("qproj", "qnope", "qproj_qnope"), ("indexer_resource", "eager_indexer_resource", "indexer_inline"), ("shared_resource", "shared_post_gate"), ("combined_resource",)):
-                candidates = [name for name in group if name in measured]
-                if candidates:
-                    selected.append(max(candidates, key=lambda name: summaries[name]["paired_gain_pct"]))
-        profiles = {}
-        for name in dict.fromkeys(selected):
-            profiles[name] = run(args, argv, name, settings_by_name[name], args.output_dir / "profiles" / name, profile=True)
-        (args.output_dir / "profiles.json").write_text(json.dumps(profiles, indent=2))
+            profile = evidence.get(name, {})
+            base = evidence.get("AUTO_TQ2", {})
+            if any(
+                r.get("status") != "ok" or not r.get("resource_analysis")
+                for r in (base, profile)
+            ):
+                parser.error(
+                    f"{name} requires successful baseline/candidate resource profiles"
+                )
+            for label, screened in (("AUTO_TQ2", base), (name, profile)):
+                if (
+                    screened.get("settings") != settings[label]
+                    or screened.get("model_path") != args.model_path
+                    or screened.get("server_args") != argv
+                ):
+                    parser.error(
+                        f"{label} screen settings/checkpoint do not match confirmation"
+                    )
+            pairs = []
+            for repetition in range(args.runs):
+                trial = args.output_dir / name / str(repetition)
+                pairs.append(
+                    tuple(
+                        run(args, argv, label, config, trial / suffix)
+                        for suffix, label, config in (
+                            ("before", "AUTO_TQ2", BASE),
+                            ("candidate", name, settings[name]),
+                            ("after", "AUTO_TQ2", BASE),
+                        )
+                    )
+                )
+            # Selecting --cases with reviewed profiles is an explicit shortlist,
+            # not an automatic claim that aggregate overlap proves a mechanism.
+            summaries[name] = summarize(pairs, mechanism_confirmed=True)
     (args.output_dir / "summary.json").write_text(json.dumps(summaries, indent=2))
     print(json.dumps(summaries, indent=2))
 

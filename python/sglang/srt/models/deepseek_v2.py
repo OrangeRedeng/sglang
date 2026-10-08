@@ -1459,22 +1459,44 @@ class DeepseekV2MoE(nn.Module):
                 and not self.shared_experts.down_proj.use_decode_attn_tp
             )
             resource_requested = self._npu_tp_shared_pipeline == "resource"
-            shared_resource = (
-                resource_requested
-                and shared_async
-                and get_forward().is_extend_in_batch
-                and not self.is_nextn
-                and is_glm_moe_dsa(self.config)
-                and self.shared_experts._npu_tp_shared_mode == "grouped_fused"
-                and self.shared_experts.swiglu_limit is None
-                and not self.experts.moe_runner_config.inplace
-            )
-            if resource_requested:
+            shared_resource = False
+            if _is_npu and (
+                resource_requested or envs.SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS.get()
+            ):
                 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
                     log_shared_pipeline,
+                    shared_resource_blockers,
                 )
 
-                log_shared_pipeline(shared_resource)
+                shared = getattr(self, "shared_experts", None)
+                state = {
+                    "has_shared_stream": self._npu_tp_shared_stream is not None,
+                    "is_extend_in_batch": get_forward().is_extend_in_batch,
+                    "is_nextn": self.is_nextn,
+                    "is_glm_moe_dsa": is_glm_moe_dsa(self.config),
+                    "shared_gmm1_mode": getattr(shared, "_npu_tp_shared_mode", None),
+                    "swiglu_limit": getattr(shared, "swiglu_limit", None),
+                    "runner_inplace": self.experts.moe_runner_config.inplace,
+                    "capture_mode": get_is_capture_mode(),
+                    "breakable_graph": is_in_breakable_cuda_graph(),
+                    "piecewise_graph": is_in_tc_piecewise_cuda_graph(),
+                    "sp_active": get_forward().sp_active,
+                    "down_proj_decode_attn_tp": getattr(
+                        getattr(shared, "down_proj", None), "use_decode_attn_tp", False
+                    ),
+                    "fuse_shared": self._fuse_npu_tp_shared,
+                    "skip_shared_experts": skip_shared_experts,
+                    "token_threshold_met": (
+                        envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
+                        <= hidden_states.shape[0]
+                    ),
+                    "requested": resource_requested,
+                }
+                shared_resource = resource_requested and not shared_resource_blockers(
+                    state
+                )
+                log_shared_pipeline(shared_resource, tuple(state.items()))
+            if resource_requested:
                 shared_async = shared_resource
             if (
                 shared_async
