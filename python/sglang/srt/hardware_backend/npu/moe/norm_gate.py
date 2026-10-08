@@ -130,33 +130,23 @@ class NativeMXFP8MoENorm(RMSNorm):
         q._npu_mxfp8_scale = scale
         return q if residual is None else (q, residual_out)
 
-    # This experiment must not select a backend that emits normalized BF16.
+    # The downstream consumers require MXFP8 with its scales.
     forward = forward_npu
-
-
-def _mxfp8_gate_logits_dtype():
-    mode = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE.get()
-    if mode == "bf16":
-        return torch.bfloat16
-    if mode == "fp32":
-        return torch.float32
-    raise ValueError(
-        f"SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE must be bf16 or fp32; got {mode!r}"
-    )
 
 
 class MXFP8GateMethod(QuantizeMethodBase):
     def __init__(self):
-        self.output_dtype = _mxfp8_gate_logits_dtype()
+        self.output_dtype = torch.float32
+        _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_LOGITS_DTYPE", ("fp32",))
         self.weight_layout = _gate_option(
             "SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT",
-            ("transposed", "contiguous", "nz", "auto"),
+            ("transposed",),
         )
         self.topk_layout = _gate_option(
             "SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT",
-            ("default", "contiguous", "clone", "nd", "materialized_nd", "auto"),
+            ("default",),
         )
-        self.scale_alg = _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG", (0, 1))
+        self.scale_alg = _gate_option("SGLANG_NPU_TP_MOE_MXFP8_GATE_SCALE_ALG", (0,))
         self.diagnostics = envs.SGLANG_NPU_TP_MOE_MXFP8_GATE_DIAGNOSTICS.get()
         self._topk_layout_logged = set()
         self.matmul = mxfp8_gate_op()
@@ -164,19 +154,6 @@ class MXFP8GateMethod(QuantizeMethodBase):
             "npu_dynamic_mx_quant",
             ("dst_type", "block_size", "scale_alg", "round_mode"),
         )
-        self.format_cast = None
-        if self.weight_layout == "nz" or self.topk_layout in ("nd", "materialized_nd"):
-            self.format_cast = require_npu_op("npu_format_cast")
-        elif "auto" in (self.weight_layout, self.topk_layout):
-            try:
-                self.format_cast = require_npu_op("npu_format_cast")
-            except RuntimeError:
-                logger.info("NPU gate autotune: format cast unavailable; exclude NZ/ND")
-        if (
-            self.weight_layout == "nz"
-            and envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get()
-        ):
-            raise ValueError("MXFP8 gate NZ conflicts with DISABLE_ACL_FORMAT_WEIGHT=1")
         _log_gate_config(
             self.output_dtype, self.weight_layout, self.topk_layout, self.scale_alg
         )
@@ -202,18 +179,8 @@ class MXFP8GateMethod(QuantizeMethodBase):
         )
         if q.dtype != torch.float8_e4m3fn or q.shape != layer.weight.shape:
             raise RuntimeError("Unsupported native gate MXFP8 quantization output")
-        if "auto" in (self.weight_layout, self.topk_layout):
-            from sglang.srt.hardware_backend.npu.moe.gate_autotune import tune_gate
-
-            tune_gate(self, layer, q, scale)
         weight = q.transpose(0, 1)
         weight_scale = mx_scale_layout(scale, 256, 6144).transpose(0, 1)
-        if self.weight_layout != "transposed":
-            # Match the scale's reduction-axis layout to the persistent weight.
-            weight = weight.contiguous()
-            weight_scale = weight_scale.contiguous()
-        if self.weight_layout == "nz":
-            weight = self.format_cast(weight, 29)
         layer.register_buffer("mxfp8_weight", weight, persistent=False)
         layer.register_buffer("mxfp8_weight_scale", weight_scale, persistent=False)
         if self.diagnostics:
@@ -221,17 +188,8 @@ class MXFP8GateMethod(QuantizeMethodBase):
             logger.info("MXFP8 gate weight scale: %s", _tensor_layout(weight_scale))
 
     def prepare_topk_logits(self, logits):
-        # Preserve the FP32 correction-bias routing boundary before changing layout.
+        # Correction-bias routing requires FP32 logits.
         topk_logits = logits.to(torch.float32)
-        if self.topk_layout == "contiguous":
-            topk_logits = topk_logits.contiguous()
-        elif self.topk_layout == "clone":
-            topk_logits = topk_logits.clone(memory_format=torch.contiguous_format)
-        elif self.topk_layout == "nd":
-            topk_logits = self.format_cast(topk_logits, 2)
-        elif self.topk_layout == "materialized_nd":
-            topk_logits = topk_logits.clone(memory_format=torch.contiguous_format)
-            topk_logits = self.format_cast(topk_logits, 2)
         if self.diagnostics:
             key = (tuple(logits.shape), logits.dtype, logits.stride())
             if key not in self._topk_layout_logged:
@@ -269,7 +227,7 @@ class MXFP8GateMethod(QuantizeMethodBase):
         if logits.dtype != output_dtype:
             raise RuntimeError(f"MXFP8 gate did not return {output_dtype} logits")
         _log_gate_output(logits.dtype)
-        if self.topk_layout != "default" or self.diagnostics:
+        if self.diagnostics:
             logits._npu_mxfp8_gate_method = self
         return logits
 
@@ -300,33 +258,19 @@ def configure_native_norm_gate(moe):
         and not moe._enable_a2a_moe
         and not moe._shared_expert_tp1
         and not moe._fuse_shared_experts_inside_sbo
-        and moe.num_fused_shared_experts in (0, 1)
+        and moe.num_fused_shared_experts == 0
         and isinstance(moe.experts.dispatcher, AscendTPDispatcher)
         and not moe.experts.dispatcher.local_ep
         and isinstance(getattr(moe.experts, "w2_kernel", None), NPUW4A8MXFP4MoEMethod)
         and envs.SGLANG_NPU_TP_MOE_PREQUANT_INPUT.get()
         and envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get()
-        and (
-            (
-                moe.num_fused_shared_experts == 1
-                and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get()
-            )
-            or (
-                moe.num_fused_shared_experts == 0
-                and hasattr(moe, "shared_experts")
-                and supports_mxfp8_linear(moe.shared_experts.gate_up_proj)
-                and supports_mxfp8_linear(moe.shared_experts.down_proj)
-            )
-        )
+        and hasattr(moe, "shared_experts")
+        and supports_mxfp8_linear(moe.shared_experts.gate_up_proj)
+        and supports_mxfp8_linear(moe.shared_experts.down_proj)
     ):
         raise ValueError(
             "Native norm/gate requires GLM-5.2 W4A8 MXFP TP4/EP1 prequant/reuse"
         )
-    if (
-        envs.SGLANG_NPU_TP_MOE_NORM_MXFP8.get()
-        or envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
-    ):
-        raise ValueError("Keep NORM_MXFP8 and FUSE_GMM2_FINALIZE off")
     if envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get():
         if not envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get():
             raise ValueError("Native MXFP8 norm requires MXFP8_GATE=1")

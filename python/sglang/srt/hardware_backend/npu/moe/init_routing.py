@@ -92,7 +92,6 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     ):
         self.quant_mode = quant_mode
         self.active_expert_range = active_expert_range
-        self.row_idx_type = 0
 
     def _init_routing(
         self,
@@ -119,7 +118,6 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_flag=True,
                 active_expert_range=self.active_expert_range or [0, num_experts],
                 quant_mode=quant_mode,
-                row_idx_type=self.row_idx_type,
                 **scale_kwargs,
             )
         )

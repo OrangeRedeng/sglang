@@ -24,7 +24,6 @@ from npu_tp_bench_utils import timing
 
 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
     mxfp8_input,
-    shared_activation_quant,
     shared_gateup_quant,
     shared_gmm1,
 )
@@ -125,8 +124,8 @@ def main():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=["baseline", "grouped_fused", "split_group_quant", "split3"],
-        default=["baseline", "grouped_fused", "split_group_quant", "split3"],
+        choices=["baseline", "grouped_fused"],
+        default=["baseline", "grouped_fused"],
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -232,22 +231,25 @@ def main():
                 )
             )
             if mode == "grouped_fused":
-                gateup = lambda: shared_gateup_quant(mlp, hidden, operand)
+
+                def gateup():
+                    return shared_gateup_quant(mlp, hidden, operand)
+
                 mid = gateup()
                 stages = {
                     "gateup_activation_quant_fused": gateup,
                     "down": lambda: mlp.down_proj(mid)[0],
                 }
             else:
-                gateup = lambda: mlp.gate_up_proj(
-                    hidden if mode == "baseline" else operand
-                )[0]
+
+                def gateup():
+                    return mlp.gate_up_proj(hidden)[0]
+
                 gate_out = gateup()
-                activation = (
-                    (lambda: mxfp8_input(mlp.act_fn(gate_out)))
-                    if mode == "baseline"
-                    else (lambda: shared_activation_quant(mlp, gate_out, mode=mode))
-                )
+
+                def activation():
+                    return mxfp8_input(mlp.act_fn(gate_out))
+
                 mid = activation()
                 stages = {
                     "gateup": gateup,

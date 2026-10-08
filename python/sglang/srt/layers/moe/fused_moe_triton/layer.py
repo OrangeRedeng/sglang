@@ -592,30 +592,13 @@ class FusedMoE(torch.nn.Module):
             and not isinstance(self.quant_method, KTEPWrapperMethod)
             and isinstance(getattr(self, "w2_kernel", None), NPUW4A8MXFP4MoEMethod)
         )
-        self._npu_tp_fuse_gmm2_finalize = (
-            eligible and envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
-        )
-        if self._npu_tp_fuse_gmm2_finalize:
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import require_npu_op
-
-            require_npu_op(
-                "npu_grouped_matmul_finalize_routing",
-                ("w_dtype", "scale_dtype", "pertoken_scale_dtype"),
-            )
-            self.dispatcher.fuse_gmm2_finalize = True
-            self.dispatcher.init.row_idx_type = 1
         fuse_shared = (
             eligible
             and self.num_fused_shared_experts == 0
             and envs.SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT.get()
         )
         fuse_scale = eligible and (
-            envs.SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE.get()
-            or fuse_shared
-            or (
-                self.num_fused_shared_experts == 1
-                and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get()
-            )
+            envs.SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE.get() or fuse_shared
         )
         self.should_fuse_routed_scaling_factor_in_topk |= fuse_scale
         return fuse_scale, fuse_shared
@@ -1631,17 +1614,8 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                current_shared_pipeline,
-            )
-
-            pipeline = current_shared_pipeline()
-            if pipeline is not None and pipeline.fuse_shared:
-                shared_output = pipeline.wait_output()
-
         if shared_output is not None:
-            # Join at the finalizer; fused GMM2 also consumes the shared input.
+            # Shared compute must finish before finalization reads its output.
             if shared_output_ready is not None:
                 shared_output_ready()
                 shared_output.record_stream(torch.get_device_module().current_stream())

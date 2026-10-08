@@ -940,24 +940,9 @@ class DeepseekV2MoE(nn.Module):
             self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
         )
         self._npu_tp_shared_stream = None
-        self._npu_tp_shared_stream_start = "pre_gate"
-        self._npu_tp_shared_pipeline = "legacy"
         if _is_npu and hasattr(self, "shared_experts"):
-            self._npu_tp_shared_stream_start = (
-                envs.SGLANG_NPU_TP_MOE_SHARED_STREAM_START.get()
-            )
-            if self._npu_tp_shared_stream_start not in (
-                "pre_gate",
-                "post_gate",
-                "post_topk",
-            ):
-                raise ValueError(
-                    "SGLANG_NPU_TP_MOE_SHARED_STREAM_START must be "
-                    "pre_gate, post_gate, or post_topk"
-                )
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
                 shared_gmm1_mode,
-                shared_pipeline_mode,
                 supports_mxfp8_linear,
             )
             from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -972,21 +957,14 @@ class DeepseekV2MoE(nn.Module):
                 and self.experts.moe_ep_size == 1
             )
             self.shared_experts._npu_tp_shared_mode = shared_gmm1_mode()
-            self._npu_tp_shared_pipeline = shared_pipeline_mode()
             if (
-                (
-                    self._npu_tp_shared_pipeline == "resource"
-                    or (
-                        envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-                        and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM.get()
-                    )
-                )
+                envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM.get()
                 and self.shared_experts._npu_tp_shared
                 and self.num_fused_shared_experts == 0
                 and not self._fuse_shared_experts_inside_sbo
                 and isinstance(self.experts.dispatcher, AscendTPDispatcher)
                 and not self.experts.dispatcher.local_ep
-                and not self.experts.dispatcher.fuse_gmm2_finalize
                 and isinstance(
                     getattr(self.experts, "w2_kernel", None), NPUW4A8MXFP4MoEMethod
                 )
@@ -1438,7 +1416,6 @@ class DeepseekV2MoE(nn.Module):
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
         shared_ready = None
-        resource_pipeline = None
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1458,51 +1435,7 @@ class DeepseekV2MoE(nn.Module):
                 and not get_forward().sp_active
                 and not self.shared_experts.down_proj.use_decode_attn_tp
             )
-            resource_requested = self._npu_tp_shared_pipeline == "resource"
-            shared_resource = False
-            if _is_npu and (
-                resource_requested or envs.SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS.get()
-            ):
-                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                    log_shared_pipeline,
-                    shared_resource_blockers,
-                )
-
-                shared = getattr(self, "shared_experts", None)
-                state = {
-                    "has_shared_stream": self._npu_tp_shared_stream is not None,
-                    "is_extend_in_batch": get_forward().is_extend_in_batch,
-                    "is_nextn": self.is_nextn,
-                    "is_glm_moe_dsa": is_glm_moe_dsa(self.config),
-                    "shared_gmm1_mode": getattr(shared, "_npu_tp_shared_mode", None),
-                    "swiglu_limit": getattr(shared, "swiglu_limit", None),
-                    "runner_inplace": self.experts.moe_runner_config.inplace,
-                    "capture_mode": get_is_capture_mode(),
-                    "breakable_graph": is_in_breakable_cuda_graph(),
-                    "piecewise_graph": is_in_tc_piecewise_cuda_graph(),
-                    "sp_active": get_forward().sp_active,
-                    "down_proj_decode_attn_tp": getattr(
-                        getattr(shared, "down_proj", None), "use_decode_attn_tp", False
-                    ),
-                    "fuse_shared": self._fuse_npu_tp_shared,
-                    "skip_shared_experts": skip_shared_experts,
-                    "token_threshold_met": (
-                        envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
-                        <= hidden_states.shape[0]
-                    ),
-                    "requested": resource_requested,
-                }
-                shared_resource = resource_requested and not shared_resource_blockers(
-                    state
-                )
-                log_shared_pipeline(shared_resource, tuple(state.items()))
-            if resource_requested:
-                shared_async = shared_resource
-            if (
-                shared_async
-                and not resource_requested
-                and self._npu_tp_shared_stream_start == "pre_gate"
-            ):
+            if shared_async:
                 shared_output, shared_ready = self._start_npu_tp_shared_experts(
                     hidden_states, pre_quant_input
                 )
@@ -1532,20 +1465,6 @@ class DeepseekV2MoE(nn.Module):
                         gate_input = pre_quant_input or hidden_states
                 router_logits = self.gate(gate_input, gemm_output_zero_allocator)
                 router_logits_partials = None
-            if shared_resource:
-                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                    TPSharedResourcePipeline,
-                )
-
-                resource_pipeline = TPSharedResourcePipeline(
-                    self.shared_experts, self._npu_tp_shared_stream,
-                    fuse_shared=self._fuse_npu_tp_shared,
-                )
-                resource_pipeline.start_gateup(hidden_states, pre_quant_input)
-            elif shared_async and self._npu_tp_shared_stream_start == "post_gate":
-                shared_output, shared_ready = self._start_npu_tp_shared_experts(
-                    hidden_states, pre_quant_input
-                )
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1567,14 +1486,6 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
-                )
-            if (
-                shared_async
-                and not resource_requested
-                and self._npu_tp_shared_stream_start == "post_topk"
-            ):
-                shared_output, shared_ready = self._start_npu_tp_shared_experts(
-                    hidden_states, pre_quant_input
                 )
         else:
             pre_quant_input = None
@@ -1612,17 +1523,7 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if resource_pipeline is not None:
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import use_shared_pipeline
-
-            # Reset context even if dispatch, a GEMM, or finalization raises.
-            with use_shared_pipeline(resource_pipeline):
-                final_hidden_states = self.experts(
-                    hidden_states, topk_output, pre_quant_input=pre_quant_input
-                )
-            if not self._fuse_npu_tp_shared:
-                shared_output = resource_pipeline.wait_output()
-        elif self._fuse_npu_tp_shared and shared_output is not None:
+        if self._fuse_npu_tp_shared and shared_output is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1658,7 +1559,6 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             defer_shared
-            and resource_pipeline is None
             and shared_ready is None
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
@@ -3004,12 +2904,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.post_attention_layernorm = NativeMXFP8MoENorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-        if _is_npu and self.is_layer_sparse and envs.SGLANG_NPU_TP_MOE_NORM_MXFP8.get():
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                configure_tp_mxfp8_norm,
-            )
-
-            configure_tp_mxfp8_norm(self.post_attention_layernorm, self.mlp.experts)
 
         if (
             _is_npu
@@ -3647,14 +3541,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ``install_shared_experts_fusion_decision``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
-        if _is_npu and envs.SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT.get():
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                tp_fused_shared_expert_reason,
-            )
-
-            return tp_fused_shared_expert_reason(hf_config, quant_config)
-        # Need to disable if quant precision mismatch, even if
-        # --enforce-shared-experts-fusion is specified
         if quant_blocks_shared_experts_fusion(quant_config):
             return (
                 "Quantization keeps shared experts at a higher precision than the "

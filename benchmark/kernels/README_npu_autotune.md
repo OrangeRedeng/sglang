@@ -1,8 +1,8 @@
 # NPU automatic configuration and measured tuning
 
 All automatic behavior is opt-in. Existing feature flags retain their defaults.
-No operator kernels are added, and router output dtype and quantization scale
-algorithm remain explicit accuracy choices.
+No operator kernels are added. The retained MXFP8 gate uses FP32 logits,
+transposed weights, default TopK layout and scale algorithm 0.
 
 Selection order is explicit CLI/environment, matching cached profile,
 deterministic calculation, then the existing default. Each automatic decision
@@ -19,7 +19,7 @@ Internal context propagation and an explicitly requested context export still oc
 | `SGLANG_NPU_HCCL_HEADROOM` | `1.25` | Collective-size multiplier, must be at least one. |
 | `SGLANG_NPU_HCCL_QUANTUM_MB` | `32` | Round up in MiB. |
 | `SGLANG_NPU_HCCL_MIN_MB` / `SGLANG_NPU_HCCL_MAX_MB` | `64` / `1024` | Clamp the estimate; a clamp can be smaller than the collective. HCCL may split the transfer. |
-| `SGLANG_NPU_TUNING_PROFILE` | `0` | Consume matching buffer, expansion, task queue, layout and threshold entries. Does not enable experimental features. |
+| `SGLANG_NPU_TUNING_PROFILE` | `0` | Consume matching buffer, expansion, task queue and threshold entries. Does not enable experimental features. |
 | `SGLANG_NPU_TUNING_CACHE_DIR` | `~/.cache/sglang/npu_tuning` | Profile directory. |
 | `SGLANG_NPU_AUTOTUNE_DRY_RUN` | `0` | Print proposed decisions without applying them. |
 | `SGLANG_NPU_TUNING_CONTEXT_FILE` | unset | Export the startup context as JSON for the restart tuner. |
@@ -30,8 +30,6 @@ Internal context propagation and an explicitly requested context export still oc
 | `SGLANG_NPU_DCP_SCRATCH_BUDGET_MB` | `256` | Scratch cap in MiB, additionally bounded by half the smallest rank's free device memory. |
 | `SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS` | `262144` | Existing explicit integer wins over auto, including zero (whole-prefix mode). |
 | `SGLANG_NPU_MEMORY_DIAGNOSTICS` | `0` | Log allocator/KV/weight observations after KV pool allocation. Never alters `mem_fraction_static`. |
-| `SGLANG_NPU_TP_MOE_MXFP8_GATE_WEIGHT_LAYOUT` | `transposed` | Existing modes plus `auto`; benchmarks transposed/contiguous/NZ. |
-| `SGLANG_NPU_TP_MOE_MXFP8_GATE_TOPK_LAYOUT` | `default` | Existing modes plus `auto`; benchmarks default/contiguous/ND. `clone` remains explicit diagnostic mode. |
 
 HCCL uses `T * hidden_size * activation_element_size` with
 `T = min(chunked_prefill_size, max_prefill_tokens)` (unchunked uses max prefill).
@@ -56,8 +54,6 @@ current token rows. Existing boolean feature flags remain required.
 
 | Environment variable | Profile entry |
 | --- | --- |
-| `SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS` | `qnope_rope_overlap_min_tokens` |
-| `SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS` | `eager_indexer_min_tokens` |
 | `SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS` | `moe_eager_multi_stream_min_tokens` |
 | `SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS` | `indexer_sharding_min_tokens` |
 | `SGLANG_NPU_DSA_CP_MIN_TOKENS` | `dsa_cp_min_tokens` |
@@ -67,31 +63,6 @@ planner and executor consult the same sharding threshold. Stream thresholds
 retain existing graph/capture, topology and correctness exclusions. Thresholds
 are consumed from calibrated profiles; this tool does not fabricate crossover
 values or calibrate them automatically.
-
-## Gate layout microtuning
-
-Request either/both layout variables as `auto` with the native gate feature
-explicitly enabled. Rank zero benchmarks the first loaded gate's **real**
-quantized weights/scales using deterministic synthetic BF16 activations, and
-broadcasts its selection to TP peers through their CPU group. Other sparse
-layers reuse the selected shape/configuration. The primary serving shape
-`min(chunked_prefill_size, max_prefill_tokens)` has weight 0.9 and a second
-`min(1024, primary)` point has weight 0.1.
-
-Candidates time QuantMatmul, FP32 routing-boundary conversion, layout transform
-and the actual TopK operation together, with 5 warmups, 20 measured synchronized
-iterations and medians. Dtype is fixed throughout. Candidates must exactly match
-baseline logits, ordered routed IDs and route weights at both synthetic points.
-The existing default is retained if improvement is under 1% or smaller than the
-measured spread. Unsupported operators/layouts fall back with a log.
-
-This startup check does **not** establish real-workload routing accuracy,
-final-layer accuracy or generation equivalence. Before production rollout,
-compare real captured inputs: ordered and unordered TopK matches, top-1,
-changed/total routes, routing weight error, final BF16 output error and generation
-match. `bench_npu_tp_moe_norm_gate.py` already provides real input replay and
-optional captured output comparisons. BF16 router dtype is never included in
-layout search; select and validate it separately.
 
 ## Profile schema and invalidation
 
@@ -115,7 +86,7 @@ Atomic writes avoid partial profiles. Use one tuner writer per profile directory
 concurrent independent jobs writing the same key are not merged transactionally.
 
 Profile fields include `hccl_buffsize_mb`, `hccl_op_expansion_mode`,
-`task_queue_enable`, `gate_weight_layout`, `gate_topk_layout`, and the threshold
+`task_queue_enable`, and the threshold
 entries above. Restart results also record `page_size`, `chunked_prefill_size`,
 `max_running_requests` when requested, and reusable `restart_evidence`.
 Page/chunk/concurrency winners must be supplied through explicit CLI on replay;
@@ -206,17 +177,6 @@ The framework does not have a built-in reference for arbitrary models.
 
 ## Additional integration and target validation
 
-Native MXFP8 norm/gate now admits the existing explicitly enabled fused shared
-expert path while retaining its topology/quantization restrictions. The gate
-still emits 256 routed logits. Existing fused TopK appends shared ID 256 with
-weight exactly 1 to routed K8, producing E257/K9. Existing weight remapping loads
-the shared expert into slot 256; the separate MLP is absent and no separate
-shared stream is constructed. This compatibility change is experimental until
-real shared-weight loading, routed IDs, unit shared weight, final BF16 output,
-and absence of missing/duplicated contribution are checked on A5. Compare
-native norm/gate plus separate overlap against native norm/gate plus fused E257/K9.
-No automatic shared-strategy selection is enabled.
-
 `python benchmark/kernels/probe_npu_hccl_options.py` inspects installed options
 fields and tries the existing branch's `hccl_config={"hccl_buffer_size":256}`
 assignment without creating a communicator. The branch already applies this
@@ -237,8 +197,7 @@ exists; existing strategy/GMM1 defaults are preserved.
 
 Production rollout requires target measurements. Deterministic HCCL sizing and
 explicit calibrated thresholds are conservative opt-in configuration tools;
-layout microbenchmarks, fused-shared compatibility and restart-selected AIV/task
-queue/page/chunk changes need matched correctness and performance acceptance.
+restart-selected AIV/task queue/page/chunk changes need matched correctness and performance acceptance.
 No NPU performance or numerical claim is established by CPU tests.
 
 CPU verification:

@@ -43,9 +43,6 @@ class AscendTPDispatchOutput(NamedTuple):
 class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     shared_output: Optional[torch.Tensor] = None
-    gmm2_input_scale: Optional[torch.Tensor] = None
-    gmm2_weight: Optional[torch.Tensor] = None
-    gmm2_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -71,7 +68,6 @@ class AscendTPDispatcher(BaseDispatcher):
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
-        self.fuse_gmm2_finalize = False
 
         # Initialise routing kernels with default (no quant config yet)
         self.set_ascend_dispatcher_output_dtype()
@@ -116,7 +112,6 @@ class AscendTPDispatcher(BaseDispatcher):
             self.init.active_expert_range = self.active_expert_range
             # Mode 3 zeros filtered routes; mode 2 assumes every route is present.
             self.finalize = NPUFinalizeRouting(drop_pad_mode=3)
-        self.init.row_idx_type = int(self.fuse_gmm2_finalize)
 
     def dispatch(
         self,
@@ -169,28 +164,6 @@ class AscendTPDispatcher(BaseDispatcher):
             raise RuntimeError("combine() called before dispatch()")
 
         dispatch_out = self._dispatch_output
-
-        if combine_input.gmm2_input_scale is not None:
-            if self.local_ep or not self.fuse_gmm2_finalize:
-                raise ValueError(
-                    "Fused GMM2 finalization requires token-major TP routing"
-                )
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                fused_gmm2_finalize,
-            )
-
-            final_hidden_states = fused_gmm2_finalize(
-                combine_input.hidden_states,
-                combine_input.gmm2_input_scale,
-                combine_input.gmm2_weight,
-                combine_input.gmm2_weight_scale,
-                dispatch_out.expert_tokens,
-                dispatch_out.topk_weights,
-                dispatch_out.expanded_row_idx,
-                combine_input.shared_output,
-            )
-            self._dispatch_output = None
-            return final_hidden_states
 
         shared_kwargs = {}
         if combine_input.shared_output is not None:
