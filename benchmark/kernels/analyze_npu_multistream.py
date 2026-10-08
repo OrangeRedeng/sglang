@@ -28,6 +28,32 @@ class Task:
     end: float
     shape: str
     kind: str
+    resource: str = "unknown"
+
+
+def core_resource(metadata):
+    # AI_CORE alone is insufficient: it does not establish Cube vs Vector.
+    # Mixed kernels also cannot be split into Cube/Vector intervals without
+    # finer-grained device evidence. Never infer resources from stream/name.
+    text = str(metadata).upper()
+    if "MIX" in text:
+        return "mixed"
+    cube = bool(re.search(r"\bCUBE\b|AI_CUBE|\bAIC\b", text))
+    vector = bool(re.search(r"\bVECTOR\b|AI_VECTOR|\bAIV\b", text))
+    if cube and vector:
+        return "mixed"
+    return "cube" if cube else "vector" if vector else "unknown"
+
+
+def resource_metadata(row):
+    return " ".join(
+        str(row[key])
+        for key in (
+            "Task Type", "Task Category", "task_type", "AI Core Type",
+            "Core Type", "core_type", "aicore_type", "kind",
+        )
+        if key in row
+    )
 
 
 def field(row, *names, default=None):
@@ -51,7 +77,7 @@ def read_tasks(path, device_pid):
                     float(field(row, "Task Start Time(us)", "Start Time(us)", "ts")),
                     float(field(row, "Task Duration(us)", "Duration(us)", "dur")),
                     field(row, "Input Shapes", "Input Dims", "shape", default=""),
-                    field(row, "Task Type", "Task Category", "kind", default=""),
+                    resource_metadata(row),
                 )
                 for row in rows
             ]
@@ -74,7 +100,7 @@ def read_tasks(path, device_pid):
                         json.dumps(
                             args.get("Input Shapes", args.get("Input Dims", ""))
                         ),
-                        str(args.get("Task Type", event.get("cat", ""))),
+                        resource_metadata(args) + " " + str(event.get("cat", "")),
                     )
                 )
     tasks = []
@@ -86,7 +112,10 @@ def read_tasks(path, device_pid):
             else "other" if COPY.search(name + category)
             else "compute"
         )
-        tasks.append(Task(name, str(stream), start, start + duration, shape, kind))
+        tasks.append(Task(
+            name, str(stream), start, start + duration, shape, kind,
+            core_resource(category) if kind == "compute" else kind,
+        ))
     if not tasks:
         raise ValueError("No device tasks found; check the file and device PID")
     return tasks
@@ -134,6 +163,50 @@ def kernel_stats(tasks):
     ]
 
 
+def resource_overlaps(tasks):
+    events = defaultdict(lambda: defaultdict(int))
+    for task in tasks:
+        if task.kind not in ("compute", "comm"):
+            continue
+        resources = ["compute", task.resource] if task.kind == "compute" else ["comm"]
+        for resource in resources:
+            events[task.start][resource] += 1
+            events[task.end][resource] -= 1
+    counts = defaultdict(int)
+    overlaps = {
+        "cube_vector_ms": 0.0, "cube_cube_ms": 0.0,
+        "vector_vector_ms": 0.0, "compute_comm_ms": 0.0,
+    }
+    previous = None
+    for point in sorted(events):
+        if previous is not None:
+            duration = (point - previous) / 1000
+            for key, active in (
+                ("cube_vector_ms", counts["cube"] > 0 and counts["vector"] > 0),
+                ("cube_cube_ms", counts["cube"] >= 2),
+                ("vector_vector_ms", counts["vector"] >= 2),
+                ("compute_comm_ms", counts["compute"] > 0 and counts["comm"] > 0),
+            ):
+                if active:
+                    overlaps[key] += duration
+        for resource, delta in events[point].items():
+            counts[resource] += delta
+        previous = point
+    compute = [t for t in tasks if t.kind == "compute"]
+    return {
+        **overlaps,
+        "unknown_compute_calls": sum(t.resource == "unknown" for t in compute),
+        "mixed_compute_calls": sum(t.resource == "mixed" for t in compute),
+        "unknown_compute_busy_ms": length(merged([
+            t for t in compute if t.resource == "unknown"
+        ])) / 1000,
+        "mixed_compute_busy_ms": length(merged([
+            t for t in compute if t.resource == "mixed"
+        ])) / 1000,
+        "classification": "profiler task/core metadata only; unknown/mixed excluded from core-pair overlap",
+    }
+
+
 def analyze(tasks, main_stream, sides, start, end, baseline):
     start = min(task.start for task in tasks) if start is None else start
     end = max(task.end for task in tasks) if end is None else end
@@ -141,7 +214,7 @@ def analyze(tasks, main_stream, sides, start, end, baseline):
         raise ValueError("The analysis window must have positive duration")
     window = [task for task in tasks if task.start < end and task.end > start]
     clipped = [
-        Task(t.name, t.stream, max(t.start, start), min(t.end, end), t.shape, t.kind)
+        Task(t.name, t.stream, max(t.start, start), min(t.end, end), t.shape, t.kind, t.resource)
         for t in window
     ]
     compute = [t for t in clipped if t.kind == "compute"]
@@ -157,6 +230,8 @@ def analyze(tasks, main_stream, sides, start, end, baseline):
         "compute_busy_ms": length(merged(compute)) / 1000,
         "comm_busy_ms": length(merged([t for t in clipped if t.kind == "comm"]))
         / 1000,
+        "comm_total_ms": sum(t.end - t.start for t in clipped if t.kind == "comm") / 1000,
+        "resource_overlap": resource_overlaps(clipped),
         "other_busy_ms": length(merged([t for t in clipped if t.kind == "other"]))
         / 1000,
         "idle_ms": ((end - start) - length(merged(clipped))) / 1000,

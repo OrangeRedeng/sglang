@@ -1,8 +1,106 @@
 """Opt-in A5 TP fusion contracts for MXFP8 activations and MXFP4 weights."""
 
+import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
 from typing import Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+_shared_pipeline = ContextVar("npu_tp_shared_pipeline", default=None)
+
+
+def shared_pipeline_mode():
+    from sglang.srt.environ import envs
+
+    mode = envs.SGLANG_NPU_TP_MOE_SHARED_PIPELINE.get()
+    if mode not in ("legacy", "resource"):
+        raise ValueError(f"Unknown SGLANG_NPU_TP_MOE_SHARED_PIPELINE: {mode!r}")
+    return mode
+
+
+def current_shared_pipeline():
+    return _shared_pipeline.get()
+
+
+@contextmanager
+def use_shared_pipeline(pipeline):
+    token = _shared_pipeline.set(pipeline)
+    try:
+        yield
+    finally:
+        _shared_pipeline.reset(token)
+
+
+@lru_cache(maxsize=None)
+def log_shared_pipeline(active):
+    logger.info(
+        "TP shared resource pipeline is ACTIVE: fused GateUp/activation/quant "
+        "overlaps routing; fused routed GMM1 has no activation boundary; "
+        "shared Down follows routed GMM2 (Cube stages serialized)"
+        if active
+        else "TP shared resource pipeline REQUESTED but is OFF: requires "
+        "eligible eager GLM native TP MXFP extend with grouped_fused shared GMM1"
+    )
+
+
+class TPSharedResourcePipeline:
+    """Per-forward events, with no persistent dispatcher hooks or tensor state.
+
+    The grouped_fused contract has no Vector-only activation boundary. Do not
+    split either fused GMM1 just to claim more overlap: enqueue Down only after
+    routed GMM2, and retain the existing shared-input finalization math.
+    """
+
+    def __init__(self, mlp, stream, *, fuse_shared):
+        self.mlp = mlp
+        self.stream = stream
+        self.fuse_shared = fuse_shared
+        self.operand = None
+        self.output = None
+        self.shared_gateup_ready = None
+        self.shared_quant_ready = None
+        self.shared_down_ready = None
+
+    def start_gateup(self, hidden_states, pre_quant_input):
+        main = torch.npu.current_stream()
+        ready = main.record_event()
+        with torch.npu.stream(self.stream):
+            self.stream.wait_event(ready)
+            hidden_states.record_stream(self.stream)
+            for tensor in self.mlp.parameters():
+                tensor.record_stream(self.stream)
+            for tensor in self.mlp.buffers():
+                tensor.record_stream(self.stream)
+            self.operand = shared_gateup_quant(
+                self.mlp, hidden_states, pre_quant_input, mode="grouped_fused"
+            )
+            record_mxfp8_operand(self.operand)
+            self.shared_gateup_ready = self.stream.record_event()
+            # Fused output already contains activation and MX quantization.
+            self.shared_quant_ready = self.shared_gateup_ready
+
+    def before_routed_gmm1(self):
+        torch.npu.current_stream().wait_event(self.shared_quant_ready)
+
+    def after_routed_gmm2(self):
+        ready = torch.npu.current_stream().record_event()
+        with torch.npu.stream(self.stream):
+            self.stream.wait_event(ready)
+            record_mxfp8_operand(self.operand)
+            self.output = shared_down(self.mlp, self.operand)
+            self.output.record_stream(self.stream)
+            self.shared_down_ready = self.stream.record_event()
+
+    def wait_output(self):
+        if self.shared_down_ready is None:
+            raise RuntimeError("TP resource pipeline did not reach routed GMM2")
+        main = torch.npu.current_stream()
+        main.wait_event(self.shared_down_ready)
+        self.output.record_stream(main)
+        return self.output
 
 
 def require_npu_op(name: str, arguments=()):
@@ -248,6 +346,17 @@ def shared_activation_quant(mlp, gate_up, *, mode):
 
 def shared_gmm1(mlp, x, pre_quant_input=None, *, mode="grouped_fused"):
     operand = shared_gateup_quant(mlp, x, pre_quant_input, mode=mode)
+    return mlp.down_proj(operand)[0]
+
+
+def shared_gateup(mlp, x, pre_quant_input=None):
+    operand = mxfp8_input(x) if pre_quant_input is None else pre_quant_input
+    record_mxfp8_operand(operand)
+    return mlp.gate_up_proj(operand)[0]
+
+
+def shared_down(mlp, operand):
+    record_mxfp8_operand(operand)
     return mlp.down_proj(operand)[0]
 
 
