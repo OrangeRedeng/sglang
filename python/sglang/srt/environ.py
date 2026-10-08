@@ -997,7 +997,18 @@ class Envs:
     # paired positions -- just not worth anything on its own. Its value would
     # grow with context length, since the gather it avoids permuting scales as
     # N^2, and the remap could be one table lookup instead of eight passes.
-    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(False)
+    #
+    # D2 default ON: that A3 measurement was the head-sharded DSA-CP config at
+    # 958k, where the two costs cancelled. The D2 token-sharded DCP8 config is
+    # different: the permuting path pays FOUR pieces x TWO keys = eight
+    # collectives per DSA layer plus the index_select, and the profile shows
+    # the last piece of the set sitting idle inside the indexer's window. The
+    # packed path is two collectives per layer and no index_select, and it is
+    # the only path the gather prefetch below can fill. It stays a no-op where
+    # the plan refuses (multi-request extends, sub-index_topk prefixes); every
+    # refusal is logged by dcp_packed_read_plan, so it cannot turn off
+    # silently.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(True)
     # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
     # l computes, into the other of two slots. Requires the packed read above.
     #
@@ -1013,7 +1024,16 @@ class Envs:
     # plus the permuting path's four buffers (~1.43 GiB) on multi-request ones,
     # against ~1.43 GiB without either flag. A mixed workload -- which is the
     # serving case -- pays ~+2.25 GiB and OOM'd at --mem-fraction-static 0.70.
-    SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
+    #
+    # D2 default ON: in the token-sharded DCP8 config the measured limit was
+    # not compute headroom but PLACEMENT -- the layer's own gather is issued in
+    # the same window as that layer's LightningIndexer and sits idle inside it
+    # (the 154 ms stall). Moving the gather to the previous layer's window is
+    # the fix that works with whatever the indexer does, and D2's first-layer
+    # prime (the prefetcher's prime) covers the one layer that has no previous
+    # layer to hide under. The mixed-workload memory cost above still applies:
+    # a serving box that takes both paths needs --mem-fraction-static below 0.70.
+    SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(True)
     # DCP extend on NPU: start the layer's prefix all-gather BEFORE the
     # LightningIndexer runs, so the SFA KV communication overlaps the top-k
     # computation, and wait for the gather only right before the sparse

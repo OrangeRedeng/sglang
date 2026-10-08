@@ -578,6 +578,30 @@ def forward_dsa_prepare_npu(
         # Indexer layer: issued right before the indexer, below, where this
         # chunk's KV already exists and the gather's window is the indexer
         # itself (measured 206 ms at extend) rather than the QKV.
+    if (
+        _dcp_extend_active(forward_batch)
+        and _enable_dcp_gather_prefetch
+    ):
+        # D2 first-layer prime: with the prefetch on, every layer's gather is
+        # owned by the prefetcher's take() in the core -- EXCEPT the first
+        # layer, which take() would issue after this layer's indexer (the 154
+        # ms stall). Prime it here, before the QKV, so the first context-KV
+        # gather starts as soon as inference does and finishes before the
+        # indexer instead of with it. Only the first DSA layer of the forward
+        # actually primes; prime() no-ops for the rest. When the packed plan
+        # refuses (multi-request, sub-index_topk) there is nothing to prime and
+        # the layer falls back to the permuting path, exactly as before.
+        packed_plan = dcp_packed_read_plan(
+            forward_batch, _dcp_sfa_gather_topk_width(m, prev_topk_indices)
+        )
+        if packed_plan is not None:
+            _dcp_gather_prefetcher_get().prime(
+                m,
+                forward_batch.attn_dcp_metadata,
+                packed_plan,
+                hidden_states,
+                m.layer_id,
+            )
     if mla_preprocess_used:
         (
             q_pe,
@@ -997,6 +1021,11 @@ class _DcpGatherPrefetcher:
         self.filled: list = [None, None]
         self.prev_layer: Optional[int] = None
         self._max_layer: Optional[int] = None
+        # The layer whose prefix prime() issued in prepare, before any take().
+        # take() must not let _note_layer reset that slot: the prime ran before
+        # the first take, so the structural "layer id stopped advancing" test
+        # cannot tell the primed first layer apart from a fresh forward.
+        self.primed: Optional[int] = None
 
     def _note_layer(self, layer_id: int) -> None:
         """Drop both slots when a new forward starts.
@@ -1008,7 +1037,23 @@ class _DcpGatherPrefetcher:
         of exactly that shape (the KV write plan, fixed in 960d3a031d). A stale
         slot here would be worse than a crash: it holds a real prefix, just the
         previous batch's.
+
+        The one exception is a primed forward: prime() runs in prepare, before
+        the first take(), and fills the first layer's slot. The structural test
+        above cannot see that the first take() belongs to the primed forward
+        (the layer id has not advanced past the prime's), so the marker is
+        consumed here and the primed slot is kept.
         """
+        if self.primed is not None:
+            if layer_id == self.primed:
+                # The take of the very layer prime() filled: keep its slot.
+                self.primed = None
+                self.prev_layer = layer_id
+                return
+            # A take that is not the primed layer: the prime is stale (its
+            # forward never consumed it) or this is a newer forward. Drop the
+            # marker and fall through to the normal reset below.
+            self.primed = None
         if self.prev_layer is None or layer_id <= self.prev_layer:
             self.filled = [None, None]
         self.prev_layer = layer_id
@@ -1019,10 +1064,15 @@ class _DcpGatherPrefetcher:
             dcp_extend_gather_buffer(f"packed_rope_{slot}", k_pe, plan.rows),
         )
 
-    def _gather_prefix(self, m, md, plan, k_nope, k_pe, layer_id: int) -> None:
-        """Issue one layer's prefix all-gather on the side stream."""
+    def _gather_prefix(self, m, md, plan, ref_nope, ref_rope, layer_id: int) -> None:
+        """Issue one layer's prefix all-gather on the side stream.
+
+        ``ref_nope``/``ref_rope`` only type the slot buffers (dtype, device,
+        row shape); they are the chunk's own KV on a take() and a (1, 1, dim)
+        slice of hidden_states on a prime(), before the QKV has produced them.
+        """
         slot = layer_id % 2
-        out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
+        out_nope, out_rope = self.slots(plan, ref_nope, ref_rope, slot)
         # The slot buffers are allocated by the caching allocator on the COMPUTE
         # stream and written here on the side stream. record_stream is what stops
         # the allocator handing that memory to something else while this stream
@@ -1051,6 +1101,42 @@ class _DcpGatherPrefetcher:
                 )
             self.ready[slot] = self.stream.record_event()
         self.filled[slot] = layer_id
+
+    def prime(self, m, md, plan, hidden_states, layer_id: int) -> None:
+        """Issue the first layer's prefix gather at the start of the forward.
+
+        take() issues a layer's gather from the core, AFTER that layer's
+        indexer has run; with no previous layer to prefetch from, layer 0's
+        gather then starts exactly where the 154 ms stall was measured -- in
+        the indexer's window, idle. prime() runs in prepare, BEFORE the QKV,
+        so the first gather moves bytes under the QKV and the indexer instead
+        of starting with them: it is done (or nearly so) by the time the core
+        needs it.
+
+        Only the first DSA layer of a forward primes; the rest no-op here and
+        are prefetched by the previous layer's take() as usual. The slot it
+        fills is the same one take() would fill, typed from hidden_states
+        (the QKV output does not exist yet) rather than from the chunk's own
+        KV, so the two share one grow-only buffer.
+        """
+        if self.prev_layer is not None and layer_id > self.prev_layer:
+            # A layer earlier in THIS forward already ran, so this is not the
+            # first layer: nothing to prime, take() will handle it.
+            return
+        # First DSA layer of a (possibly new) forward: drop the previous
+        # forward's slots, then fill this layer's.
+        self.filled = [None, None]
+        self.prev_layer = layer_id
+        ref_nope = hidden_states.new_empty((1, 1, m.kv_lora_rank))
+        ref_rope = hidden_states.new_empty((1, 1, m.qk_rope_head_dim))
+        self._gather_prefix(m, md, plan, ref_nope, ref_rope, layer_id)
+        self.primed = layer_id
+        print_info_once(
+            "DCP gather first-layer prime is ON: layer "
+            f"{layer_id}'s prefix all-gather is issued in prepare, before the "
+            "QKV, so it runs under the QKV and the indexer instead of starting "
+            "with them"
+        )
 
     def _max_servable_layer(self) -> int:
         """Highest layer id the KV pool can serve, from the list it indexes.
@@ -1104,6 +1190,21 @@ class _DcpGatherPrefetcher:
 
 
 _dcp_gather_prefetcher: Optional[_DcpGatherPrefetcher] = None
+
+
+def _dcp_gather_prefetcher_get() -> _DcpGatherPrefetcher:
+    """The process-wide prefetcher, created on first use.
+
+    Two call sites need it -- prepare (to prime the first layer's gather
+    before the QKV) and the core's packed path (to take a layer's buffer) --
+    and either can run first, so the creation lives here rather than in one
+    of them.
+    """
+    global _dcp_gather_prefetcher
+    if _dcp_gather_prefetcher is None:
+        _dcp_gather_prefetcher = _DcpGatherPrefetcher()
+    return _dcp_gather_prefetcher
+
 
 _enable_dcp_sfa_gather_overlap = envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.get()
 _enable_dsa_cp_local_topk = envs.SGLANG_NPU_DSA_CP_LOCAL_TOPK.get()
@@ -1523,10 +1624,7 @@ def _dcp_gather_extend_kv_packed_npu(
             _log_dcp_extend_memory(plan.prefix_len, plan.extend_len)
 
     if _enable_dcp_gather_prefetch:
-        global _dcp_gather_prefetcher
-        if _dcp_gather_prefetcher is None:
-            _dcp_gather_prefetcher = _DcpGatherPrefetcher()
-        return _dcp_gather_prefetcher.take(m, md, plan, k_nope, k_pe, m.layer_id)
+        return _dcp_gather_prefetcher_get().take(m, md, plan, k_nope, k_pe, m.layer_id)
 
     out_nope = dcp_extend_gather_buffer("packed_latent", k_nope, plan.rows)
     out_rope = dcp_extend_gather_buffer("packed_rope", k_pe, plan.rows)
