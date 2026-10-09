@@ -1089,6 +1089,28 @@ class Envs:
     # behaviour (it starts the gather a layer earlier, so this flag is a no-op
     # there).
     SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP = EnvBool(False)
+    # NPU (D2v3): stream the o_proj replication instead of holding it. The
+    # D1v3 token-sharded rebuild replicates the full o_proj on every
+    # attention-TP rank because each rank must produce the COMPLETE
+    # [rows, hidden] result for its own tokens -- 192 MiB bf16 per DSA layer,
+    # 78 layers, 14.1 GiB per device on the full model, TP- and
+    # context-independent. At 64 GB of HBM that tax alone puts the full model
+    # over the edge (48 GiB of sharded weights + 21.6 GiB of D1v3 replicas
+    # + KV + HCCL).
+    #
+    # ON (default with the rebuild): no static replication. The model runner
+    # keeps only this rank's dequantized RowParallel shard (24 MiB per layer,
+    # 1.9 GiB for 78), and the DCP gather side stream assembles the full
+    # matrix by all-gathering the shards into a double-buffered slot --
+    # issued immediately after the same layer's context-KV gather, one layer
+    # ahead, so the ~2 ms collect per layer hides under the layer's SFA and
+    # absorb, exactly like the KV gather it rides on. Cost: +192 MiB of HCCS
+    # traffic per layer per forward on the side stream that already moves the
+    # context KV; 384 MiB of standing slots per device.
+    #
+    # OFF: the D1v3 static replication (o_proj_qrep_weight), byte for byte.
+    # Requires SGLANG_NPU_DSA_CP_TOKEN_SHARDED; inert otherwise.
+    SGLANG_NPU_STREAM_O_PROJ = EnvBool(True)
     # DSA-CP local top-k: keep the indexer's top-k in this rank's query rows
     # instead of gathering it back to full width across the attention-TP
     # group. The DSA-CP plan's token split is byte-identical to the indexer's

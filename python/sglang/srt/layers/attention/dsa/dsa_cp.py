@@ -43,7 +43,7 @@ What is kept is the entire reason for the exercise: ``SparseFlashAttention``,
 by ``attn_tp_size`` when the queries do.
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
@@ -130,6 +130,23 @@ def dsa_cp_set_token_sharded(forward_batch, active: bool) -> None:
             "depend only on the batch and the process, not the layer"
         )
     forward_batch.npu_dsa_cp_token_sharded = active
+
+
+# D2v3: this rank's dequantized o_proj RowParallel shard, per DSA layer id.
+# Filled once by the model runner's token-sharded preparation and consumed by
+# the NPU gather side stream, which all-gathers the shards into the full
+# matrix on demand (see SGLANG_NPU_STREAM_O_PROJ). A registry rather than a
+# per-module lookup: the side stream prefetches layer L+1 from inside layer
+# L's forward, where it only holds layer L's module.
+_o_proj_stream_shards: Dict[int, torch.Tensor] = {}
+
+
+def register_o_proj_stream_shard(layer_id: int, shard: torch.Tensor) -> None:
+    _o_proj_stream_shards[layer_id] = shard
+
+
+def get_o_proj_stream_shard(layer_id: int) -> Optional[torch.Tensor]:
+    return _o_proj_stream_shards.get(layer_id)
 
 
 def dsa_cp_reduce_scatter_tokens(x: torch.Tensor) -> torch.Tensor:

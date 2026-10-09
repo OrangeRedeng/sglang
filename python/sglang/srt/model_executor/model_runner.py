@@ -1195,6 +1195,9 @@ class ModelRunner:
         # refusal rather than a fallback because a half-enabled rebuild (for
         # example the MoE input gathered under expert parallelism) would not
         # fail loudly -- it would produce plausible garbage.
+        from sglang.srt.layers.attention.dsa.dsa_cp import (
+            register_o_proj_stream_shard,
+        )
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -1287,6 +1290,15 @@ class ModelRunner:
         # instead of relying on it. o_proj is dequantized through an identity
         # GEMM, the same way version B dequantizes q_b_proj, so W4A8-
         # quantized checkpoints are supported.
+        #
+        # D2v3: o_proj is the big one (192 MiB bf16 per DSA layer per rank on
+        # the full model, 14.1 GiB for 78 layers). By default it is NOT
+        # gathered here: only this rank's dequantized RowParallel shard is
+        # kept (24 MiB per layer), registered by layer id, and assembled on
+        # the DCP gather side stream right after the same layer's context-KV
+        # gather -- one layer ahead, double buffered. SGLANG_NPU_STREAM_O_PROJ=0
+        # restores the static full replica below.
+        stream_o_proj = envs.SGLANG_NPU_STREAM_O_PROJ.get()
         tp_group = parallel.attn_tp_group
         total_bytes = 0
         for m in dsa_layers:
@@ -1307,7 +1319,25 @@ class ModelRunner:
             if getattr(m, "w_vc_qrep", None) is None:
                 m.w_vc_qrep = tp_group.all_gather(m.w_vc.contiguous(), dim=0)
                 total_bytes += m.w_vc_qrep.numel()
-            if getattr(m, "o_proj_qrep_weight", None) is None:
+            if stream_o_proj:
+                if getattr(m, "o_proj_stream_shard", None) is None:
+                    w_o = m.o_proj(
+                        torch.eye(
+                            m.o_proj.input_size_per_partition,
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
+                    )[0]
+                    # [in_r, out] = W_r^T dequantized; the forward wants W_r.
+                    w_o = w_o.t().contiguous()
+                    # RowParallelLinear shards the INPUT dim (weight
+                    # [out, in_r]); the side stream gathers the full [out, in]
+                    # from these shards, rank r contributing columns
+                    # [r*in_r, (r+1)*in_r).
+                    m.o_proj_stream_shard = w_o
+                    register_o_proj_stream_shard(m.layer_id, w_o)
+                    total_bytes += w_o.numel()
+            elif getattr(m, "o_proj_qrep_weight", None) is None:
                 w_o = m.o_proj(
                     torch.eye(
                         m.o_proj.input_size_per_partition,
@@ -1332,15 +1362,31 @@ class ModelRunner:
             torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
         )
         m0 = dsa_layers[0]
-        logger.info(
-            "dsa_cp_token_sharded: replicated weights/rank shapes -> "
-            "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj_qrep %s "
-            "(first layer shown; all DSA layers share the same shapes)",
-            tuple(m0.q_b_proj_qrep_weight.shape),
-            tuple(m0.w_kc_qrep.shape),
-            tuple(m0.w_vc_qrep.shape),
-            tuple(m0.o_proj_qrep_weight.shape),
-        )
+        if stream_o_proj:
+            logger.info(
+                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj STREAMED "
+                "(shard %s, full %s assembled on the gather side stream) "
+                "(first layer shown; all DSA layers share the same shapes)",
+                tuple(m0.q_b_proj_qrep_weight.shape),
+                tuple(m0.w_kc_qrep.shape),
+                tuple(m0.w_vc_qrep.shape),
+                tuple(m0.o_proj_stream_shard.shape),
+                (
+                    m0.o_proj_stream_shard.shape[0],
+                    m0.o_proj_stream_shard.shape[1] * parallel.attn_tp_size,
+                ),
+            )
+        else:
+            logger.info(
+                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj_qrep %s "
+                "(first layer shown; all DSA layers share the same shapes)",
+                tuple(m0.q_b_proj_qrep_weight.shape),
+                tuple(m0.w_kc_qrep.shape),
+                tuple(m0.w_vc_qrep.shape),
+                tuple(m0.o_proj_qrep_weight.shape),
+            )
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm the sampling path after graph initialization."""

@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsa.dsa_cp import (
     dsa_cp_token_sharded,
     dsa_cp_token_sharded_enabled,
     get_dsa_cp_plan,
+    get_o_proj_stream_shard,
 )
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
@@ -480,6 +481,14 @@ def forward_dsa_prepare_npu(
             )
         )
     )
+    # D2v3: the o_proj full matrix comes from the stream when
+    # SGLANG_NPU_STREAM_O_PROJ is on (this rank's dequantized shard, registered
+    # by layer id by the model runner) and from the static replica otherwise.
+    o_proj_present = (
+        get_o_proj_stream_shard(m.layer_id) is not None
+        if _stream_o_proj
+        else getattr(m, "o_proj_qrep_weight", None) is not None
+    )
     token_sharded = (
         dsa_cp_token_sharded_enabled()
         and dsa_cp_plan is not None
@@ -488,7 +497,7 @@ def forward_dsa_prepare_npu(
         and getattr(m, "q_b_proj_qrep_weight", None) is not None
         and getattr(m, "w_kc_qrep", None) is not None
         and getattr(m, "w_vc_qrep", None) is not None
-        and getattr(m, "o_proj_qrep_weight", None) is not None
+        and o_proj_present
     )
     if dsa_cp_token_sharded_enabled() and dsa_cp_plan is not None:
         # The startup gate raised on an incomplete preparation, so reaching
@@ -500,13 +509,15 @@ def forward_dsa_prepare_npu(
             getattr(m, "q_b_proj_qrep_weight", None) is None
             or getattr(m, "w_kc_qrep", None) is None
             or getattr(m, "w_vc_qrep", None) is None
-            or getattr(m, "o_proj_qrep_weight", None) is None
+            or not o_proj_present
         ):
             raise RuntimeError(
                 "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is on and the DSA-CP plan is "
                 "built, but this layer's full-width weights are incomplete "
-                "(q_b/w_kc/w_vc/o_proj qrep); the model-runner preparation "
-                "must have run before any forward"
+                "(q_b/w_kc/w_vc/o_proj"
+                + (" shard" if _stream_o_proj else " qrep")
+                + "); the model-runner preparation must have run before any "
+                "forward"
             )
     dsa_cp_set_token_sharded(forward_batch, token_sharded)
 
@@ -963,6 +974,17 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
 
 _enable_dcp_gather_prefetch = envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
 
+# D2v3: stream the o_proj full matrix on the DCP gather side stream instead of
+# holding a static per-rank replica. The side stream assembles it right after
+# the same layer's context-KV gather, one layer ahead, double buffered. OFF
+# restores the D1v3 static o_proj_qrep_weight, byte for byte. It only takes
+# effect under the D1v3 token-sharded rebuild, which is what makes the full
+# matrix necessary in the first place.
+_stream_o_proj = (
+    envs.SGLANG_NPU_STREAM_O_PROJ.get()
+    and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+)
+
 if _enable_dcp_gather_prefetch and not envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get():
     # The prefetch fills the buffer the operator reads directly. On the
     # permuting path that buffer is produced by an index_select from a scratch,
@@ -1019,6 +1041,22 @@ class _DcpGatherPrefetcher:
         self.ready: list = [None, None]
         # Which layer each slot currently holds the PREFIX for, per forward.
         self.filled: list = [None, None]
+        # D2v3: the full o_proj matrix for a layer, assembled on THIS side
+        # stream immediately after that layer's context-KV gather (one layer
+        # ahead, so it hides under the layer's own SFA and absorb). Double
+        # buffered by layer parity, like the KV slots: the gather for
+        # layer L+1 must not overwrite the slot layer L-1's o_proj GEMM --
+        # the previous reader -- is still consuming, and the wait_stream at
+        # the top of _gather_prefix is what orders that.
+        self.o_proj_slots: list = [None, None]
+        self.o_proj_ready: list = [None, None]
+        # Which layer each o_proj slot currently holds (None: never filled).
+        # The consumer checks this, not just the event's presence: a parity
+        # slot can carry a live event from layer L-2 while layer L's gather
+        # was never issued (a forward the prefetch declined) -- waiting on
+        # the stale event would read L-2's matrix for L, silently wrong.
+        self.o_proj_filled: list = [None, None]
+        self._o_proj_ranks_checked = False
         self.prev_layer: Optional[int] = None
         self._max_layer: Optional[int] = None
         # The layer whose prefix prime() issued in prepare, before any take().
@@ -1099,8 +1137,85 @@ class _DcpGatherPrefetcher:
                 parallel.dcp_group.all_gather_into_tensor(
                     out_rope[: plan.gathered_rows], send_rope
                 )
+            # The KV-only ready event is recorded here, before the o_proj
+            # gather, so the SFA read does not wait for the weight assembly.
             self.ready[slot] = self.stream.record_event()
+            # D2v3: the full o_proj matrix for this layer, on the same side
+            # stream and immediately after the KV gather -- the ~2 ms
+            # collective then hides under this layer's SFA and absorb instead
+            # of 14.1 GiB of it standing on every device.
+            if _stream_o_proj:
+                o_shard = get_o_proj_stream_shard(layer_id)
+                if o_shard is not None:
+                    self._issue_o_proj_gather(layer_id, o_shard)
         self.filled[slot] = layer_id
+
+    def _issue_o_proj_gather(self, layer_id: int, o_shard: torch.Tensor) -> None:
+        """All-gather the full o_proj matrix for ``layer_id`` on the side
+        stream (see SGLANG_NPU_STREAM_O_PROJ).
+
+        The shards are RowParallel over the attention-TP group, but the
+        collect runs on the DCP group -- the same communicator as the KV
+        gather this rides on, one communicator per stream. That is correct
+        only while both groups are the same ranks in the same order (true at
+        TP==DCP, the supported configuration), which is checked once, loudly.
+        """
+        parallel = get_parallel()
+        if not self._o_proj_ranks_checked:
+            if list(parallel.dcp_group.ranks) != list(
+                parallel.attn_tp_group.ranks
+            ):
+                raise RuntimeError(
+                    "SGLANG_NPU_STREAM_O_PROJ assembles the attention-TP "
+                    "o_proj shards on the DCP group, which requires both "
+                    "groups to hold the same ranks in the same order; got "
+                    f"dcp={list(parallel.dcp_group.ranks)} vs "
+                    f"attn_tp={list(parallel.attn_tp_group.ranks)}"
+                )
+            self._o_proj_ranks_checked = True
+            print_info_once(
+                "D2v3 o_proj streaming ON: the full o_proj matrix is "
+                "all-gathered on the DCP gather side stream, right after the "
+                "same layer's context-KV gather, instead of standing "
+                "replicated on every device"
+            )
+        slot = layer_id % 2
+        full_shape = (
+            o_shard.shape[0],
+            o_shard.shape[1] * parallel.attn_tp_size,
+        )
+        slot_buf = self.o_proj_slots[slot]
+        if (
+            slot_buf is None
+            or slot_buf.shape != full_shape
+            or slot_buf.dtype != o_shard.dtype
+            or slot_buf.device != o_shard.device
+        ):
+            slot_buf = o_shard.new_empty(full_shape)
+            self.o_proj_slots[slot] = slot_buf
+        # Same allocator bookkeeping as the KV slots above: written on the
+        # side stream, read on the compute stream, cached for good.
+        slot_buf.record_stream(self.stream)
+        parallel.dcp_group.all_gather_into_tensor(slot_buf, o_shard)
+        # A separate event: the o_proj GEMM waits on this one, and it is
+        # ordered after the KV ready event by the side stream itself.
+        self.o_proj_ready[slot] = self.stream.record_event()
+        self.o_proj_filled[slot] = layer_id
+
+    def take_o_proj(self, layer_id: int) -> torch.Tensor:
+        """This layer's full o_proj matrix: wait for its side-stream gather
+        and take the double-buffered slot. The wait is the last moment before
+        the GEMM reads the buffer -- the same placement as the KV ready wait
+        in take()."""
+        slot = layer_id % 2
+        if self.o_proj_ready[slot] is None:
+            raise RuntimeError(
+                f"o_proj streaming: layer {layer_id}'s full matrix was never "
+                "gathered; the side stream must issue it one layer ahead "
+                "(prime/take), the same as the KV gather"
+            )
+        torch.npu.current_stream().wait_event(self.o_proj_ready[slot])
+        return self.o_proj_slots[slot]
 
     def prime(self, m, md, plan, hidden_states, layer_id: int) -> None:
         """Issue the first layer's prefix gather at the start of the forward.
@@ -1204,6 +1319,73 @@ def _dcp_gather_prefetcher_get() -> _DcpGatherPrefetcher:
     if _dcp_gather_prefetcher is None:
         _dcp_gather_prefetcher = _DcpGatherPrefetcher()
     return _dcp_gather_prefetcher
+
+
+_eager_o_proj_slots: list = [None, None]
+
+# One line per process for the fallback below. print_info_once dedupes on the
+# message TEXT, and the message names the layer -- without this guard every
+# layer of a rejected forward would log its own "once" line (78 per rank).
+_dcp_o_proj_fallback_logged = False
+
+
+def _dcp_o_proj_weight(m: "DeepseekV2AttentionMLA") -> torch.Tensor:
+    """This layer's full o_proj matrix for the token-sharded o_proj GEMM
+    (D2v3).
+
+    Prefetch path: the matrix was all-gathered one layer ahead, right after
+    this layer's KV gather -- wait on its ready event and take the
+    double-buffered slot. The filled-layer check, not just the event's
+    presence: a parity slot can carry a live event from layer L-2 while
+    layer L's gather was never issued (a forward the prefetch declined),
+    and waiting on the stale event would read L-2's matrix for L, silently
+    wrong. Fallback (the prefetch off, DCP disabled, or a forward whose
+    packed plan declined the prefetch): gather synchronously on the compute
+    stream over the attention-TP group -- the shards' own group, so no
+    rank-order assumption across groups -- into the parity slot. Correct,
+    and exposed on the critical path, which is why the prefetch path
+    exists; the slot is safe across layers because the collect is enqueued
+    after the previous consumer's GEMM in stream order."""
+    global _dcp_o_proj_fallback_logged
+    parallel = get_parallel()
+    if _enable_dcp_gather_prefetch and parallel.dcp_enabled:
+        prefetcher = _dcp_gather_prefetcher_get()
+        if prefetcher.o_proj_filled[m.layer_id % 2] == m.layer_id:
+            return prefetcher.take_o_proj(m.layer_id)
+        if not _dcp_o_proj_fallback_logged:
+            _dcp_o_proj_fallback_logged = True
+            print_info_once(
+                "D2v3 o_proj: the side stream did not gather layer "
+                f"{m.layer_id}'s matrix this forward (DCP disabled, or the "
+                "packed plan declined the prefetch -- see the 'DCP packed "
+                "read is off ...' line for the reason); assembling it "
+                "synchronously on the compute stream instead -- correct, "
+                "but exposed on the critical path. Further occurrences of "
+                "the fallback are not logged."
+            )
+    shard = get_o_proj_stream_shard(m.layer_id)
+    if shard is None:
+        raise RuntimeError(
+            f"o_proj streaming: layer {m.layer_id}'s shard was never "
+            "registered; the model-runner token-sharded preparation must "
+            "have run before any forward"
+        )
+    slot = m.layer_id % 2
+    full_shape = (
+        shard.shape[0],
+        shard.shape[1] * parallel.attn_tp_size,
+    )
+    buf = _eager_o_proj_slots[slot]
+    if (
+        buf is None
+        or buf.shape != full_shape
+        or buf.dtype != shard.dtype
+        or buf.device != shard.device
+    ):
+        buf = shard.new_empty(full_shape)
+        _eager_o_proj_slots[slot] = buf
+    parallel.attn_tp_group.all_gather_into_tensor(buf, shard)
+    return buf
 
 
 _enable_dcp_sfa_gather_overlap = envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.get()
@@ -2190,12 +2372,26 @@ def forward_dsa_core_npu(
         attn_bmm_output = m._apply_gated(attn_bmm_output, gate)
     if dsa_cp_token_sharded(forward_batch):
         # Full W_O: the complete result for this rank's rows, no allReduce.
-        print_info_once(
-            "D1v3: o_proj runs the full replicated W_O (o_proj_qrep_weight) "
-            "on this rank's rows, so the attention output is complete and the "
-            "o_proj allReduce is skipped."
-        )
-        output = torch.nn.functional.linear(attn_bmm_output, m.o_proj_qrep_weight)
+        if _stream_o_proj:
+            # D2v3: the full matrix was assembled on the gather side stream
+            # one layer ahead; take_o_proj waits on its ready event here, the
+            # last moment before this GEMM reads the slot.
+            print_info_once(
+                "D2v3: o_proj runs the STREAMED full W_O (all-gathered on the "
+                "DCP side stream after this layer's KV gather), so the "
+                "attention output is complete and the o_proj allReduce is "
+                "skipped, with no standing per-device replica."
+            )
+            output = torch.nn.functional.linear(
+                attn_bmm_output, _dcp_o_proj_weight(m)
+            )
+        else:
+            print_info_once(
+                "D1v3: o_proj runs the full replicated W_O (o_proj_qrep_weight) "
+                "on this rank's rows, so the attention output is complete and the "
+                "o_proj allReduce is skipped."
+            )
+            output = torch.nn.functional.linear(attn_bmm_output, m.o_proj_qrep_weight)
     else:
         output, _ = m.o_proj(attn_bmm_output)
     if not m.next_skip_topk:
