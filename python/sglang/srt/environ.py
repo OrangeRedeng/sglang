@@ -1176,6 +1176,21 @@ class Envs:
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
+    # DSA SFA latent KV: store the MLA latent KV packed at 8 bits in the pool
+    # regardless of --kv-cache-dtype, which stays the model's COMPUTE dtype
+    # (bf16 here). The row is the kv_quant_sparse_flash_attention packed layout:
+    # latent | rope BF16 | per-128-tile FP32 scales = 656 B/token vs 1152 B
+    # bf16, x1.76 pool capacity at fixed GiB. On A2/A3 (910B) the kernel
+    # (KvQuantSparseFlashAttention) accepts INT8-only for key/value, so the
+    # latent is quantised to INT8 per-128-tile (npu_dynamic_quant); on 950PR
+    # the same op also accepts FP8. Decoupled from --kv-cache-dtype AND from
+    # SGLANG_NPU_INDEXER_INT8 (the index-K keeps its own dtype). Writes
+    # quantise the 512-dim latent at set_kv_buffer time; serving reads are
+    # dequant-on-read (DCP extend/decode gather) and the F2 paged read fuses
+    # the dequant into the quant sparse-attention operator. Requires DCP > 1.
+    # Not supported with the MLA preprocess (SGLANG_NPU_USE_MLAPO) direct-write
+    # path or the HiCache host mirror. OFF keeps the plain bf16 pool bitwise.
+    SGLANG_NPU_SFA_KV_8BIT = EnvBool(False)
 
     # ===================================================================
     # MUSA

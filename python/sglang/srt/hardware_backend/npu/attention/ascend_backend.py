@@ -1229,6 +1229,37 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _sfa_packed_kv(self) -> bool:
+        """Whether the serving pool stores the SFA latent KV packed 8-bit.
+
+        True under SGLANG_NPU_SFA_KV_8BIT (the bf16-compute flag, int8 on
+        A2/A3) and under the in-tree packed-fp8 DSA mode. getattr, because a
+        wrapper pool (SWA, hybrid) may not know the attribute; declining there
+        is the bf16 behaviour, which is what a wrapper that does not pack has.
+        """
+        return getattr(self.token_to_kv_pool, "sfa_packed_kv_storage", False)
+
+    def _dcp_decode_packed_kv_lens(
+        self, forward_batch: ForwardBatch, k_width: int, device: torch.device
+    ) -> torch.Tensor:
+        """The operator's ``actual_seq_lengths_kv`` for the packed decode read.
+
+        Cumulative, per request, and every entry is the FULL top-k width: the
+        TND buffer holds one run of k_width rows per request and the -1 tail of
+        each run masks the slots the rank does not own. Cached on the batch
+        rather than built per layer: torch.tensor(list, device=npu) is a
+        blocking host-to-device copy, 78 of them a forward.
+        """
+        cached = getattr(forward_batch, "npu_dcp_decode_packed_kv_lens", None)
+        if cached is None or cached.numel() != forward_batch.batch_size:
+            cached = (
+                torch.arange(1, forward_batch.batch_size + 1, device=device)
+                .to(torch.int32)
+                * k_width
+            )
+            forward_batch.npu_dcp_decode_packed_kv_lens = cached
+        return cached
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1312,6 +1343,17 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            if self._sfa_packed_kv():
+                # The CP-strategy balance read is a paged bf16 read of the raw
+                # pool; it cannot address a packed 8-bit row. F1's temporary
+                # read covers the DCP gather paths; the paged quant read lands
+                # in F2.
+                raise NotImplementedError(
+                    "SGLANG_NPU_SFA_KV_8BIT with the CP-strategy balance "
+                    "attention read: the paged read of packed rows is the F2 "
+                    "quant sparse-attention path; F1's temporary read covers "
+                    "the DCP decode/extend gathers only."
+                )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
@@ -1372,12 +1414,50 @@ class AscendAttnBackend(AttentionBackend):
                 # row width and the top-k order and marking non-owned entries
                 # -1 (the operator infers its count from that tail).
                 topk_indices = remap_dcp_local_topk_indices(topk_indices)
-                block_table = self.forward_metadata.dcp_local_block_tables
-                seq_lengths_kv = get_dcp_lens(
-                    actual_seq_lengths_kv,
-                    get_parallel().attn_dcp_size,
-                    get_parallel().attn_dcp_rank,
-                )
+                if self._sfa_packed_kv():
+                    # F1's temporary read for the packed pool (F2 fuses the
+                    # dequant into the quant operator where it can take the
+                    # packed row directly). The LSE operator above is
+                    # bf16-only, so gather this rank's selected rows and
+                    # dequantise them (pool.get_mla_kv_buffer) into a plain
+                    # TND buffer instead of reading the paged pool.
+                    #
+                    # The remap above compacted each row's owned entries to the
+                    # front with a -1 tail, so the buffer's per-request run is
+                    # exactly the top-k width and entry i names row i of its
+                    # run: -1 stays -1 (masked) and its slot reads padding row
+                    # 0, the same data-independent aim as _resolve_dcp_write.
+                    k_width = topk_indices.shape[-1]
+                    gather_rows = torch.where(
+                        topk_indices >= 0,
+                        topk_indices,
+                        topk_indices.new_zeros(()),
+                    ).reshape(-1)
+                    key_nope, key_rope = self.token_to_kv_pool.get_mla_kv_buffer(
+                        layer, gather_rows
+                    )
+                    topk_indices = torch.where(
+                        topk_indices >= 0,
+                        torch.arange(
+                            k_width,
+                            device=topk_indices.device,
+                            dtype=topk_indices.dtype,
+                        ),
+                        topk_indices.new_full((), -1),
+                    )
+                    block_table = None
+                    seq_lengths_kv = self._dcp_decode_packed_kv_lens(
+                        forward_batch, k_width, topk_indices.device
+                    )
+                    layout_kv = "TND"
+                    sparse_mode = 0
+                else:
+                    block_table = self.forward_metadata.dcp_local_block_tables
+                    seq_lengths_kv = get_dcp_lens(
+                        actual_seq_lengths_kv,
+                        get_parallel().attn_dcp_size,
+                        get_parallel().attn_dcp_rank,
+                    )
                 # 0, not 3. Once the indices are rank-local, local KV length and
                 # global query length no longer share a coordinate system, so the
                 # operator must not apply its own right-down causal crop.
@@ -1480,6 +1560,13 @@ class AscendAttnBackend(AttentionBackend):
                 # TND and not BSND.
                 layout_kv = "TND"
             else:
+                assert not self._sfa_packed_kv(), (
+                    "packed 8-bit SFA KV reached the unsharded paged read: "
+                    "F1's temporary read covers the DCP paths only. The pool "
+                    "refuses the flag at init without DCP, so this is a "
+                    "wiring error, not a configuration -- the paged quant "
+                    "read lands in F2."
+                )
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
                 sparse_mode = 3
