@@ -77,13 +77,11 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export DEEPEP_HCCL_BUFFSIZE=2500
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_SOCKET_IFNAME=<network-interface>
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -224,7 +222,6 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
@@ -281,7 +278,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -427,7 +423,6 @@ do
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -482,7 +477,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -634,7 +628,6 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
@@ -692,7 +685,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -841,7 +833,6 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1037,7 +1028,6 @@ do
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1092,7 +1082,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1247,7 +1236,6 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1301,7 +1289,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1457,7 +1444,6 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1510,7 +1496,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
