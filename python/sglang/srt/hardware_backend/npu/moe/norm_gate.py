@@ -1,4 +1,4 @@
-"""Opt-in native MXFP8 input and router for GLM-5.2 TP MoE."""
+"""Opt-in native MXFP8 input and router for the NPU W4A8-MXFP4 TP MoE path."""
 
 from functools import lru_cache
 
@@ -50,8 +50,10 @@ def mx_scale_layout(scale, rows, hidden_size):
 
 def native_add_rmsnorm_mxfp8(x, residual, gamma, eps):
     op = native_norm_op()
-    if x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] != 6144:
-        raise ValueError("Native MoE norm requires BF16 [T,6144]")
+    if x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] != gamma.shape[0]:
+        raise ValueError(
+            "Native MoE norm requires BF16 [T, hidden] matching the norm weight"
+        )
     if residual.shape != x.shape or residual.dtype != x.dtype:
         raise ValueError("Native MoE norm requires a matching BF16 residual")
     q, residual_out, scale, rstd = op(
@@ -111,11 +113,14 @@ class MXFP8GateMethod(QuantizeMethodBase):
             torch.float16,
             torch.bfloat16,
             torch.float32,
-        ) or layer.weight.shape != (256, 6144):
+        ) or layer.weight.ndim != 2:
             raise ValueError(
-                "GLM-5.2 MXFP8 gate requires FP16/BF16/FP32 [256,6144] weights; "
+                "MXFP8 gate requires a 2-D FP16/BF16/FP32 "
+                "[n_routed_experts, hidden_size] weight; "
                 f"got {layer.weight.dtype} {tuple(layer.weight.shape)}"
             )
+        num_experts, hidden_size = layer.weight.shape
+        layer.mxfp8_hidden_size = hidden_size
         # Retain the loaded gate dtype/values for the production reference.
         q, scale = self.quantize(
             layer.weight.data,
@@ -127,7 +132,7 @@ class MXFP8GateMethod(QuantizeMethodBase):
         if q.dtype != torch.float8_e4m3fn or q.shape != layer.weight.shape:
             raise RuntimeError("Unsupported native gate MXFP8 quantization output")
         weight = q.transpose(0, 1)
-        weight_scale = mx_scale_layout(scale, 256, 6144).transpose(0, 1)
+        weight_scale = mx_scale_layout(scale, num_experts, hidden_size).transpose(0, 1)
         layer.register_buffer("mxfp8_weight", weight, persistent=False)
         layer.register_buffer("mxfp8_weight_scale", weight_scale, persistent=False)
 
@@ -140,8 +145,12 @@ class MXFP8GateMethod(QuantizeMethodBase):
             else mxfp8_input(hidden_states)
         )
         q, scale = operand
-        if q.dtype != torch.float8_e4m3fn or q.ndim != 2 or q.shape[1] != 6144:
-            raise ValueError("MXFP8 gate requires E4M3 [T,6144]")
+        if (
+            q.dtype != torch.float8_e4m3fn
+            or q.ndim != 2
+            or q.shape[1] != layer.mxfp8_hidden_size
+        ):
+            raise ValueError("MXFP8 gate requires E4M3 [T, hidden] activations")
         record_mxfp8_operand(operand)
         logits = self.matmul(
             q,
@@ -159,7 +168,6 @@ class MXFP8GateMethod(QuantizeMethodBase):
 
 
 def configure_native_norm_gate(moe):
-    from sglang.srt.configs.model_config import is_glm_moe_dsa
     from sglang.srt.environ import envs
     from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         NPUW4A8MXFP4MoEMethod,
@@ -170,12 +178,7 @@ def configure_native_norm_gate(moe):
 
     parallel = get_parallel()
     if not (
-        is_glm_moe_dsa(moe.config)
-        and moe.config.hidden_size == 6144
-        and moe.config.n_routed_experts == 256
-        and moe.config.num_experts_per_tok == 8
-        and moe.tp_size == 4
-        and moe.moe_ep_size == 1
+        moe.moe_ep_size == 1
         and parallel.moe_dp_size == 1
         and parallel.attn_dp_size == 1
         and parallel.attn_cp_size == 1
@@ -194,7 +197,7 @@ def configure_native_norm_gate(moe):
         and supports_mxfp8_linear(moe.shared_experts.down_proj)
     ):
         raise ValueError(
-            "Native norm/gate requires GLM-5.2 W4A8 MXFP TP4/EP1 prequant/reuse"
+            "Native norm/gate requires the W4A8 MXFP TP/EP1 prequant/reuse setup"
         )
     if envs.SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8.get():
         if not envs.SGLANG_NPU_TP_MOE_MXFP8_GATE.get():
