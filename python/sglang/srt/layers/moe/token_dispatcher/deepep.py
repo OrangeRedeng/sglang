@@ -540,14 +540,6 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
-            elif self.deepep_output_dtype in (
-                DispatcherOutputDtype.MXFP8,
-                DispatcherOutputDtype.MXFP4,
-            ):
-                raise ValueError(
-                    f"{self.deepep_output_dtype.value} DeepEP dispatcher output "
-                    "dtype is only supported on Ascend NPU"
-                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def set_overlap_args(
@@ -610,11 +602,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 quant_mode = "mx_fp4_e2m1"
             elif self.use_mxfp8:
                 quant_mode = "mx_fp8_e4m3"
-            elif self.deepep_output_dtype == DispatcherOutputDtype.FP8:
-                raise RuntimeError(
-                    "Installed DeepEP quant_mode API does not expose a native FP8 "
-                    "mode; use a DeepEP build with use_fp8 support."
-                )
             elif self.use_fp8:
                 quant_mode = "int8"
             else:
