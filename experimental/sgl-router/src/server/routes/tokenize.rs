@@ -112,24 +112,31 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "x".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
-            models: vec![crate::config::ModelConfig {
+            model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
-            }],
-            discovery: crate::config::DiscoveryConfig {
-                backend: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
+                sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
             },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
             proxy: crate::config::ProxyConfig::default(),
-            active_load: crate::config::ActiveLoadConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(
