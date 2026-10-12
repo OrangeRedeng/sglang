@@ -109,11 +109,15 @@ class MXFP8GateMethod(QuantizeMethodBase):
 
     @torch.no_grad()
     def process_weights_after_loading(self, layer):
-        if layer.weight.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ) or layer.weight.ndim != 2:
+        if (
+            layer.weight.dtype
+            not in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            )
+            or layer.weight.ndim != 2
+        ):
             raise ValueError(
                 "MXFP8 gate requires a 2-D FP16/BF16/FP32 "
                 "[n_routed_experts, hidden_size] weight; "

@@ -7,12 +7,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-except ModuleNotFoundError:
-    pass
-else:
-    register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 SPEC = importlib.util.spec_from_file_location(
@@ -74,3 +71,7 @@ class TestNpuHcclConfig(unittest.TestCase):
                     self.assertEqual(os.environ.get("HCCL_BUFFSIZE"), expected)
                     if enabled == "0" or explicit is not None:
                         resolver.model_config_of.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

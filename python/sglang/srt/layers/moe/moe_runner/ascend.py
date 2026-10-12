@@ -26,8 +26,6 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
-
-
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
