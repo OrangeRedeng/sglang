@@ -217,7 +217,8 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+        if torch.npu.get_soc_version() < 260:
+            torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
@@ -263,12 +264,11 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
-        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
-            ``customize_dtype=torch.float8_e4m3fn``,
-            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
-            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
-            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
-            ND fallback would corrupt results.
+        customize_dtype / input_dtype: carrier-dtype kwargs (e.g.
+            ``customize_dtype=torch.int8``, ``input_dtype=torch.int8`` for the
+            packed-FP4 view). When either is set the kwargs are forwarded to the
+            op and the ``_is_nz_aligned`` ND fallback is skipped so an explicit
+            carrier-dtype conversion does not silently keep ND storage.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -292,9 +292,7 @@ def npu_format_cast(
     if tensor.device.type == "meta":
         return tensor
 
-    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
-    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
-    # silent ND fallback would corrupt results.
+    # Explicit carrier-dtype casts must not silently skip the requested layout.
     if customize_dtype is not None or input_dtype is not None:
         return torch.ops.npu.npu_format_cast(
             tensor,
@@ -316,6 +314,49 @@ def npu_format_cast(
         return tensor
 
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
+
+
+def cast_packed_fp4_weight_to_nz(
+    weight: torch.Tensor, *, w4a8: bool = False
+) -> torch.Tensor:
+    """Optionally prepare NZ with K0=64 for W4A4 or K0=32 for W4A8."""
+    if not envs.SGLANG_NPU_ENABLE_MXFP4_NZ.get():
+        return weight
+    if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+        raise ValueError(
+            "SGLANG_NPU_ENABLE_MXFP4_NZ conflicts with "
+            "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+        )
+    if weight.device.type != "npu":
+        raise ValueError("MXFP4 NZ conversion requires weights on NPU")
+    if w4a8:
+        import torch_npu
+
+        # FP8-target packing uses 16 bytes per block of 32 logical FP4 values.
+        converted = npu_format_cast(
+            weight.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+    else:
+        converted = npu_format_cast(
+            weight.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.int8,
+            input_dtype=torch.int8,
+        )
+    # ACLNN exposes packed W4A8's C0=32 logical FP4 tile as C0=16 bytes.
+    expected_format = 50 if w4a8 else int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+    actual_format = torch.ops.npu.get_npu_format(converted)
+    if actual_format != expected_format:
+        raise RuntimeError(
+            f"MXFP4 {'W4A8' if w4a8 else 'W4A4'} NZ conversion returned "
+            f"format {actual_format}, expected {expected_format}. "
+            "Check the installed torch_npu/CANN format-cast support, or set "
+            "SGLANG_NPU_ENABLE_MXFP4_NZ=0 to use ND."
+        )
+    return converted
 
 
 def get_indexer_weight_stream():

@@ -1011,6 +1011,10 @@ class Envs:
     SGLANG_NPU_HCCL_MIN_MB = EnvInt(64)
     SGLANG_NPU_HCCL_MAX_MB = EnvInt(1024)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # Store packed-MXFP4 weights in FRACTAL_NZ (K0=64 W4A4 / K0=32 W4A8) instead
+    # of ND. Off by default: ND is the portable layout; NZ needs a torch_npu
+    # build whose FP4 npu_quant_matmul accepts the NZ x2 on Ascend 950.
+    SGLANG_NPU_ENABLE_MXFP4_NZ = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Opt-in A/B stages; shared finalization also requires scaled routing weights.
     SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE = EnvBool(False)
