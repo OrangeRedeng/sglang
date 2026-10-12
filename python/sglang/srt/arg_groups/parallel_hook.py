@@ -7,6 +7,9 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+    resolve_cp_tp_group_sharing,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
@@ -58,22 +61,25 @@ def handle_deprecated_dp_attention(server_args: Any):
     )
 
 
-def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    kimi_k3 = architecture in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
     if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
-        # Neither model enters the input-scattered attention scope. Preserve
-        # their existing ordinary execution and make the effective flag explicit.
+    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+        # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
-            model_type,
+            architecture,
         )
         return {"enable_attn_tp_input_scattered": False}
     return {}
@@ -96,7 +102,7 @@ def handle_context_parallelism(server_args: Any):
             server_args,
             "boundary_parallelism",
             **_boundary_parallelism_overrides(
-                cfg, model_config.hf_text_config.model_type
+                cfg, model_config.hf_text_config.model_type, model_arch
             ),
         )
         if (
@@ -134,6 +140,7 @@ def handle_context_parallelism(server_args: Any):
                     "MiMo V2 prefill CP only supports text inference; add "
                     "--language-only."
                 )
+        resolve_cp_tp_group_sharing(server_args, model_config)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
@@ -233,45 +240,6 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_size > 1:
-        # initialize_model_parallel rejects this too; repeat it here so the
-        # failure names the flags before torch.distributed comes up.
-        if cfg.tp_size % cfg.dcp_size != 0:
-            raise ValueError(
-                "--tp-size / --tensor-parallel-size must be evenly divisible "
-                "by --dcp-size / --decode-context-parallel-size, but got "
-                f"tp_size={cfg.tp_size} and dcp_size={cfg.dcp_size} "
-                f"(tp_size % dcp_size = {cfg.tp_size % cfg.dcp_size})."
-            )
-
-        # DCP must also nest inside one attention-TP group, or a DCP group can
-        # straddle two DP replicas decoding different batches. attn_dp_size is
-        # recomputed because this handler runs before handle_dwdp.
-        attn_dp_size = (
-            cfg.dwdp_size
-            if cfg.dwdp_size > 1
-            else (cfg.dp_size if cfg.enable_dp_attention else 1)
-        )
-        attn_divisor = attn_dp_size * cfg.attn_cp_size
-        # An indivisible tp_size is handle_context_parallelism's error to
-        # raise; skip rather than report a truncated attn_tp_size here.
-        if attn_divisor > 0 and cfg.tp_size % attn_divisor == 0:
-            attn_tp_size = cfg.tp_size // attn_divisor
-            if attn_tp_size % cfg.dcp_size != 0:
-                raise ValueError(
-                    "Decode context parallelism must nest inside one "
-                    "attention-TP group: the effective attention TP size must "
-                    "be evenly divisible by --dcp-size / "
-                    "--decode-context-parallel-size, but got "
-                    f"attn_tp_size={attn_tp_size} and "
-                    f"dcp_size={cfg.dcp_size} (tp_size={cfg.tp_size}, "
-                    f"dp_size={cfg.dp_size}, "
-                    f"enable_dp_attention={cfg.enable_dp_attention}, "
-                    f"dwdp_size={cfg.dwdp_size}, "
-                    f"attn_cp_size={cfg.attn_cp_size}). A DCP group wider "
-                    "than one attention-TP group would span ranks decoding "
-                    "different batches."
-                )
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "

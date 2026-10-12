@@ -12,7 +12,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -528,54 +527,6 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
-        )
-
-    def _plan_quant_indexer_metadata(self, forward_batch: ForwardBatch) -> None:
-        # Pre-plan the quant_lightning_indexer (v2) task list once per
-        # forward batch; every DSA indexer layer of this step reads it from
-        # forward_metadata instead of calling the metadata op per layer.
-        # CP prefill takes the legacy op path in the indexer and never calls
-        # quant_lightning_indexer, so it is skipped here.
-        #
-        # So does a prefill whose indexer queries are sharded across
-        # attention-TP: a batch-wide plan does not describe that rank's slice
-        # of the query rows, and handing it to the operator anyway is an
-        # out-of-bounds read. The indexer re-plans per shard, so skip the work
-        # here rather than compute a plan it must discard.
-        if not self.quant_indexer_enabled:
-            return
-        if forward_batch.forward_mode.is_extend() and (
-            forward_batch.attn_cp_metadata is not None or _shard_indexer_queries
-        ):
-            return
-        base_q = self.forward_metadata.actual_seq_lengths_q
-        if base_q is None:  # plain extend: cumsum of per-seq q lengths
-            base_q = forward_batch.extend_seq_lens.int().cumsum(0)
-        # NPU cumsum upcasts int32 -> int64; the op requires int32
-        # cu_seqlens_q.
-        base_q = base_q.to(torch.int32)
-        fm = self.forward_metadata
-        fm.quant_indexer_cu_seqlens_q = torch.cat([base_q.new_zeros(1), base_q])
-        fm.quant_indexer_seqused_k = fm.seq_lens_cpu_int.to(
-            self.device, dtype=torch.int32
-        )
-        fm.quant_indexer_metadata = (
-            torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
-                self.quant_indexer_n_heads,
-                1,
-                self.quant_indexer_head_dim,
-                self.quant_indexer_topk,
-                3,  # QUANT_MODE_MXFP8
-                cu_seqlens_q=fm.quant_indexer_cu_seqlens_q,
-                seqused_k=fm.quant_indexer_seqused_k,
-                batch_size=int(fm.quant_indexer_seqused_k.numel()),
-                max_seqlen_q=-1,
-                max_seqlen_k=-1,
-                layout_q="TND",
-                layout_k="PA_BBND",
-                mask_mode=3,
-                cmp_ratio=1,
-            )
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
@@ -15,35 +15,19 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.attention.dsa.dsa_cp import (
-    dsa_cp_redistribute_heads,
-    dsa_cp_restore_tokens,
-    dsa_cp_slice,
-    get_dsa_cp_plan,
-)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mla
-from sglang.srt.layers.dcp.layout import (
-    dcp_extend_gather_buffer,
-    plan_dcp_extend_gather,
-)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    is_dcp_mla_decode_phase,
-)
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
-
-
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
 
@@ -53,10 +37,7 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
         runtime_context.get_parallel().dcp_enabled
         and not forward_context.get_attn_backend().is_draft_worker
         and not dsa_use_prefill_cp(forward_batch)
-        and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
+        and not forward_batch.forward_mode.is_idle()
     )
 
 
@@ -398,10 +379,6 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    get_dsa_cp_plan(
-        forward_batch,
-        index_topk=m.indexer.index_topk if m.indexer is not None else None,
-    )
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -556,175 +533,6 @@ def forward_dsa_prepare_npu(
     )
 
 
-# Rows per extend-gather collective: caps the scratch held beside the output.
-# The bytes moved are the same at any piece size.
-_dcp_extend_gather_piece_rows = envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.get()
-if _dcp_extend_gather_piece_rows <= 0:
-    _dcp_extend_gather_piece_rows = 1 << 62
-
-
-def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
-    """Lay this rank's per-request shards out at their padded send offsets."""
-    send = shards.new_empty((plan.send_rows, *shards.shape[1:]))
-    src = dst = 0
-    for local_len, padded_len in zip(plan.local_lens, plan.padded_lens):
-        send[dst : dst + local_len] = shards[src : src + local_len]
-        src += local_len
-        dst += padded_len
-    return send
-
-
-def _dcp_extend_gather_scratch(name: str, ref: torch.Tensor, rows: int):
-    return dcp_extend_gather_buffer(name, ref, rows)
-
-
-def _dcp_extend_gather_scratches(k_nope, k_pe, rows: int, packed_kv: bool):
-    """``[(scratch, own), ...]``: one entry under FP8, two under bf16."""
-    keys = [(_dcp_extend_gather_scratch("latent_scratch", k_nope, rows), k_nope)]
-    if not packed_kv:
-        keys.append((_dcp_extend_gather_scratch("rope_scratch", k_pe, rows), k_pe))
-    return keys
-
-
-def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int, packed_kv: bool):
-    """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
-
-    Returns one send per gathered key, in the same order as
-    ``_dcp_extend_gather_scratches``: [nope] under an FP8 cache, [nope, rope]
-    under bf16. Prefix rows were written by earlier forwards.
-    """
-    if not plan.send_rows:
-        return [None] if packed_kv else [None, None]
-    send_nope, send_rope = pool.get_mla_kv_buffer(
-        layer, md.dcp_local_prefix_kv_indices, layer_id=layer_id
-    )
-    if plan.local_lens != plan.padded_lens:
-        # Served prefixes are dcp_size-aligned (the widened allocator page)
-        # and need no padding; this is the general case.
-        send_nope = _pad_dcp_extend_send(send_nope, plan)
-        if send_rope is not None:
-            send_rope = _pad_dcp_extend_send(send_rope, plan)
-    return [send_nope] if packed_kv else [send_nope, send_rope]
-
-
-def _dcp_extend_all_gather(parallel, plan, piece, pairs) -> None:
-    """The collectives for one piece: ``pairs`` is [(scratch, send), ...]."""
-    gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
-    if not gathered:
-        return
-    for scratch, send in pairs:
-        parallel.dcp_group.all_gather_into_tensor(
-            scratch[:gathered], send[piece.send_start : piece.send_end]
-        )
-
-
-def _dcp_gather_extend_kv_npu(
-    m: "DeepseekV2AttentionMLA",
-    forward_batch: "ForwardBatch",
-    k_nope: torch.Tensor,
-    k_pe: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Materialise each request's FULL prefix+extend KV, for one layer.
-
-    A rank holds 1/c of the context, so at extend it gathers the rest rather
-    than sharding the attention and merging: prefill has many query tokens and
-    few heads, which makes moving the KV the cheap direction. Decode is the
-    mirror image and gathers the query instead.
-
-    The result is one contiguous run per request, which is what
-    ``npu_sparse_flash_attention`` needs under a non-paged layout -- sparse
-    indices relative to each request's KV start, cumulative KV lengths. The
-    shared ``all_gather_kv_cache_for_mla_extend`` cannot be used: it groups all
-    prefixes then all extends, so a request's KV is two disjoint runs.
-
-    The prefix is gathered in pieces of at most
-    ``SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS`` rows; each piece is written into
-    its place in the output by one ``index_select`` before the next is gathered.
-    Output and scratch come from ``dcp_extend_gather_buffer`` and are reused by
-    every layer and forward, so nothing context-sized is allocated after the
-    first extend -- a moving context-sized allocation makes ranks free and
-    refill out of step and stalls the collectives for minutes.
-
-    The two keys are gathered separately because the operator takes them as
-    separate tensors and slices of a wide buffer are not contiguous. Only the
-    prefix is gathered; this chunk's own KV arrives as ``k_nope``/``k_pe``.
-    """
-    parallel = get_parallel()
-    md = forward_batch.attn_dcp_metadata
-    plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
-    if plan is None:
-        # The shared planner's context-sized buffer is for CUDA's kernels and is
-        # never read here, so drop it rather than hold it through every layer.
-        md.dcp_kv_buffer = None
-        plan = plan_dcp_extend_gather(
-            forward_batch.extend_prefix_lens_cpu,
-            forward_batch.extend_seq_lens_cpu,
-            parallel.dcp_size,
-            parallel.dcp_rank,
-            _dcp_extend_gather_piece_rows,
-            interleave_size=forward_context.get_attn_backend().page_size,
-        )
-        plan = plan._replace(
-            pieces=[
-                piece._replace(index=piece.index.to(k_nope.device))
-                for piece in plan.pieces
-            ]
-        )
-        forward_batch.npu_dcp_extend_gather = plan
-        # Let the pool drop the rows this rank does not own from this forward's
-        # KV write. A wrapper pool (SWA, hybrid) may not offer it; that is fine.
-        plan_write = getattr(get_token_to_kv_pool(), "plan_dcp_extend_write", None)
-        if plan_write is not None:
-            plan_write(forward_batch.out_cache_loc)
-    pool = get_token_to_kv_pool()
-    # Under an FP8 DSA cache the pool stores ONE packed record per token --
-    # nope, rope and the dequant scales in a single 656-byte row -- so there is
-    # no second tensor to move. Pack this chunk's own bf16 KV into the same
-    # record and the gather is byte-for-byte the shape the sparse operator
-    # reads at layout_kv TND. It is also 43% less wire than the bf16 form,
-    # which matters because this gather is the port's largest single cost.
-    packed_kv = getattr(pool, "dsa_kv_cache_store_fp8", False)
-    if packed_kv:
-        # (rows, 1, kv_cache_dim), matching what get_mla_kv_buffer returns for
-        # the prefix, so send and own rows concatenate without a reshape.
-        #
-        # Carried as uint8, not float8_e4m3fn: aclnnIndexSelect has no FP8 in
-        # its dtype list and the reorder below is an index_select. The record
-        # is an opaque byte string to everything on this path -- only the
-        # sparse operator interprets it -- so the backend views it back to FP8
-        # at the call. Same width either way, so nothing else changes.
-        k_nope = pool._pack_dsa_fp8_kv_cache(k_nope, k_pe).view(torch.uint8)
-        k_nope = k_nope.unsqueeze(1)
-        k_pe = None
-
-    total_rows = plan.pieces[-1].out_end if plan.pieces else 0
-    out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
-    out_rope = None if packed_kv else dcp_extend_gather_buffer("rope", k_pe, total_rows)
-
-    layer_id = m.attn_mqa.layer_id
-    scratches = _dcp_extend_gather_scratches(k_nope, k_pe, plan.scratch_rows, packed_kv)
-    sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, layer_id, packed_kv)
-    # Pieces reuse scratch, so each gather must precede its own index_select.
-    outs = [out_nope] if packed_kv else [out_nope, out_rope]
-    for piece in plan.pieces:
-        gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
-        rows = gathered + piece.extend_end - piece.extend_start
-        _dcp_extend_all_gather(
-            parallel,
-            plan,
-            piece,
-            [(buf, send) for (buf, _), send in zip(scratches, sends)],
-        )
-        for out, (buf, own) in zip(outs, scratches):
-            scratch = buf[:rows]
-            scratch[gathered:] = own[piece.extend_start : piece.extend_end]
-            torch.index_select(
-                scratch, 0, piece.index, out=out[piece.out_start : piece.out_end]
-            )
-
-    return out_nope, out_rope
-
-
 def forward_dsa_core_npu(
     m: "DeepseekV2AttentionMLA",
     q_pe: torch.Tensor,
@@ -741,93 +549,28 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # GLM-5.2 dispatches DSA_NPU here rather than to forward_absorb_core, so
-    # forward_mla.py's DCP block never runs for it and DCP is composed here too.
-    dcp_extend = (
-        get_parallel().dcp_enabled
-        and not forward_context.get_attn_backend().is_draft_worker
-        and forward_batch.forward_mode.is_extend()
-        and not is_dcp_mla_decode_phase(forward_batch)
-        and forward_batch.attn_dcp_metadata is not None
+    use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
+    attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
+    attn_output = attn(
+        q_nope_out.contiguous(),
+        k_nope.contiguous(),
+        k_nope.contiguous(),
+        forward_batch,
+        save_kv_cache=not mla_preprocess_used,
+        q_rope=q_pe.contiguous(),
+        k_rope=k_pe.contiguous(),
+        topk_indices=topk_indices,
     )
-    if dcp_extend:
-        # Gather the context so this rank can see all of it; without it the
-        # backend reads its own shard with a full-span page table.
-        forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
-            m, forward_batch, k_nope, k_pe
-        )
-
-    if _use_dsa_dcp_partial_attention(forward_batch):
-        # Prepare has already gathered heads and localized each fresh top-k.
-        attn_output, lse = m.attn_mqa_for_dcp_decode(
-            q_nope_out.contiguous(),
-            k_nope.contiguous(),
-            k_nope.contiguous(),
-            forward_batch,
-            save_kv_cache=not mla_preprocess_used,
-            q_rope=q_pe.contiguous(),
-            k_rope=k_pe.contiguous(),
-            topk_indices=topk_indices,
-        )
+    if use_dcp:
+        attn_output, lse = attn_output
         attn_output = attn_output.view(
-            -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
+            -1,
+            m.num_local_heads * runtime_context.get_parallel().attn_dcp_size,
+            m.kv_lora_rank,
         )
-        if get_parallel().dcp_comm_backend in ("a2a", "fi_a2a"):
-            attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
-                attn_output, lse, get_parallel().dcp_group
-            )
-        else:
-            attn_output = cp_lse_ag_out_rs_mla(
-                attn_output, lse, get_parallel().dcp_group, is_lse_base_on_e=True
-            ).transpose(0, 1)
-    else:
-        attn_mqa = m.attn_mqa
-        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
-        if dsa_cp_plan is not None and (
-            topk_indices is None or m.attn_mqa_for_dsa_cp is None
-        ):
-            # Same condition builds both, so a mismatch is a wiring bug.
-            raise RuntimeError(
-                "DSA-CP planned this forward but the layer is not set up for "
-                f"it: attn_mqa_for_dsa_cp={m.attn_mqa_for_dsa_cp is not None}, "
-                f"topk_indices={topk_indices is not None}"
-            )
-        if dsa_cp_plan is not None:
-            # DSA-CP: swap "my heads for every token" for "every head for my
-            # tokens", which divides the per-query top-k KV read. k_nope/k_pe
-            # stay full width, and the padded row count must be handed back.
-            dsa_cp_rows = q_nope_out.shape[0]
-            q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
-            q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
-            # This rank's rows of the full-width top-k. A separate name is
-            # load-bearing: topk_indices is returned for the next layer to reuse,
-            # so rebinding it here would hand that layer a slice of a slice.
-            attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
-            attn_mqa = m.attn_mqa_for_dsa_cp
-        else:
-            attn_topk_indices = topk_indices
-        attn_output = attn_mqa(
-            q_nope_out.contiguous(),
-            k_nope.contiguous(),
-            k_nope.contiguous(),
-            forward_batch,
-            save_kv_cache=not mla_preprocess_used,
-            q_rope=q_pe.contiguous(),
-            k_rope=k_pe.contiguous(),
-            topk_indices=attn_topk_indices,
+        attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
+            attn_output, lse, runtime_context.get_parallel().dcp_group
         )
-        if dsa_cp_plan is not None:
-            # Undo the swap: everything downstream expects this rank's own heads
-            # for the whole batch.
-            attn_output = dsa_cp_restore_tokens(
-                attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank),
-                dsa_cp_plan,
-                dsa_cp_rows,
-            )
-    if dcp_extend:
-        # Drop the reference so a later forward cannot read a stale gather; the
-        # buffers themselves are reserved and survive.
-        forward_batch.npu_dcp_extend_kv = None
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     if _is_npu_arch35 or (
