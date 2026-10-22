@@ -147,12 +147,15 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.free_group is None:
-            device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            self._release_page_ids(free_page_indices.to(device))
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
-
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+        # The previous NPU override round-tripped every free through the CPU
+        # (blocking D2H copy + host torch.unique + H2D copy back), which put a
+        # full-device sync into the step's free path right where the next
+        # prefill is submitted (profile: EVENT_WAIT ~4.6ms per step absorbing
+        # the drained launch queue). The paged parent does the identical page
+        # census entirely on device -- unique -> staged pages, consolidated
+        # lazily by merge_and_sort_free at the next allocation-pressure point.
+        # Only cross-device inputs are moved here; an H2D never blocks on
+        # device progress.
+        if free_index.device.type != torch.device(self.device).type:
+            free_index = free_index.to(torch.device(self.device), non_blocking=True)
+        super().free(free_index)
