@@ -47,6 +47,9 @@ ONLINE_QUANT_SCHEMES = {
     "w4a8_mxfp": "W4A8_MXFP",
     "w4a4_mxfp4": "W4A4_MXFP4",
     "w8a8_dynamic": "W8A8_DYNAMIC",
+    "w8a8_int8": "W8A8_DYNAMIC",
+    # Friendly alias: dynamic INT8 (per-token activation, per-channel weight).
+    "int8": "W8A8_DYNAMIC",
     "w4a4_dynamic": "W4A4_DYNAMIC",
 }
 
