@@ -214,6 +214,11 @@ class ModelSlimConfig(QuantizationConfig):
         boundary.
         """
         candidates = [prefix]
+        # Gemma checkpoints omit the runtime MoE wrapper and wrap vision linears.
+        if ".moe.experts" in prefix:
+            candidates.append(prefix.replace(".moe.experts", ".experts"))
+        if ".vision_tower." in prefix and not prefix.endswith(".linear"):
+            candidates.append(f"{prefix}.linear")
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
@@ -271,8 +276,8 @@ class ModelSlimConfig(QuantizationConfig):
             elif "visual" in prefix:
                 key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
-                prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
-                prefix = prefix.replace(r"attn.proj", r"wo")
+                prefix = prefix.replace(".attn.qkv_proj", ".wqkv")
+                prefix = prefix.replace(".attn.proj", ".wo")
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
