@@ -73,9 +73,11 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, make_pp_layers
+from sglang.srt.utils import add_prefix, is_npu, make_pp_layers
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -199,6 +201,20 @@ class Gemma4Router(nn.Module):
             prefix=add_prefix("proj", prefix),
         )
         self._scale_fused = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+            )
+
+            # Opt-in --online-quantization gate:SCHEME converts the loaded FP
+            # router projection once after loading (changes routing numerics).
+            # Without the flag this returns False and the router keeps its
+            # checkpoint precision; offline-quantized router checkpoints are
+            # picked up by the same call when the prefix resolves to a
+            # ModelSlim scheme.
+            self._npu_gate_online = configure_online_gate(
+                self.proj, add_prefix("proj", prefix), quant_config
+            )
 
     def fuse_scale(self):
         """Fold scale * root_size into norm.weight so forward needs no extra mul."""
@@ -211,6 +227,12 @@ class Gemma4Router(nn.Module):
         if not self._scale_fused:
             self.fuse_scale()
         x = self.norm(x)
+        if _is_npu and getattr(self, "_npu_gate_method", None) is not None:
+            # Quantized gate path (online conversion or offline ModelSlim
+            # router); returns FP32 logits directly.
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
+
+            return gate_forward(self.proj, x)
         router_logits, _ = self.proj(x)
         return router_logits
 
@@ -295,6 +317,12 @@ class Gemma4MoE(nn.Module):
             activation=activation,
             reduce_results=reduce_results,
         )
+        if _is_npu:
+            # Capability-selected Ascend TP dispatch/finalize fusions (routed
+            # scale fold, shared finalize skip1). Returns False unless the
+            # dispatcher/quant/EP layout is eligible, so this is a no-op on
+            # unsupported configurations.
+            self.experts.configure_ascend_tp_finalize_fusion()
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
