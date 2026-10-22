@@ -947,6 +947,7 @@ class LogitsProcessor(nn.Module):
 
         fuse_cast_softcap = (
             self.final_logit_softcapping
+            and not (_is_npu or _is_cpu)
             and logits.is_cuda
             and logits.dtype in (torch.float16, torch.bfloat16)
         )
