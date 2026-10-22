@@ -6,6 +6,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
+from sglang.kernels.ops.memory.allocator import alloc_decode_kernel
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -23,7 +24,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
-        self.roundup = page_size - 1
 
     def alloc_extend(
         self,
@@ -41,11 +41,14 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         if num_new_pages is None:
-            num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
-            ).sum()
-            num_new_pages_item = num_new_pages_tensor.item()
+            # Derive the count from the CPU length copies: a device-side sum
+            # forces a .item() sync into every prefill step and serializes the
+            # launch queue right before the extend kernels.
+            num_new_pages_item = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
         else:
             num_new_pages_item = num_new_pages
         if num_new_pages_item > len(self.free_pages):
@@ -119,16 +122,20 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        need_new_pages = (seq_lens % self.page_size == 1).int()
-        end_new_pages = torch.cumsum(need_new_pages, 0)
-        start_new_pages = end_new_pages - need_new_pages
-        if num_new_pages == 0:
-            out_indices = last_loc + 1
-        else:
-            start_new_pages = start_new_pages.clamp(max=num_new_pages - 1)
-            out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
-                start_new_pages
-            ] * self.page_size * need_new_pages
+        # One triton launch replaces the eager chain (eq -> cast -> cumsum ->
+        # cast -> sub -> clamp -> where/index -> mul/add). The cumsum member of
+        # that chain dispatches to the AiCPU engine on Ascend, which serializes
+        # against AiCore work; the kernel computes the same page starts on
+        # device exactly like the CUDA paged allocator does.
+        out_indices = torch.empty((seq_lens.shape[0],), dtype=torch.int64, device=self.device)
+        alloc_decode_kernel[(seq_lens.shape[0],)](
+            seq_lens,
+            last_loc,
+            self.free_pages,
+            out_indices,
+            next_power_of_2(seq_lens.shape[0]),
+            self.page_size,
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
