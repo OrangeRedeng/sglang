@@ -354,6 +354,18 @@ class Gemma4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and layer_type == "full_attention"
+            and getattr(config, "attention_k_eq_v", False)
+        ):
+            # The weight loader duplicates K into V for shared-K/V layers.
+            k_prefix = quant_config._resolve_quant_prefix(add_prefix("k_proj", prefix))
+            if quant_config.quant_description.get(f"{k_prefix}.weight") == "FLOAT":
+                v_key = f"{k_prefix.removesuffix('k_proj')}v_proj.weight"
+                quant_config.quant_description.setdefault(v_key, "FLOAT")
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
