@@ -1395,6 +1395,9 @@ class Gemma4RMSNorm(BaseFusedOp):
 
         self.eps = eps
         self.scale_shift = scale_shift
+        # Lazily built NPU-side weight for the generic scale_shift case; kept
+        # on the module so repeated forwards skip the fold.
+        self._npu_effective_weight: Optional[torch.Tensor] = None
 
     def __repr__(self):
         dim = self.weight.shape[0]
@@ -1423,6 +1426,29 @@ class Gemma4RMSNorm(BaseFusedOp):
                 x, self.weight.data, self.eps, self.scale_shift, self.with_scale
             )
         return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        """aclnn fused path. Without this the router/Gamma4 norms run the
+        native eager chain (pow -> mean -> pow(-0.5) -> mul -> casts), which
+        costs ~6 launches per call and serializes against AiCore work."""
+        if x.numel() == 0:
+            return x
+        weight = self.weight.data
+        if self.with_scale and self.scale_shift == 1.0:
+            # Gemma (+1) semantics: norm(x) * (1 + w), applied by the kernel.
+            output, _ = torch_npu.npu_gemma_rms_norm(x, weight, self.eps)
+            return output
+        if not self.with_scale or self.scale_shift == 0.0:
+            # norm(x) * w. with_scale=False callers keep a folded scale in the
+            # weight buffer (e.g. Gemma4Router folds scale * root_size after
+            # load), so multiplying by the buffer is always correct.
+            return torch_npu.npu_rms_norm(x, weight, self.eps)[0]
+        # Generic scale_shift: fold once into an effective weight and reuse.
+        eff = self._npu_effective_weight
+        if eff is None:
+            eff = (weight.float() + self.scale_shift).to(weight.dtype)
+            self._npu_effective_weight = eff
+        return torch_npu.npu_rms_norm(x, eff, self.eps)[0]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
