@@ -544,11 +544,7 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
-            extend_seq_lens_cpu=(
-                forward_batch.extend_seq_lens_cpu
-                if forward_batch.extend_seq_lens_cpu is not None
-                else None
-            ),
+            extend_seq_lens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
         )
         if forward_batch.forward_mode.is_extend():
             # The captured extend kernels read this metadata object; replay
