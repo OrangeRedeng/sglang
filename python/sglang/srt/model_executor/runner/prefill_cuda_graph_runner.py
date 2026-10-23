@@ -889,6 +889,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
+                elif self.buffer_registry.has_slot("input_embeds"):
+                    # Embeds-capable models (multimodal, EAGLE3 draft): the
+                    # captured body reads the static input_embeds slot, and
+                    # replay fills it via _fill_input_embeds_slot before the
+                    # graph replays. The layer model's own guard rejects
+                    # input_ids and input_embeds both set, so capture the
+                    # explicit-embedding branch exactly like replay runs it.
+                    input_ids = None
+                    for embeds_name in ("input_embeds", "inputs_embeds"):
+                        if embeds_name in kwargs:
+                            kwargs[embeds_name] = forward_batch.input_embeds
+                            break
                 output = self.layer_model.forward(
                     input_ids,
                     positions,
