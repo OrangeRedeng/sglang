@@ -233,5 +233,7 @@ class NPUPrefillGraphBackend(NPUCudaGraphBackend):
         pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
         if pending is not None:
             self._prefill_state_source._npu_prefill_graph_update = None
-            return self.replay_with_input_update(shape_key, cpu_update_input=pending)
+            return self.replay_with_input_update(
+                shape_key, seq_lens=None, cpu_update_input=pending
+            )
         return super().replay(shape_key, static_forward_batch, **kwargs)
