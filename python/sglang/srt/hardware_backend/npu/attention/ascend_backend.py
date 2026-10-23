@@ -1007,8 +1007,29 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+            if forward_mode.is_extend():
+                # Prefill owns a separate stable token buffer (allocated at
+                # first _apply, i.e. the largest bucket during reversed-order
+                # capture); decode's cuda_graph_swa_out_cache_loc does not
+                # exist yet at prefill capture time.
+                buf = prefill_state.get("swa_out_cache_loc")
+                if buf is None:
+                    buf = torch.zeros(
+                        n, dtype=torch.int64, device=self.device
+                    )
+                    prefill_state["swa_out_cache_loc"] = buf
+                elif buf.shape[0] < n:
+                    raise RuntimeError(
+                        "NPU prefill graph swa_out_cache_loc was sized for "
+                        f"{buf.shape[0]} tokens but this batch has {n}; "
+                        "growth after capture would invalidate recorded "
+                        "addresses."
+                    )
+                metadata.swa_out_cache_loc = buf
+            else:
+                buf = self.cuda_graph_swa_out_cache_loc
+            buf[n:].zero_()
+            buf[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         # Compute the host-side KV lengths visible to this attention step. Target
