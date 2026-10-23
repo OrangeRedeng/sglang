@@ -892,6 +892,11 @@ class AscendAttnBackend(AttentionBackend):
             # at replay via NPUGraph.update (see _apply_cuda_graph_metadata).
             state = self._ensure_prefill_graph_state(bs)
             metadata.extend_seq_lens = state["extend_seq_lens"][:bs]
+            if state.get("seq_lens") is None:
+                state["seq_lens"] = torch.zeros(
+                    state["cap"], dtype=torch.int32, device=self.device
+                )
+            metadata.seq_lens = state["seq_lens"][:bs]
             metadata.block_tables = state["block_tables"][:bs, :]
             if self.is_hybrid_swa:
                 metadata.block_tables_swa = state["block_tables_swa"][:bs, :]
@@ -1113,6 +1118,7 @@ class AscendAttnBackend(AttentionBackend):
                 {"seq_lens_list_cumsum": metadata.seq_lens_list_cumsum},
                 {"seq_lens_cpu_int": metadata.seq_lens_cpu_int},
             ]
+            metadata.seq_lens_cpu_list = [int(v) for v in seq_lens_cpu[:bs]]
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
