@@ -462,7 +462,7 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
-    def can_run_prefill_cuda_graph(self, forward_batch: "ForwardBatch") -> bool:
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         """Prefill body-capture capability (NPU prefill CUDA graph).
 
         The captured extend path requires the FIA TND kernel, whose
@@ -471,15 +471,12 @@ class AscendAttnBackend(AttentionBackend):
         sparsity/offload paths build variable host structures that cannot be
         capture-stable, so those configurations keep the eager prefill.
         """
-        if not self.use_fia:
-            return False
-        if get_parallel().dcp_enabled:
-            return False
-        if self.enable_sparsity_driven_kv_offload:
-            return False
-        if self.is_dllm_model:
-            return False
-        return True
+        return (
+            self.use_fia
+            and not get_parallel().dcp_enabled
+            and not self.enable_sparsity_driven_kv_offload
+            and not self.is_dllm_model
+        )
 
     def _get_kv_lens_and_block_tables(
         self,
@@ -546,7 +543,17 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
+            extend_seq_lens_cpu=(
+                forward_batch.extend_seq_lens_cpu
+                if forward_batch.extend_seq_lens_cpu is not None
+                else None
+            ),
         )
+        if forward_batch.forward_mode.is_extend():
+            # The captured extend kernels read this metadata object; replay
+            # refreshes its contents in place before each NPUGraph replay.
+            self.forward_metadata = self.graph_metadata[bs]
+            self.graph_mode = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -936,6 +943,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1011,9 +1019,10 @@ class AscendAttnBackend(AttentionBackend):
             # actual_seq_kvlen). Those cannot be captured with per-batch
             # values, so stash them for NPUGraph.update right before replay
             # (NPUPrefillGraphBackend.replay pops _npu_prefill_graph_update).
-            extend_lens_cpu = [
-                int(v) for v in forward_batch.extend_seq_lens_cpu[:bs]
-            ]
+            assert extend_seq_lens_cpu is not None, (
+                "NPU prefill graph metadata requires extend_seq_lens_cpu"
+            )
+            extend_lens_cpu = [int(v) for v in extend_seq_lens_cpu[:bs]]
             metadata.extend_seq_lens[:bs].copy_(
                 torch.tensor(extend_lens_cpu, dtype=torch.int32, device=self.device)
             )
@@ -1021,9 +1030,7 @@ class AscendAttnBackend(AttentionBackend):
                 extend_lens_cpu, dtype=torch.int32
             )
             metadata.seq_lens_list_cumsum = np.cumsum(extend_lens_cpu).tolist()
-            metadata.seq_lens_cpu_int = [
-                int(v) for v in forward_batch.seq_lens_cpu[:bs]
-            ]
+            metadata.seq_lens_cpu_int = [int(v) for v in seq_lens_cpu[:bs]]
             self._npu_prefill_graph_update = [
                 {"seq_lens_list_cumsum": metadata.seq_lens_list_cumsum},
                 {"seq_lens_cpu_int": metadata.seq_lens_cpu_int},
