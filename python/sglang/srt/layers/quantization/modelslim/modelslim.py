@@ -224,6 +224,21 @@ class ModelSlimConfig(QuantizationConfig):
             candidates.append(f"{prefix}.linear")
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+        # GDN (Qwen3-Next family) checkpoints quantize the projections under
+        # their checkpoint-split names, while the runtime module is the merged
+        # one. Without these aliases the merged prefix misses the description
+        # entirely and the projection silently falls back to BF16 (and its
+        # checkpoint scales then fail to find their params). The first
+        # candidate whose ".weight" exists in the description wins; a merged
+        # checkpoint key still takes precedence because it is tried first.
+        if ".in_proj_qkvz" in prefix:
+            parent = prefix.rsplit(".", 1)[0]
+            candidates.append(f"{parent}.in_proj_qkv")
+            candidates.append(f"{parent}.in_proj_z")
+        if ".in_proj_ba" in prefix:
+            parent = prefix.rsplit(".", 1)[0]
+            candidates.append(f"{parent}.in_proj_b")
+            candidates.append(f"{parent}.in_proj_a")
 
         for candidate in list(candidates):
             if candidate.startswith("language_model."):
