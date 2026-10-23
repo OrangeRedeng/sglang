@@ -552,7 +552,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_extend():
             # The captured extend kernels read this metadata object; replay
             # refreshes its contents in place before each NPUGraph replay.
-            self.forward_metadata = self.graph_metadata[bs]
+            self.forward_metadata = self.prefill_graph_state["metadata"][bs]
             self.graph_mode = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -823,6 +823,52 @@ class AscendAttnBackend(AttentionBackend):
         """
         pass
 
+    def _ensure_prefill_graph_state(self, bs: int) -> dict:
+        """Lazily allocate the prefill (extend) body-capture state.
+
+        Kept separate from ``graph_metadata``: the prefill phase captures
+        BEFORE the decode runner calls init_cuda_graph_state, and decode's
+        re-init replaces that dict wholesale, which would orphan the buffers
+        the already-captured prefill graphs recorded. Buffers are sized with
+        headroom on first use; growing them after capture would invalidate
+        recorded addresses, so a later larger bs raises instead.
+        """
+        state = getattr(self, "prefill_graph_state", None)
+        if state is None:
+            total_context_len = self.max_context_len + self.page_size - 1
+            width = total_context_len // self.page_size
+            cap = max(bs, 64)
+            state = {
+                "cap": cap,
+                "block_tables": torch.empty(
+                    (cap, width), dtype=torch.int32, device=self.device
+                ),
+                "extend_seq_lens": torch.zeros(
+                    cap, dtype=torch.int32, device=self.device
+                ),
+                "metadata": {},
+            }
+            if self.is_hybrid_swa:
+                state["block_tables_swa"] = torch.empty(
+                    (cap, width), dtype=torch.int32, device=self.device
+                )
+                state["swa_mask"] = torch.ones(
+                    (cap, 1, total_context_len),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                state["swa_indices"] = torch.arange(
+                    total_context_len, device=self.device, dtype=torch.int32
+                )
+            self.prefill_graph_state = state
+        if state["cap"] < bs:
+            raise RuntimeError(
+                "NPU prefill graph state was sized for "
+                f"{state['cap']} slots but capture/replay needs {bs}; "
+                "all buckets must use one request-slot count."
+            )
+        return state
+
     def _init_cuda_graph_metadata(
         self,
         bs: int,
@@ -844,12 +890,14 @@ class AscendAttnBackend(AttentionBackend):
             # Prefill body capture: the graph reads extend lengths from a
             # stable device buffer; host-side cumsum/kv-len lists are rebound
             # at replay via NPUGraph.update (see _apply_cuda_graph_metadata).
-            buf = self.graph_metadata.get("extend_seq_lens")
-            if buf is None or buf.shape[0] < bs:
-                cap = max(bs, 2 * bs)
-                buf = torch.zeros(cap, dtype=torch.int32, device=self.device)
-                self.graph_metadata["extend_seq_lens"] = buf
-            metadata.extend_seq_lens = buf[:bs]
+            state = self._ensure_prefill_graph_state(bs)
+            metadata.extend_seq_lens = state["extend_seq_lens"][:bs]
+            metadata.block_tables = state["block_tables"][:bs, :]
+            if self.is_hybrid_swa:
+                metadata.block_tables_swa = state["block_tables_swa"][:bs, :]
+                metadata.swa_mask = state["swa_mask"][:bs, :, :]
+            state["metadata"][bs] = metadata
+            return metadata
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if get_parallel().dcp_enabled:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -949,7 +997,12 @@ class AscendAttnBackend(AttentionBackend):
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
-        metadata = self.graph_metadata[bs]
+        prefill_state = None
+        if forward_mode.is_extend():
+            prefill_state = self._ensure_prefill_graph_state(bs)
+            metadata = prefill_state["metadata"][bs]
+        else:
+            metadata = self.graph_metadata[bs]
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -997,7 +1050,11 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-            indices = self.graph_metadata["swa_indices"]
+            indices = (
+                prefill_state["swa_indices"]
+                if prefill_state is not None
+                else self.graph_metadata["swa_indices"]
+            )
             start_exp = starts.unsqueeze(1)
             seq_exp = seq_lens_int.unsqueeze(1)
             mask = (indices.unsqueeze(0) < start_exp) | (
