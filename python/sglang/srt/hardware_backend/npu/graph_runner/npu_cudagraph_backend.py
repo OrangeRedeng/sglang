@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -24,6 +25,8 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -223,12 +226,36 @@ class NPUPrefillGraphBackend(NPUCudaGraphBackend):
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
         self._prefill_state_source = cuda_graph_runner.model_runner.attn_backend
-        # Updates are the replay contract for every graph this backend
-        # captures (the extend metadata stashes the host rebinding on every
-        # init). No NPUGraph introspection: torch_npu does not expose a
-        # dispatch-records view here, and probing one mis-detects capable
-        # graphs as record-less, silently pinning prefill to eager.
+        # Optimistic until a capture probe proves otherwise: the extend
+        # metadata stashes a host rebinding on every init, and replay applies
+        # it through NPUGraph.update. Whether the dispatcher actually
+        # registered updatable records is only observable after capture, so
+        # capture_one probes each graph once and downgrades to eager prefill
+        # (via the capability flag) when the graph is record-less.
         self._prefill_state_source._prefill_graph_updates_available = True
+
+    def capture_one(self, shape_key, forward_fn, **kwargs) -> None:
+        super().capture_one(shape_key, forward_fn, **kwargs)
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is None:
+            return
+        self._prefill_state_source._npu_prefill_graph_update = None
+        try:
+            # Apply the capture-consistent values: a no-op semantically, but
+            # it is the only reliable probe for "did the dispatcher record
+            # any updatable host args" on this torch_npu.
+            self._graphs[shape_key].update(cpu_update_input=pending)
+        except RuntimeError as exc:
+            if "0 operators" not in str(exc):
+                raise
+            self._prefill_state_source._prefill_graph_updates_available = False
+            logger.warning(
+                "NPU prefill graph: captured attention ops expose no updatable "
+                "host records on this torch_npu (the TND length lists were not "
+                "registered during capture); prefill will run eager while decode "
+                "keeps its graphs. %s",
+                exc,
+            )
 
     def replay(
         self,
