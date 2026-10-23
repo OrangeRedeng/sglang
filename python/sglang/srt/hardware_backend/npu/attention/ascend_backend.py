@@ -470,6 +470,11 @@ class AscendAttnBackend(AttentionBackend):
         rebind at replay. The per-request BSND loop, DCP metadata paths and
         sparsity/offload paths build variable host structures that cannot be
         capture-stable, so those configurations keep the eager prefill.
+
+        ``_prefill_graph_updates_available`` is set True by the prefill
+        backend's construction and is NOT gated on graph introspection:
+        torch_npu's NPUGraph does not expose a dispatch-records view on this
+        stack, and decode replay has always rebound host lists without one.
         """
         return (
             self.use_fia
@@ -1112,8 +1117,12 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens_list_cumsum = np.cumsum(extend_lens_cpu).tolist()
             metadata.seq_lens_cpu_int = [int(v) for v in seq_lens_cpu[:bs]]
             self._npu_prefill_graph_update = [
-                {"seq_lens_list_cumsum": metadata.seq_lens_list_cumsum},
-                {"seq_lens_cpu_int": metadata.seq_lens_cpu_int},
+                # NPUGraph.update rebinds recorded host arguments by their
+                # aclnn parameter name (decode does the same with
+                # "actual_seq_lengths_kv"); these are the two IntArray args
+                # of npu_fused_infer_attention_score_v2 in the TND call.
+                {"actual_seq_qlen": metadata.seq_lens_list_cumsum},
+                {"actual_seq_kvlen": metadata.seq_lens_cpu_int},
             ]
             metadata.seq_lens_cpu_list = [int(v) for v in seq_lens_cpu[:bs]]
 

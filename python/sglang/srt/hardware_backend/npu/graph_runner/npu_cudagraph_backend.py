@@ -223,16 +223,12 @@ class NPUPrefillGraphBackend(NPUCudaGraphBackend):
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
         self._prefill_state_source = cuda_graph_runner.model_runner.attn_backend
+        # Updates are the replay contract for every graph this backend
+        # captures (the extend metadata stashes the host rebinding on every
+        # init). No NPUGraph introspection: torch_npu does not expose a
+        # dispatch-records view here, and probing one mis-detects capable
+        # graphs as record-less, silently pinning prefill to eager.
         self._prefill_state_source._prefill_graph_updates_available = True
-
-    def capture_one(self, *args, **kwargs) -> None:
-        super().capture_one(*args, **kwargs)
-        # Without dispatch records, replay would retain capture-time lengths.
-        for graph in self._graphs.values():
-            mode = getattr(graph, "graph_dispatch_mode", None)
-            if not getattr(mode, "graph_dispatch_records", None):
-                self._prefill_state_source._prefill_graph_updates_available = False
-                break
 
     def replay(
         self,
