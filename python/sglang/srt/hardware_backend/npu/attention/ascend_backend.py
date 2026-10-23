@@ -473,6 +473,7 @@ class AscendAttnBackend(AttentionBackend):
         """
         return (
             self.use_fia
+            and getattr(self, "_prefill_graph_updates_available", False)
             and not get_parallel().dcp_enabled
             and not self.enable_sparsity_driven_kv_offload
             and not self.is_dllm_model
