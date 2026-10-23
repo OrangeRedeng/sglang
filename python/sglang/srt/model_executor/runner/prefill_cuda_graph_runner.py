@@ -896,11 +896,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     # graph replays. The layer model's own guard rejects
                     # input_ids and input_embeds both set, so capture the
                     # explicit-embedding branch exactly like replay runs it.
+                    dummy_ids = forward_batch.input_ids
                     input_ids = None
                     for embeds_name in ("input_embeds", "inputs_embeds"):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = forward_batch.input_embeds
                             break
+                    # Warmups + capture see real embedding magnitudes
+                    # (all-zero activations would make dynamic-quant scales
+                    # degenerate during capture-time tiling).
+                    embed = getattr(
+                        self.model_runner.model, "get_input_embeddings", None
+                    )
+                    if embed is not None and dummy_ids is not None:
+                        self.buffer_registry.get_slot("input_embeds").slice_for(
+                            1, num_tokens
+                        )[: dummy_ids.shape[0]].copy_(embed()(dummy_ids))
                 output = self.layer_model.forward(
                     input_ids,
                     positions,
