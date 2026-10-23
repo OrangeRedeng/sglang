@@ -462,6 +462,25 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
+    def can_run_prefill_cuda_graph(self, forward_batch: "ForwardBatch") -> bool:
+        """Prefill body-capture capability (NPU prefill CUDA graph).
+
+        The captured extend path requires the FIA TND kernel, whose
+        per-request lengths are plain host lists that NPUGraph.update can
+        rebind at replay. The per-request BSND loop, DCP metadata paths and
+        sparsity/offload paths build variable host structures that cannot be
+        capture-stable, so those configurations keep the eager prefill.
+        """
+        if not self.use_fia:
+            return False
+        if get_parallel().dcp_enabled:
+            return False
+        if self.enable_sparsity_driven_kv_offload:
+            return False
+        if self.is_dllm_model:
+            return False
+        return True
+
     def _get_kv_lens_and_block_tables(
         self,
         kv_lens_cpu: torch.Tensor,
@@ -814,6 +833,16 @@ class AscendAttnBackend(AttentionBackend):
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
+        if forward_mode.is_extend():
+            # Prefill body capture: the graph reads extend lengths from a
+            # stable device buffer; host-side cumsum/kv-len lists are rebound
+            # at replay via NPUGraph.update (see _apply_cuda_graph_metadata).
+            buf = self.graph_metadata.get("extend_seq_lens")
+            if buf is None or buf.shape[0] < bs:
+                cap = max(bs, 2 * bs)
+                buf = torch.zeros(cap, dtype=torch.int32, device=self.device)
+                self.graph_metadata["extend_seq_lens"] = buf
+            metadata.extend_seq_lens = buf[:bs]
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if get_parallel().dcp_enabled:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -974,6 +1003,31 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+
+        if forward_mode.is_extend():
+            # Prefill replay/capture refresh: extend lengths go through the
+            # stable device buffer; the FIA TND kernel additionally consumes
+            # two host-side lists (actual_seq_qlen cumsum and
+            # actual_seq_kvlen). Those cannot be captured with per-batch
+            # values, so stash them for NPUGraph.update right before replay
+            # (NPUPrefillGraphBackend.replay pops _npu_prefill_graph_update).
+            extend_lens_cpu = [
+                int(v) for v in forward_batch.extend_seq_lens_cpu[:bs]
+            ]
+            metadata.extend_seq_lens[:bs].copy_(
+                torch.tensor(extend_lens_cpu, dtype=torch.int32, device=self.device)
+            )
+            metadata.extend_seq_lens_cpu_int = torch.tensor(
+                extend_lens_cpu, dtype=torch.int32
+            )
+            metadata.seq_lens_list_cumsum = np.cumsum(extend_lens_cpu).tolist()
+            metadata.seq_lens_cpu_int = [
+                int(v) for v in forward_batch.seq_lens_cpu[:bs]
+            ]
+            self._npu_prefill_graph_update = [
+                {"seq_lens_list_cumsum": metadata.seq_lens_list_cumsum},
+                {"seq_lens_cpu_int": metadata.seq_lens_cpu_int},
+            ]
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:

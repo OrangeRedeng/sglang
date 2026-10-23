@@ -319,6 +319,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"backend; got '{backend}'."
             )
         super().__init__(model_runner)
+        # Lazy: npu_cudagraph_backend participates in an import cycle through
+        # the runner package; by the time a prefill runner is constructed the
+        # package is fully initialized.
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUPrefillGraphBackend,
+        )
+
+        self._NPUPrefillGraphBackend = NPUPrefillGraphBackend
         self.dllm_attention = model_runner.attn_backend.dllm_attention
         self._backend_can_run_prefill_cuda_graph = (
             self.dllm_attention.can_run_prefill_cuda_graph
@@ -509,7 +517,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = isinstance(
+            self.backend,
+            (FullCudaGraphBackend, self._NPUPrefillGraphBackend),
+        )
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
@@ -523,7 +534,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
         self._capture_lora = self.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
         )
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
@@ -585,7 +601,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if isinstance(
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
+        ):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -658,7 +681,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if isinstance(
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
+        ):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model

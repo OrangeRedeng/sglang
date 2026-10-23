@@ -198,3 +198,40 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+
+
+class NPUPrefillGraphBackend(NPUCudaGraphBackend):
+    """NPU backend for the prefill (extend) phase body capture.
+
+    Same torch.npu.NPUGraph capture/replay mechanics as decode; the prefill
+    runner treats this as a full-style body-capture backend: one graph per
+    token bucket records the transformer stack (layer_model.forward), while
+    the embedding and logits tails run eagerly at replay with live request
+    metadata.
+
+    Attention metadata is capture-stable on device (block tables, seq_lens
+    tensor: refreshed in place via copy_). The two FIA TND host-side inputs
+    (actual_seq_qlen cumsum and actual_seq_kvlen lists) cannot be baked at
+    capture, so the ascend backend stashes fresh values in
+    ``_npu_prefill_graph_update`` at metadata refresh time and replay routes
+    through NPUGraph.update, exactly like the decode runner's seq_lens
+    rebinding.
+    """
+
+    def __init__(self, cuda_graph_runner, *, enable_memory_saver: bool = False) -> None:
+        super().__init__(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
+        self._prefill_state_source = cuda_graph_runner.model_runner.attn_backend
+
+    def replay(
+        self,
+        shape_key: ShapeKey,
+        static_forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> Any:
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is not None:
+            self._prefill_state_source._npu_prefill_graph_update = None
+            return self.replay_with_input_update(shape_key, cpu_update_input=pending)
+        return super().replay(shape_key, static_forward_batch, **kwargs)
