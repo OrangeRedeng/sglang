@@ -1828,7 +1828,7 @@ class AscendAttnBackend(AttentionBackend):
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                         # FIA BSND with paged KV cache (reads prefix tokens from cache)
-                        seq_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+                        seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
                         attn_out = torch.empty(
                             (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                             device=q.device,
@@ -1955,7 +1955,7 @@ class AscendAttnBackend(AttentionBackend):
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                     # FIA BSND with paged KV cache (reads prefix tokens from cache)
-                    seq_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+                    seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
                     attn_output = torch.empty(
                         (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                         device=q.device,
