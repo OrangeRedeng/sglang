@@ -54,12 +54,24 @@ ONLINE_QUANT_SCHEMES = {
 }
 
 
+# Bare --online-quantization values that select the load-time integer online
+# quantization path (NPUOnlineDense/MoEWeightLoader) instead of the scoped
+# post-load TARGET:SCHEME conversion. The raw flag value drives that path;
+# the scoped parser treats them as "no scoped targets".
+BARE_INTEGER_ONLINE_QUANT_MODES = ("w8a8_int", "w4a4_int")
+
+
 def parse_online_quantization(spec: Optional[str]) -> dict:
     """Parse 'TARGET:SCHEME[,TARGET:SCHEME...]' into {target: scheme}.
 
-    Raises ValueError on malformed input; 'all' expands to every target.
+    A bare integer online-quantization mode ('w8a8_int' / 'w4a4_int') is not
+    a scoped conversion request: it returns {} here while the load-time path
+    reads the raw flag value. Raises ValueError on malformed input; 'all'
+    expands to every target.
     """
     if not spec:
+        return {}
+    if spec.strip().lower() in BARE_INTEGER_ONLINE_QUANT_MODES:
         return {}
     parsed = {}
     for pair in spec.split(","):

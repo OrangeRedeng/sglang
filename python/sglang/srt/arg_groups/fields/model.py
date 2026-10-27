@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
+    ONLINE_QUANTIZATION_CHOICES,
     QUANTIZATION_CHOICES,
 )
 from sglang.srt.utils.common import (
@@ -180,16 +181,21 @@ class Model(msgspec.Struct):
         Optional[str],
         Arg(
             help=(
-                "Opt-in online quantization of selected projections after "
-                "checkpoint loading, as 'TARGET:SCHEME' pairs separated by "
-                "commas (e.g. 'gate:w8a8_mxfp8,qkv:w8a8_mxfp8'). Targets: "
-                "'gate' (the routed-expert MoE router gate), 'moe', "
-                "'shared_expert', 'qkv', 'dense', 'all'. Schemes alias the "
-                "Ascend quantization registry: 'w8a8_mxfp8', 'w4a8_mxfp', "
-                "'w4a4_mxfp4', 'w8a8_dynamic' (INT8), 'w4a4_dynamic' (INT4). "
-                "Unlike --quantization this never changes checkpoint "
-                "semantics by default: quantization happens once, after "
-                "loading, and is an explicit accuracy experiment."
+                "Opt-in online quantization of Ascend NPU projections from "
+                "full-precision FP16/BF16 checkpoints. Two forms: a bare "
+                "integer mode -- 'w8a8_int' (W8A8 for supported dense "
+                "projections and MoE experts) or 'w4a4_int' (mixed: dense "
+                "W8A8, MoE w13 W4A4 / w2 W8A8; MoE-only architectures) -- "
+                "which converts weights during loading; or 'TARGET:SCHEME' "
+                "pairs separated by commas (e.g. "
+                "'gate:w8a8_mxfp8,qkv:w8a8_mxfp8') which quantize once after "
+                "loading. Targets: 'gate' (the routed-expert MoE router "
+                "gate), 'moe', 'shared_expert', 'qkv', 'dense', 'all'. "
+                "Schemes alias the Ascend quantization registry: "
+                "'w8a8_mxfp8', 'w4a8_mxfp', 'w4a4_mxfp4', 'w8a8_dynamic' "
+                "(INT8), 'w4a4_dynamic' (INT4). Unlike --quantization this "
+                "never changes checkpoint semantics by default and is an "
+                "explicit accuracy experiment."
             ),
         ),
     ] = None
