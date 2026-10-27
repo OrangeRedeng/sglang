@@ -34,6 +34,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
     gemma_routing_post_topk,
 )
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -423,6 +424,18 @@ class Gemma4Attention(nn.Module):
         self.v_norm = Gemma4RMSNorm(
             self.head_dim, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=False
         )
+        self._use_npu_qkv_norm = (
+            _is_npu
+            and envs.SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM.get()
+            and self.head_dim in (128, 256, 512)
+        )
+        self._fused_qkv_norm = gemma_qkv_rmsnorm
+        if self._use_npu_qkv_norm:
+            from sglang.srt.hardware_backend.npu.gemma4_ops import (
+                npu_gemma4_qkv_rmsnorm,
+            )
+
+            self._fused_qkv_norm = npu_gemma4_qkv_rmsnorm
 
         if layer_type in config.rope_parameters:
             rope_parameters = dict(config.rope_parameters[layer_type])
@@ -496,14 +509,14 @@ class Gemma4Attention(nn.Module):
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            (q.is_cuda or q.is_xpu)
+            (q.is_cuda or q.is_xpu or self._use_npu_qkv_norm)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
         )
         if can_fuse_qkv_norm:
             if is_kv_shared:
-                gemma_qkv_rmsnorm(
+                self._fused_qkv_norm(
                     q,
                     None,
                     None,
@@ -517,7 +530,7 @@ class Gemma4Attention(nn.Module):
                 k = None
                 v = None
             else:
-                gemma_qkv_rmsnorm(
+                self._fused_qkv_norm(
                     q,
                     k,
                     v,

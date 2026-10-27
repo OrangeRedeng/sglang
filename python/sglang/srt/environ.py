@@ -1028,8 +1028,11 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
-    # Experimental: synchronize on phase changes, then use queue 0/1 for prefill/decode.
+    # Experimental: synchronize on phase changes before switching dispatch queues.
     SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE = EnvBool(False)
+    SGLANG_NPU_PREFILL_TASK_QUEUE_MODE = EnvInt(0)
+    SGLANG_NPU_DECODE_TASK_QUEUE_MODE = EnvInt(1)
+    SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the

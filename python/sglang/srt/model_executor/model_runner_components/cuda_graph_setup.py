@@ -645,7 +645,7 @@ def capture_prefill_graph(
     )
 
     if policy := getattr(model_runner, "npu_task_queue_policy", None):
-        policy.set_mode(0)
+        policy.set_mode(policy.prefill_mode)
     prefill_runner = PrefillCudaGraphRunner(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
@@ -737,7 +737,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         )
         GraphRunnerCls = graph_runners[model_runner.device]
     if policy := getattr(model_runner, "npu_task_queue_policy", None):
-        policy.set_mode(1)
+        policy.set_mode(policy.decode_mode)
     runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

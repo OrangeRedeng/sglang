@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class NPUTaskQueuePolicy:
-    def __init__(self, npu):
+    def __init__(self, npu, *, prefill_mode=0, decode_mode=1):
+        if prefill_mode not in (0, 1, 2) or decode_mode not in (0, 1, 2):
+            raise ValueError("NPU task queue modes must be 0, 1, or 2")
+        self.prefill_mode = prefill_mode
+        self.decode_mode = decode_mode
         required = (
             "set_task_queue_enable",
             "get_task_queue_enable",
@@ -33,8 +37,10 @@ class NPUTaskQueuePolicy:
         self._owner_thread = threading.get_ident()
         self._mode = npu.get_task_queue_enable()
         logger.info(
-            "Adaptive NPU task queue enabled: prefill=0, decode=1; "
-            "phase transitions synchronize the device."
+            "Adaptive NPU task queue enabled: prefill=%d, decode=%d; "
+            "phase transitions synchronize the device.",
+            prefill_mode,
+            decode_mode,
         )
 
     @classmethod
@@ -60,15 +66,24 @@ class NPUTaskQueuePolicy:
                 "Adaptive NPU task queues require non-speculative serving without "
                 "PP, two-batch overlap, HiCache, CPU offload, or PD disaggregation."
             )
+        prefill_mode = envs.SGLANG_NPU_PREFILL_TASK_QUEUE_MODE.get()
+        decode_mode = envs.SGLANG_NPU_DECODE_TASK_QUEUE_MODE.get()
+        graph_config = get_exec().graph.cuda_graph_config
+        for phase, mode in (("prefill", prefill_mode), ("decode", decode_mode)):
+            if mode == 2 and getattr(graph_config, phase).backend != "disabled":
+                raise ValueError(
+                    f"NPU task queue mode 2 requires {phase} graphs disabled; "
+                    f"set --cuda-graph-backend-{phase}=disabled"
+                )
         import torch_npu
 
-        return cls(torch_npu.npu)
+        return cls(torch_npu.npu, prefill_mode=prefill_mode, decode_mode=decode_mode)
 
     def before_forward(self, forward_mode):
         if forward_mode.is_decode():
-            self.set_mode(1)
+            self.set_mode(self.decode_mode)
         elif forward_mode.is_extend_without_speculative():
-            self.set_mode(0)
+            self.set_mode(self.prefill_mode)
 
     def set_mode(self, mode):
         if threading.get_ident() != self._owner_thread:

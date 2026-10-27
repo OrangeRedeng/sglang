@@ -107,6 +107,12 @@ def test_missing_runtime_api_fails_early():
 @pytest.fixture
 def runtime(monkeypatch):
     execution = SimpleNamespace(
+        graph=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled"),
+                decode=SimpleNamespace(backend="full"),
+            )
+        ),
         offload=SimpleNamespace(cpu_offload_gb=0, offload_group_size=-1),
         overlap=SimpleNamespace(enable_two_batch_overlap=False),
     )
@@ -189,3 +195,40 @@ def test_supported_runtime_uses_public_api(runtime, monkeypatch):
         )
     policy.before_forward(ForwardMode.EXTEND)
     assert npu.calls == ["sync", 0]
+
+
+def test_eager_prefill_two_decode_zero(runtime, monkeypatch):
+    npu = FakeNPU()
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu=npu))
+    with (
+        task_queue.envs.SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE.override(True),
+        task_queue.envs.SGLANG_NPU_PREFILL_TASK_QUEUE_MODE.override(2),
+        task_queue.envs.SGLANG_NPU_DECODE_TASK_QUEUE_MODE.override(0),
+    ):
+        policy = task_queue.NPUTaskQueuePolicy.create(
+            device="npu", is_draft_worker=False
+        )
+    for mode in (ForwardMode.EXTEND, ForwardMode.EXTEND, ForwardMode.DECODE):
+        policy.before_forward(mode)
+    assert npu.calls == ["sync", 2, "sync", 0]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_mode_two_requires_graphs_disabled(runtime, phase):
+    execution = runtime[0]
+    getattr(execution.graph.cuda_graph_config, phase).backend = "full"
+    setting = getattr(task_queue.envs, f"SGLANG_NPU_{phase.upper()}_TASK_QUEUE_MODE")
+    with (
+        task_queue.envs.SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE.override(True),
+        setting.override(2),
+        pytest.raises(ValueError, match=f"requires {phase} graphs disabled"),
+    ):
+        task_queue.NPUTaskQueuePolicy.create(device="npu", is_draft_worker=False)
+
+
+@pytest.mark.parametrize("modes", [(3, 0), (0, -1)])
+def test_rejects_invalid_modes(modes):
+    with pytest.raises(ValueError, match="must be 0, 1, or 2"):
+        task_queue.NPUTaskQueuePolicy(
+            FakeNPU(), prefill_mode=modes[0], decode_mode=modes[1]
+        )

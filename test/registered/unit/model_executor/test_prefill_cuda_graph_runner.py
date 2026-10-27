@@ -299,6 +299,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         model_runner = SimpleNamespace(
             device="cuda",
             npu_task_queue_policy=SimpleNamespace(
+                prefill_mode=0,
                 set_mode=lambda mode: capture_events.append(mode)
             ),
             gpu_id=0,
