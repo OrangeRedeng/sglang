@@ -541,7 +541,10 @@ def initialize_moe_config():
         from sglang.srt.hardware_backend.npu.moe.norm_gate import GATE_SCHEME_CONTRACTS
 
         for target, scheme in moe.online_quantization.items():
-            allowed = ("W8A8_MXFP8",) if target == "moe" else GATE_SCHEME_CONTRACTS
+            # INT-only A3 stack: gate targets accept the INT gate contracts; the
+            # routed 'moe' target has no scoped conversion (use bare
+            # w8a8_int/w4a4_int load-time modes instead).
+            allowed = GATE_SCHEME_CONTRACTS if target != "moe" else ()
             if scheme not in allowed:
                 raise ValueError(f"Online {target}:{scheme} conversion is unsupported")
     # Seeded with the user's intent; each model's gate refines the ACTIVE

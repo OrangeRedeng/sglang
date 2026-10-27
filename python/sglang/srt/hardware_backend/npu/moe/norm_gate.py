@@ -21,14 +21,16 @@ logger = logging.getLogger(__name__)
 # Gate weight formats this module can prepare online. MXFP8 is the first
 # choice (documented native FP32 matmul output on Ascend 950); INT8 matmuls
 # return FP16/BF16 and the FP32 cast afterwards is NOT FP32 accumulation.
+# INT-only on the A3 stack: MXFP8 gate/norm conversion is excluded (the MX
+# contract machinery below stays only for upstream checkpoint paths).
 GATE_SCHEME_CONTRACTS = {
-    "W8A8_MXFP8": MXFP8,
     "W8A8_DYNAMIC": INT8,
 }
 # Declined online gate schemes, with recorded reasons (fail closed):
 GATE_SCHEME_DECLINED = {
-    "W4A8_MXFP": "packed-FP4 gate weights need offline-validated packing ABI",
-    "W4A4_MXFP4": "MXFP4 gate accuracy/packing is not validated",
+    "W8A8_MXFP8": "MXFP excluded on the A3 INT-only online stack",
+    "W4A8_MXFP": "MXFP excluded on the A3 INT-only online stack",
+    "W4A4_MXFP4": "MXFP excluded on the A3 INT-only online stack",
     "W4A4_DYNAMIC": "INT4 gate packing ABI and top-k stability unproven",
 }
 

@@ -42,10 +42,6 @@ E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 # --online-quantization grammar: TARGET:SCHEME pairs.
 ONLINE_QUANT_TARGETS = ("gate", "moe", "shared_expert", "qkv", "dense", "all")
 ONLINE_QUANT_SCHEMES = {
-    "w8a8_mxfp8": "W8A8_MXFP8",
-    "w8a8_mxfp": "W8A8_MXFP8",
-    "w4a8_mxfp": "W4A8_MXFP",
-    "w4a4_mxfp4": "W4A4_MXFP4",
     "w8a8_dynamic": "W8A8_DYNAMIC",
     "w8a8_int8": "W8A8_DYNAMIC",
     # Friendly alias: dynamic INT8 (per-token activation, per-channel weight).
