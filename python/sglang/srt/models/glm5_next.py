@@ -808,6 +808,32 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_last_layer=terminal,
             ).residual_ops()
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
+        # GLM-5.3 (NPU): fuse the post-attention RMSNorm with the FFN boundary's
+        # INT quantization when the layer's MoE/linear block selected a format —
+        # the same NORM_QUANT_READOUT wiring DeepseekV2DecoderLayer uses.
+        from sglang.srt.utils import is_npu
+
+        if is_npu() and type(self.post_attention_layernorm) is RMSNorm:
+            import dataclasses as _dataclasses
+
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+                select_moe_boundary_quant_format,
+            )
+            from sglang.srt.layers.layer_boundary.residual.add_norm import (
+                NORM_QUANT_READOUT,
+            )
+
+            if isinstance(self.mlp, Glm5NextMoE):
+                ffn_quant_format = select_moe_boundary_quant_format(self.mlp)
+            elif isinstance(self.mlp, Glm5NextMLP):
+                ffn_quant_format = select_linear_boundary_quant_format(
+                    [self.mlp.gate_up_proj]
+                )
+            else:
+                ffn_quant_format = ""
+            if ffn_quant_format:
+                ffn = _dataclasses.replace(ffn, read=NORM_QUANT_READOUT)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 attn,
