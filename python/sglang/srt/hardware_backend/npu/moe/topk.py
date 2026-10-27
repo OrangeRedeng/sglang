@@ -2,6 +2,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel_npu.norm.l1_norm import l1_norm as _l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -11,10 +12,21 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+
+
+def _l1_norm_fake(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.new_empty.default(input, input.shape, dtype=torch.float32)
+
+
+@register_custom_op(op_name="npu_topk_l1_norm", fake_impl=_l1_norm_fake)
+def l1_norm(input: torch.Tensor) -> torch.Tensor:
+    # Keep external allocation and Triton launch code outside Dynamo tracing.
+    return _l1_norm(input)
 
 
 def fused_topk_npu(
@@ -102,8 +114,6 @@ def fused_topk_npu(
         )
 
         if renormalize:
-            from sgl_kernel_npu.norm.l1_norm import l1_norm
-
             topk_weights = l1_norm(
                 topk_weights
                 if topk_config.num_shared_topk_slots == 0

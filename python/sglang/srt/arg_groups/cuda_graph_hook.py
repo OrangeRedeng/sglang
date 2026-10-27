@@ -418,6 +418,28 @@ def validate_cuda_graph_config(server_args: Any):
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
             )
+    if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
+        if cfg.device != "npu":
+            raise ValueError("tc_piecewise prefill is only supported on NPU")
+        prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+        if prefill_backend != "ascend":
+            raise ValueError("tc_piecewise NPU prefill requires ascend attention")
+        if (
+            cfg.pp_size > 1
+            or cfg.dcp_size > 1
+            or cfg.attn_cp_size > 1
+            or cfg.enable_dp_attention
+            or cfg.enable_lora
+            or cfg.speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "tc_piecewise NPU prefill does not support PP, CP, DP attention, "
+                "LoRA, or speculative decoding"
+            )
+        logger.warning(
+            "Ascend tc_piecewise prefill is experimental; attention runs eagerly "
+            "between captured compute pieces."
+        )
 
 
 def _resolve_max_context_size(

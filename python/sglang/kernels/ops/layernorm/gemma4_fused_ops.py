@@ -243,6 +243,63 @@ def _gemma_qkv_rmsnorm_kernel(
                 )
 
 
+@triton.jit
+def _gemma_qkv_rmsnorm_npu_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    Q_w_ptr,
+    K_w_ptr,
+    stride_q_m,
+    stride_k_m,
+    stride_v_m,
+    M,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    eps,
+    HAS_KV: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    total_heads = NUM_Q_HEADS + (2 * NUM_KV_HEADS if HAS_KV else 0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HEAD_DIM
+    # Bind programs to vector cores and distribute token/head rows within each core.
+    for index in range(tl.program_id(0), M * total_heads, tl.num_programs(0)):
+        m = index // total_heads
+        h = index % total_heads
+        if h < NUM_Q_HEADS:
+            _gemma_qkv_rmsnorm_store(
+                Q_ptr, Q_w_ptr, stride_q_m, m, h, cols, mask, HEAD_DIM, eps, True
+            )
+        elif HAS_KV and h < NUM_Q_HEADS + NUM_KV_HEADS:
+            _gemma_qkv_rmsnorm_store(
+                K_ptr,
+                K_w_ptr,
+                stride_k_m,
+                m,
+                h - NUM_Q_HEADS,
+                cols,
+                mask,
+                HEAD_DIM,
+                eps,
+                True,
+            )
+        elif HAS_KV:
+            _gemma_qkv_rmsnorm_store(
+                V_ptr,
+                Q_w_ptr,
+                stride_v_m,
+                m,
+                h - NUM_Q_HEADS - NUM_KV_HEADS,
+                cols,
+                mask,
+                HEAD_DIM,
+                eps,
+                False,
+            )
+
+
 def gemma_qkv_rmsnorm(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -267,7 +324,8 @@ def gemma_qkv_rmsnorm(
 
     If k and v are both None (KV-shared layer), only Q is normalized.
     """
-    assert q.is_cuda or q.is_xpu
+    is_npu = q.device.type in ("npu", "privateuseone")
+    assert q.is_cuda or q.is_xpu or is_npu
     assert q.stride(-1) == 1, "Q's last dim must be contiguous"
     assert q_weight.shape[-1] == head_dim
     M = q.shape[0] if q.dim() >= 2 else 1
@@ -275,9 +333,47 @@ def gemma_qkv_rmsnorm(
 
     has_kv = k is not None and v is not None
     if has_kv:
-        assert (k.is_cuda and v.is_cuda) or (k.is_xpu and v.is_xpu)
+        assert (
+            (k.is_cuda and v.is_cuda)
+            or (k.is_xpu and v.is_xpu)
+            or (is_npu and k.device == q.device and v.device == q.device)
+        )
         assert k.stride(-1) == 1 and v.stride(-1) == 1
         assert k_weight is not None and k_weight.shape[-1] == head_dim
+
+    if is_npu:
+        assert q.ndim == 2 and q.shape[1] == num_q_heads * head_dim
+        assert head_dim in (128, 256, 512)
+        assert (k is None) == (v is None)
+        assert q_weight.numel() == head_dim and q_weight.stride(0) == 1
+        if has_kv:
+            assert k.ndim == v.ndim == 2
+            assert k.shape == v.shape == (M, num_kv_heads * head_dim)
+            assert k_weight.numel() == head_dim and k_weight.stride(0) == 1
+        if M == 0:
+            return
+        from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
+        _, vector_cores = get_device_properties()
+        total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)
+        _gemma_qkv_rmsnorm_npu_kernel[(min(vector_cores, M * total_heads),)](
+            q,
+            k if has_kv else q,
+            v if has_kv else q,
+            q_weight,
+            k_weight if has_kv else q_weight,
+            q.stride(0),
+            k.stride(0) if has_kv else 0,
+            v.stride(0) if has_kv else 0,
+            M,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            HEAD_DIM=head_dim,
+            eps=eps,
+            HAS_KV=has_kv,
+            BLOCK=BLOCK,
+        )
+        return
 
     if M <= 256 or (M == 512 and is_sm100_supported()):
         total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)

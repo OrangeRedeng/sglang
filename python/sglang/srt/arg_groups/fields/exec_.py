@@ -26,10 +26,13 @@ from sglang.srt.arg_groups.choices import (
     RL_ON_POLICY_TARGET_CHOICES,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
+    ALLOWED_BACKENDS_PER_PHASE,
     Backend,
     CudaGraphConfig,
+    Phase,
     parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
+    parse_cuda_graph_prefill_backend_arg,
 )
 from sglang.srt.utils.common import human_readable_int
 
@@ -606,7 +609,7 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_config: A[
         Optional[CudaGraphConfig],
         Arg(
-            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}\'. Allowed backends per phase: full, breakable, disabled. JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
+            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}\'. Allowed backends: full, breakable, disabled; Ascend prefill also accepts tc_piecewise. JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
             type_parser=parse_cuda_graph_config_arg,
         ),
     ] = None
@@ -619,11 +622,11 @@ class ExecGraph(msgspec.Struct):
         ),
     ] = None
     cuda_graph_backend_prefill: A[
-        Optional[Literal["full", "breakable", "disabled"]],
+        Optional[Literal["full", "breakable", "disabled", "tc_piecewise"]],
         Arg(
-            help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
-            choices=Backend.ALL,
-            type_parser=parse_cuda_graph_backend_arg,
+            help="Backend for the prefill phase. tc_piecewise enables experimental Ascend piecewise capture with eager attention. Folds into cuda_graph_config[prefill].backend.",
+            choices=ALLOWED_BACKENDS_PER_PHASE[Phase.PREFILL],
+            type_parser=parse_cuda_graph_prefill_backend_arg,
         ),
     ] = None
     cuda_graph_max_bs_decode: A[

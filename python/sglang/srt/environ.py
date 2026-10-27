@@ -1158,6 +1158,8 @@ class Envs:
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
+    # Opt-in fused Gemma4 QKV norm (dual-contract INT8 gate path).
+    SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time so arch35 (Atlas A5) dense linears run on the native quantized

@@ -184,6 +184,28 @@ class RadixAttention(nn.Module):
             q, k, v, self, forward_batch, save_kv_cache, **kwargs
         )
 
+
+def _new_attention_output(
+    layer: RadixAttention, q: torch.Tensor, v: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """An uninitialized buffer for the layer's attention output over q's rows.
+
+    Its dtype follows v (the model dtype) when available: qk-norm may emit q in
+    a different dtype without changing the dtype the backend writes. FP8 q/v
+    (e.g. mxfp8 KV-cache attention) still produce a bf16 attention output;
+    sizing the buffer off an fp8 dtype would silently cast-copy the result to
+    fp8.
+    """
+    out_dtype = v.dtype if v is not None else q.dtype
+    if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        out_dtype = torch.bfloat16
+    # transfer_to_npu wraps the public factories with Dynamo-disabled helpers.
+    if layer.qk_head_dim != layer.v_head_dim:
+        return torch.ops.aten.new_empty.default(
+            q, (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+        )
+    return torch.ops.aten.empty_like.default(q, dtype=out_dtype)
+
     @eager_on_graph
     def _eager_attention(
         self,

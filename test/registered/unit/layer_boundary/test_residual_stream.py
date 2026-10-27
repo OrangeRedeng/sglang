@@ -21,6 +21,7 @@ from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import (
+    DeclaredSum,
     OwedOutput,
     ResidualStream,
 )
@@ -34,6 +35,36 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestResidualStream(CustomTestCase):
+    def test_fullgraph_records_completes_and_releases_contributions(self):
+        try:
+            for deferred in (False, True):
+                with self.subTest(deferred=deferred):
+
+                    def forward(value, residual):
+                        stream = ResidualStream(residual)
+                        owed = (
+                            DeclaredSum(SumGroup.ATTN_TP, lambda x: x * 2)
+                            if deferred
+                            else None
+                        )
+                        hidden = stream.record(value, PLAIN_ADD, declared_sum=owed)
+                        contribution = stream.pending
+                        result = stream.complete(hidden) + stream.residual
+                        stream.write(result)
+                        assert contribution.value is None
+                        assert contribution.update is None
+                        assert contribution.owed is None
+                        return stream.residual
+
+                    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+                    for rows in (2, 5):
+                        value = torch.arange(rows * 4).reshape(rows, 4).float()
+                        residual = torch.ones_like(value)
+                        expected = value * (2 if deferred else 1) + residual
+                        torch.testing.assert_close(compiled(value, residual), expected)
+        finally:
+            torch._dynamo.reset()
+
     def setUp(self):
         self.group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x.mul_(2)))
         self.residual = torch.full((2, 4), 3.0)

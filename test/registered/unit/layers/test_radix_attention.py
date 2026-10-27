@@ -51,6 +51,61 @@ def make_batch(tokens=2, rows=4, return_lse=False):
         mha_return_lse=return_lse,
     )
 
+class TestRadixAttentionGraphInterface(CustomTestCase):
+    def test_attention_output_fullgraph_avoids_transfer_wrappers(self):
+        empty_like = torch.empty_like
+        new_empty = torch.Tensor.new_empty
+
+        @torch.compiler.disable
+        def remap_devices(args):
+            return args
+
+        def wrapped_empty_like(*args, **kwargs):
+            return empty_like(*remap_devices(args), **kwargs)
+
+        def wrapped_new_empty(*args, **kwargs):
+            return new_empty(*remap_devices(args), **kwargs)
+
+        try:
+            for v_dim in (3, 5):
+                layer = SimpleNamespace(
+                    qk_head_dim=3, v_head_dim=v_dim, tp_q_head_num=2
+                )
+
+                def allocate(q, v):
+                    return radix_attention_module._new_attention_output(layer, q, v)
+
+                query = torch.zeros((4, 2, 6))[..., ::2]
+                value = torch.zeros((4, 2, v_dim), dtype=torch.bfloat16)
+                expected = (
+                    empty_like(query, dtype=value.dtype)
+                    if v_dim == 3
+                    else new_empty(query, (4, 2 * v_dim), dtype=value.dtype)
+                )
+                with (
+                    patch.object(torch, "empty_like", wrapped_empty_like),
+                    patch.object(torch.Tensor, "new_empty", wrapped_new_empty),
+                ):
+                    compiled = torch.compile(allocate, backend="eager", fullgraph=True)
+                    output = compiled(query, value)
+                self.assertEqual(output.shape, expected.shape)
+                self.assertEqual(output.dtype, expected.dtype)
+                self.assertEqual(output.stride(), expected.stride())
+                self.assertEqual(output.device, query.device)
+        finally:
+            torch._dynamo.reset()
+
+    @staticmethod
+    def _new_layer() -> RadixAttention:
+        layer = RadixAttention(
+            num_heads=2,
+            head_dim=3,
+            scaling=1.0,
+            num_kv_heads=2,
+            layer_id=0,
+        )
+        return layer
+
 
 @pytest.mark.parametrize("breakable", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
