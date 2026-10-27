@@ -316,11 +316,12 @@ def _new_attention_output(
     out_dtype = v.dtype if v is not None else q.dtype
     if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         out_dtype = torch.bfloat16
+    # transfer_to_npu wraps the public factories with Dynamo-disabled helpers.
     if layer.qk_head_dim != layer.v_head_dim:
-        return q.new_empty(
-            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+        return torch.ops.aten.new_empty.default(
+            q, (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
         )
-    return torch.empty_like(q, dtype=out_dtype)
+    return torch.ops.aten.empty_like.default(q, dtype=out_dtype)
 
 
 # Per-row attention inputs beside Q, K and V that the tc-piecewise op schema
