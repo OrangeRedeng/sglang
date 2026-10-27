@@ -169,8 +169,12 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     Uses ``npu_moe_init_routing_v2``, which integrates expert token counting.
     """
 
-    def __init__(self, quant_mode: int = -1):
+    def __init__(
+        self, quant_mode: int = -1, active_expert_range: Optional[list[int]] = None
+    ):
         self.quant_mode = quant_mode
+        self.active_expert_range = active_expert_range
+        self.row_idx_type = 0
 
     def _init_routing(
         self,

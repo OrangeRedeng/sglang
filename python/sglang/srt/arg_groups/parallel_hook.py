@@ -249,11 +249,8 @@ def handle_decode_context_parallelism(server_args: Any):
     if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
         raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
     if cfg.dcp_size > 1:
-        # initialize_model_parallel rejects an uneven tp/dcp split too, just
-        # before it chunks each TP group into DCP groups. Repeat it here so the
-        # failure lands at argument resolution -- naming the flags the operator
-        # actually typed -- rather than after torch.distributed is up on every
-        # rank.
+        # initialize_model_parallel rejects this too; repeat it here so the
+        # failure names the flags before torch.distributed comes up.
         if cfg.tp_size % cfg.dcp_size != 0:
             raise ValueError(
                 "--tp-size / --tensor-parallel-size must be evenly divisible "
@@ -262,19 +259,9 @@ def handle_decode_context_parallelism(server_args: Any):
                 f"(tp_size % dcp_size = {cfg.tp_size % cfg.dcp_size})."
             )
 
-        # Decode context parallelism must also nest inside a single
-        # attention-TP group, i.e. one DP replica at one CP rank. Both group
-        # families are built as contiguous chunks of the same TP group -- DCP
-        # in chunks of dcp_size, attention-TP in chunks of attn_tp_size -- so
-        # they nest exactly when attn_tp_size divides evenly by dcp_size.
-        # Without this, --tp-size 16 --dp-size 2 --enable-dp-attention
-        # --dcp-size 16 passes the check above and then builds a 16-rank DCP
-        # group straddling two DP replicas that are decoding different batches.
-        #
-        # attn_dp_size is recomputed here instead of read off the resolved
-        # view because this handler runs before handle_dwdp and
-        # handle_data_parallelism: DWDP forces dp_size/enable_dp_attention
-        # afterwards, so its width has to be folded in by hand.
+        # DCP must also nest inside one attention-TP group, or a DCP group can
+        # straddle two DP replicas decoding different batches. attn_dp_size is
+        # recomputed because this handler runs before handle_dwdp.
         attn_dp_size = (
             cfg.dwdp_size
             if cfg.dwdp_size > 1
@@ -797,7 +784,10 @@ def handle_eplb_and_dispatch(server_args: Any):
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
-    needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
+    needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend in (
+        "none",
+        "allreduce-deepep",
+    )
 
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
         cfg.ep_dispatch_algorithm is None
@@ -820,7 +810,7 @@ def handle_eplb_and_dispatch(server_args: Any):
             f"--ep-dispatch-algorithm {cfg.ep_dispatch_algorithm} picks a "
             "different physical replica per rank, which only holds up when an "
             "a2a backend routes each token to a single rank. Use "
-            "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
+            "--ep-dispatch-algorithm dynamic with a backend using replicated inputs."
         )
 
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":

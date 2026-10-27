@@ -1051,8 +1051,41 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_NPU_AUTO_HCCL_BUFFSIZE = EnvBool(False)
+    SGLANG_NPU_HCCL_HEADROOM = EnvFloat(1.25)
+    SGLANG_NPU_HCCL_QUANTUM_MB = EnvInt(32)
+    SGLANG_NPU_HCCL_MIN_MB = EnvInt(64)
+    SGLANG_NPU_HCCL_MAX_MB = EnvInt(1024)
+    SGLANG_NPU_TUNING_PROFILE = EnvBool(False)
+    SGLANG_NPU_TUNING_CACHE_DIR = EnvStr("~/.cache/sglang/npu_tuning")
+    SGLANG_NPU_AUTOTUNE_DRY_RUN = EnvBool(False)
+    SGLANG_NPU_AUTO_STREAM_THRESHOLDS = EnvBool(False)
+    SGLANG_NPU_AUTO_DCP_EXTEND_GATHER_PIECE_ROWS = EnvBool(False)
+    SGLANG_NPU_DCP_SCRATCH_BUDGET_MB = EnvInt(256)
+    SGLANG_NPU_MEMORY_DIAGNOSTICS = EnvBool(False)
+    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
+    SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Opt-in A/B stages; shared finalization also requires scaled routing weights.
+    SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE = EnvBool(False)
+    SGLANG_NPU_TP_MOE_PREQUANT_INPUT = EnvBool(False)
+    SGLANG_NPU_TP_MOE_REUSE_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_SHARED_GMM1 = EnvBool(False)
+    # An explicit mode overrides the legacy SHARED_GMM1 switch.
+    SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
+    SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_TP_MOE_SHARED_STREAM_START = EnvStr("pre_gate")
+    SGLANG_NPU_TP_MOE_SHARED_PIPELINE = EnvStr("legacy")
+    SGLANG_NPU_RESOURCE_SCHED_DIAGNOSTICS = EnvBool(False)
+    SGLANG_NPU_TP_MOE_NORM_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
@@ -1074,32 +1107,21 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
-    # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
-    # ON: measured 1M TTFT 2011 -> 491 s and a 960k warm-up 456 s against ~33
-    # minutes. Set 0 to restore the unsharded indexer for an A/B.
+    # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
-    # DSA prefill: shard the whole attention block's TOKENS across the
-    # attention-TP group -- every rank computes every head for its own slice,
-    # instead of its own heads for every token. Consumes no ranks, so it
-    # composes with DCP, and with the indexer-only sharding above rather than
-    # replacing it. No weight is resharded: the query is redistributed across
-    # attention TP by all-to-all and put back after attention. Read at startup
-    # because it decides whether the full-head RadixAttention gets built.
-    # ON: measured a 16k tail on a 958k cached prefix 7.699 -> 4.757 s (-38.2%)
-    # against a same-session control, with prefill logprobs bitwise identical at
-    # all 44,062 paired positions. Set 0 to restore the unsharded attention.
+    SGLANG_NPU_DSA_OVERLAP_QNOPE_ROPE = EnvBool(False)
+    SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM = EnvBool(False)
+    SGLANG_NPU_DSA_EAGER_INDEXER = EnvBool(False)
+    # Isolate indexer scheduling from unrelated global multistream features.
+    SGLANG_NPU_DSA_INDEXER_STREAM_MODE = EnvStr("legacy")
+    SGLANG_NPU_DSA_INDEXER_HADAMARD_MODE = EnvStr("matmul")
+    # DSA prefill: shard the attention block's tokens across attention-TP, so
+    # every rank computes every head for its own slice, with the query
+    # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
-    # DSA-CP: also shard batches that carry more than one request, by passing
-    # full per-request KV lengths and dropping the operator's causal crop. Only
-    # where every request's prefix reaches index_topk -- below that the crop is
-    # load-bearing and the batch keeps the unsharded path. See
-    # dsa_cp.dsa_cp_multi_request_enabled.
-    # ON: measured three ~4k tails on a 958k cached prefix (GLM-5.2, A3, TP16
-    # DCP16) in one forward at 9.21 -> ~6.5 s, with prefill logprobs bitwise
-    # identical to the pre-lift path at all 12,311 tail positions, for the
-    # batch and for the same tails one at a time. AISBench (990k shared prefix,
-    # 16 x ~10.8k at concurrency 16): measured phase 110.2 -> 79.1 s. Set 0 for
-    # the pre-lift path.
+    # DSA-CP: also shard batches carrying more than one request, by passing
+    # full per-request KV lengths and dropping the operator's causal crop.
+    # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
     # DCP extend on NPU: let the sparse operator read the gathered prefix in the
     # rank-major order the all-gather already produced, remapping the top-k
@@ -1274,18 +1296,11 @@ class Envs:
     # between the two. Under graph capture the synchronous gather is kept
     # (see the pre-issue site), so captured decode is unaffected.
     SGLANG_NPU_DCP_DECODE_Q_PREISSUE = EnvBool(True)
-    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
-    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
-    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
-    # the scratch a layer holds beside the gathered context. The default is
-    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
-    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
-    # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
-    # Ascend DeepEP library; the MTP draft-build scopes override it to False).
+    # Kept only so legacy deployments can migrate to the dispatcher dtype CLI.
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")

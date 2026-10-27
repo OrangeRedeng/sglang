@@ -228,7 +228,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * num_indexer_layers
             )
             if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                # FP32 quantization scale per token per indexer layer.
+                # MX E8M0 scales per token per indexer layer
+                # (d/32 == 4 blocks, 1 byte each).
                 size_per_token += 4 * num_indexer_layers
         return size_per_token
 
@@ -314,7 +315,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         * self.dtype.itemsize
                     )
                 if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                    # FP32 scale mirror
+                    # MX scale mirror (4 E8M0 bytes per token per layer)
                     total_bytes += (
                         self.page_num * self.page_size * num_indexer_layers * 4
                     )
@@ -336,18 +337,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
-                # This mirror is sized from the device pool's `size`, which is
-                # the rank's SHARDED latent-KV extent. The device's index-K is
-                # not sharded: the LightningIndexer is replicated and addresses
-                # every global position, so its buffer spans `index_buf_size` --
-                # the whole DCP virtual range. The two agree only while
-                # host_to_device_ratio >= dcp_size, which at a typical ratio of
-                # 2-3 and DCP16 it is not.
-                #
-                # Fail at startup rather than let transfer_kv_dim_exchange copy
-                # device pages into a host buffer that has fewer of them. That
-                # op checks the layer counts against each other
-                # (transfer_kv_dim_exchange.cpp:37) but not the page counts.
+                # This mirror is sized from the device pool's sharded `size`,
+                # but the device's index-K spans the replicated `index_buf_size`.
+                # transfer_kv_dim_exchange checks layer counts, not page counts.
                 device_index_pages = (
                     getattr(self.device_pool, "index_buf_size", self.device_pool.size)
                     // self.device_pool.page_size
@@ -367,14 +359,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
-            # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
+            # Host-side mirror of the NPU quantized-Indexer scale cache
             # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
-            # the device pool carries one (FP8 DSA + npu_quant_lightning_indexer).
+            # the device pool carries one (FP8 DSA + quant_lightning_indexer).
+            # The trailing (k_n, d/64, 2) MX-scale tail and the uint8 storage
+            # dtype are taken from the device pool so the mirror matches it
+            # byte-for-byte.
             self.index_k_scale_buffer = None
-            if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+            device_index_k_scale = getattr(
+                self.device_pool, "index_k_scale_buffer", None
+            )
+            if device_index_k_scale is not None:
                 self.index_k_scale_buffer = alloc_func(
-                    (*indexer_dims, 1),
-                    dtype=torch.float32,
+                    (*indexer_dims, *device_index_k_scale.shape[-2:]),
+                    dtype=device_index_k_scale.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -1138,8 +1136,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
-                    # indexer layer.
+                    # page_size, 1, 2, 2) uint8: 4 E8M0 MX-scale bytes per
+                    # token per indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
                     )

@@ -1552,17 +1552,18 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
-    if view.moe_a2a_backend == "deepep_v2":
-        # Fused shared experts are not validated with DeepEP v2.
+    if view.moe_a2a_backend in ("deepep_v2", "allreduce-deepep"):
+        # These dispatchers require shared experts outside the routed expert range.
         return {"disable_shared_experts_fusion": True}
     return {}
 
 
-# Every A2A backend that forces expert parallelism to span the TP group.
+# Backends whose expert parallelism spans the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
+        "allreduce-deepep",
         "deepep_v2",
         "mooncake",
         "nixl",

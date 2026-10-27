@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.tp_fusion import current_shared_pipeline
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
@@ -109,6 +110,7 @@ class AscendRunnerOutput(RunnerOutput):
     """Output bundle from the NPU runner."""
 
     hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -256,6 +258,9 @@ class AscendRunnerCore(MoeRunnerCore):
         group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
+        shared_pipeline = current_shared_pipeline()
+        if shared_pipeline is not None:
+            shared_pipeline.before_routed_gmm1()
 
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -307,6 +312,8 @@ class AscendRunnerCore(MoeRunnerCore):
                 )
 
         # --- w2 (down) projection ---
+        if running_state.get("ascend_tp_fused_gmm2") and hidden_states.shape[0] > 0:
+            return AscendRunnerOutput(hidden_states, pertoken_scale)
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
             hidden_states,
@@ -316,6 +323,8 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
+        if shared_pipeline is not None:
+            shared_pipeline.after_routed_gmm2()
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
@@ -350,6 +359,9 @@ def pre_permute_ascend_tp_to_ascend(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
+    running_state["ascend_tp_fused_gmm2"] = getattr(
+        runner_config.layer, "_npu_tp_fuse_gmm2_finalize", False
+    )
     return AscendRunnerInput(
         hidden_states=dispatch_output.hidden_states,
         hidden_states_scale=dispatch_output.hidden_states_scale,
@@ -424,6 +436,13 @@ def post_permute_ascend_to_ascend_tp(
 ) -> AscendTPCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
 
+    if runner_output.hidden_states_scale is not None:
+        return AscendTPCombineInput(
+            hidden_states=runner_output.hidden_states,
+            gmm2_input_scale=runner_output.hidden_states_scale,
+            gmm2_weight=quant_info.w2_weight,
+            gmm2_weight_scale=quant_info.w2_weight_scale,
+        )
     return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
 
 

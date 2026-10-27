@@ -782,6 +782,7 @@ class ExecMoe(msgspec.Struct):
         Literal[
             "none",
             "deepep",
+            "allreduce-deepep",
             "mooncake",
             "nixl",
             "mori",
@@ -794,10 +795,12 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. allreduce-deepep uses local "
+            "Ascend routing over replicated inputs and an EP AllReduce.",
             choices=[
                 "none",
                 "deepep",
+                "allreduce-deepep",
                 "mooncake",
                 "nixl",
                 "mori",
@@ -849,7 +852,7 @@ class ExecMoe(msgspec.Struct):
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
     ] = 2
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        Literal["auto", "bf16", "fp8", "int8", "nvfp4", "mxfp8", "mxfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
     flashinfer_a2a_dispatch_type: A[
