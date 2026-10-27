@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -77,6 +78,11 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        _ts_t = time.perf_counter()
+        print(
+            f"[SGL-TS] RECV-HTTP t={_ts_t:.6f} stream={getattr(request, 'stream', None)}",
+            flush=True,
+        )
 
         try:
             # Validate request

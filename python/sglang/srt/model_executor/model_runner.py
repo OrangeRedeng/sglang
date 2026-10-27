@@ -1956,6 +1956,15 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        _ts_t0 = time.perf_counter()
+        _ts_nseq = len(forward_batch.seq_lens)
+        _ts_ntok = len(forward_batch.input_ids)
+        print(
+            f"[SGL-TS] MODEL-FWD-START t={_ts_t0:.6f} rank={self.ps.tp_rank} "
+            f"nseq={_ts_nseq} ntok={_ts_ntok} mode={forward_batch.forward_mode}",
+            flush=True,
+        )
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -2038,6 +2047,14 @@ class ModelRunner:
 
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
+
+        _ts_t1 = time.perf_counter()
+        print(
+            f"[SGL-TS] MODEL-FWD-END t={_ts_t1:.6f} rank={self.ps.tp_rank} "
+            f"nseq={_ts_nseq} ntok={_ts_ntok} mode={forward_batch.forward_mode} "
+            f"dur={_ts_t1 - _ts_t0:.3f}s",
+            flush=True,
+        )
 
         return output
 

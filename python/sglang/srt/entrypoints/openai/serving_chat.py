@@ -2029,6 +2029,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        _ts_rid = None
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2047,6 +2048,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                _ts_rid = content["meta_info"]["id"]
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]
@@ -2323,6 +2325,8 @@ class OpenAIServingChat(OpenAIServingBase):
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
+        _ts_t = time.perf_counter()
+        print(f"[SGL-TS] SENDBACK t={_ts_t:.6f} rid={_ts_rid}", flush=True)
         yield "data: [DONE]\n\n"
 
     async def _handle_non_streaming_request(
