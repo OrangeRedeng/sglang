@@ -72,7 +72,10 @@ ONLINE_QUANTIZATION_CHOICES = [
     "w4a4_int",
 ]
 
-W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS = {"Qwen3MoeForCausalLM"}
+W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS = {
+    "Qwen3MoeForCausalLM",
+    "Glm5NextForConditionalGeneration",
+}
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
