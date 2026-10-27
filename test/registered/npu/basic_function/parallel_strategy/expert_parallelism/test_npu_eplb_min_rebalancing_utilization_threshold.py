@@ -83,6 +83,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
                 "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
@@ -158,6 +159,7 @@ class TestEplbMinRebalancingUtilizationThreshold095(
                 "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )

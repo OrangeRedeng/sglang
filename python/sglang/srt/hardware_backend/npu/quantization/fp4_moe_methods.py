@@ -164,7 +164,8 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
         layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
-        NPUW4A8MXFP4MoEMethod._set_dispatcher_output_dtype(layer, "mxfp8")
+        if hasattr(layer, "dispatcher"):
+            NPUW4A8MXFP4MoEMethod._set_dispatcher_output_dtype(layer, "mxfp8")
 
     def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):
         from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo

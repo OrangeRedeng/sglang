@@ -38,7 +38,6 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -372,6 +371,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self._fuse_npu_tp_routed_scale, self._fuse_npu_tp_shared = (
             self.experts.configure_ascend_tp_finalize_fusion()
@@ -447,6 +450,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or get_moe_a2a_backend().is_ascend_fuseep()
                     )
                     else {}
                 ),
@@ -468,6 +472,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
@@ -629,7 +634,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                    from sglang.kernels.ops.elementwise.elementwise import (
                         sigmoid_gate_mul_broadcast,
                     )
 
@@ -709,14 +714,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -765,16 +762,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if not self.is_nextn
-                    else None
-                ),
             )
             if self.enable_shared_expert_fusion:
                 topk_output = self._append_shared_to_topk_output(
@@ -982,6 +969,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
@@ -1002,6 +990,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and (get_is_capture_mode() or self._npu_tp_shared_overlap)
             and not torch.compiler.is_compiling()
+            # Paged experts run as an eager break, which must end the segment on the
+            # capture stream.
+            and not (
+                get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
+            )
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
@@ -1041,7 +1034,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 

@@ -323,6 +323,7 @@ class Gemma4MoE(nn.Module):
             # dispatcher/quant/EP layout is eligible, so this is a no-op on
             # unsupported configurations.
             self.experts.configure_ascend_tp_finalize_fusion()
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

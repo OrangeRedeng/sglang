@@ -34,6 +34,8 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     """The fused activation emits MXFP8, which W2 must consume directly."""
     from sglang.srt.hardware_backend.npu.moe.contracts import MXFP8, moe_input_contract
 
+    if config.activation == "situ":
+        return False
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if not isinstance(
