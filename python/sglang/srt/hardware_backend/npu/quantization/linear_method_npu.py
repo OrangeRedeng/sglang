@@ -459,25 +459,6 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
-def _apply_w4a4_dynamic_linear(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    original_dtype = x.dtype
-    quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-        x, dst_type=torch.quint4x2
-    )
-    return torch.ops.npu.npu_quant_matmul(
-        quant_out,
-        layer.weight,
-        layer.weight_scale,
-        pertoken_scale=dynamic_scale.flatten(),
-        bias=bias,
-        output_dtype=original_dtype,
-    )
-
-
 def npu_w8a8_mxfp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
