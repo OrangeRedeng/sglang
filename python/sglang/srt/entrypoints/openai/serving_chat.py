@@ -13,7 +13,6 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncGenerator,
     Callable,
     Dict,
     List,
@@ -56,7 +55,6 @@ from sglang.srt.entrypoints.openai import (
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
-    parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
