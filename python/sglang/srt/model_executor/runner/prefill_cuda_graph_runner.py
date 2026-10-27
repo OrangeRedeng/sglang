@@ -351,6 +351,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        if (
+            model_runner.device == "npu"
+            and self.prefill_backend_name == Backend.TC_PIECEWISE
+        ):
+            # Attention runs eagerly, so full-graph host-list updates are unnecessary.
+            self._backend_can_run_prefill_cuda_graph = None
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
