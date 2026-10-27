@@ -5,6 +5,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.contracts import MXFP4
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -163,7 +164,7 @@ def fused_moe_npu(
     moe_runner_config,
 ):
     logger.warning_once(
-        f"The fused_moe_npu method deprecated and will be removed in future releases"
+        "The fused_moe_npu method deprecated and will be removed in future releases"
     )
     topk_weights, topk_ids, _ = topk_output
     original_dtype = x.dtype
@@ -250,6 +251,26 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
         if hasattr(layer, "dispatcher"):
+            if dtype == "bf16":
+                from sglang.srt.hardware_backend.npu.moe.contracts import (
+                    INT4,
+                    MXFP4,
+                    moe_input_contract,
+                )
+                from sglang.srt.hardware_backend.npu.moe.init_routing import (
+                    supports_packed_routing,
+                )
+                from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                    AscendTPDispatcher,
+                )
+
+                contract = moe_input_contract(getattr(layer, "w13_kernel", None))
+                if (
+                    isinstance(layer.dispatcher, AscendTPDispatcher)
+                    and contract in (INT4, MXFP4)
+                    and supports_packed_routing(contract.kind)
+                ):
+                    dtype = contract.kind
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
 
     @staticmethod
@@ -282,6 +303,16 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
+        # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
+        # accepts FP4 weights via weight_scale/weight_dtype — verified on A5
+        # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
+        # chain modulo the output fp8 requant, which the unfused chain also
+        # applies before gmm2).
+        self.use_fused_gmm1 = True
+        self.fused_matmul = GroupedMatmulSwigluQuant()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -298,10 +329,28 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
-        if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
+        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
+        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
+        # preserves multi-node prefill when ``deepep-mode=auto``.
+        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                AscendTPDispatcher,
+            )
+
+            if (
+                isinstance(layer.dispatcher, AscendTPDispatcher)
+                and layer.moe_ep_size == 1
+                and self.dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT
+            ):
+                self._set_dispatcher_output_dtype(layer, "mxfp8")
+                return
+            layer.dispatcher.set_quant_config(
+                {
+                    "normal_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "mxfp8",
+                }
+            )
 
     def apply(
         self,
@@ -333,6 +382,57 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             dynamic_quant_kwargs=dynamic_quant_kwargs,
         )
 
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """gmm1 + swiglu + requant in one kernel (fused MXFP4 path).
+
+        Mirrors NPUMXFP8MoEMethod.apply_fused_gmm1_swiglu but passes the FP4
+        weight dtype and the e8m0 weight_scale. Returns (e4m3 activations,
+        e8m0 block scale) ready for the w2 gmm.
+
+        The dispatcher hands over BF16 (see process_weights_after_loading), so
+        pertoken_scale is normally None and the activation quant happens here.
+        """
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        e8m0_dtype = _require_e8m0_dtype()
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        else:
+            # flat [T, K//32] -> pair form [T, K//64, 2]; identity if already
+            # pair-split.
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
+
+        return self.fused_matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_dtype=torch.float8_e4m3fn,
+            # e4m3 is implicit for x; FP4 must be passed for the weight.
+            x_dtype=None,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
+
 
 # ---------------------------------------------------------------------------
 #  NPUW4A4MXFP4MoEMethod
@@ -349,6 +449,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
+            contract=MXFP4,
         )
 
     def process_weights_after_loading(
@@ -724,7 +825,19 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         scale_bias_name = f"{weight_prefix}_scale_bias"
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
-            scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+            bias = scale_bias.data
+            if weight_prefix == "w2":
+                # W2 is K-sharded; each rank owns only its compensation segments.
+                tp_size = layer.moe_tp_size
+                num_segments = bias.shape[-1]
+                if num_segments % tp_size:
+                    raise ValueError(
+                        f"W2 compensation segments ({num_segments}) must be divisible "
+                        f"by MoE TP size ({tp_size})"
+                    )
+                shard_size = num_segments // tp_size
+                bias = bias.narrow(2, layer.moe_tp_rank * shard_size, shard_size)
+            scale_bias.data = bias.transpose(1, 2).contiguous().sum(dim=1)
 
     def _process_scale(
         self,
@@ -1154,12 +1267,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        if weight_prefix != "w2":
-            raise ValueError(
-                f"NPUMXFP8MoEMethod.apply only serves the w2 gmm, got "
-                f"'{weight_prefix}'. gmm1 fuses swiglu into a single op and must "
-                f"go through apply_fused_gmm1_swiglu, which returns a scale too."
-            )
+        self._validate_weight_prefix(quant_info, weight_prefix)
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = HiddenStatesDynamicQuant(
+                quant_dtype=torch.float8_e4m3fn
+            )(hidden_states)
 
         e8m0_dtype = _require_e8m0_dtype()
         scale_args: Dict[str, Any] = {
@@ -1170,7 +1282,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             "x_dtype": None,
             "weight_dtype": None,
         }
-        return self.matmul.forward(
+        return GroupedMatmul().forward(
             quant_info,
             weight_prefix,
             hidden_states,

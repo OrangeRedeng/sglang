@@ -28,6 +28,9 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_unquant_moe import (
+    ModelSlimUnquantizedMoE,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -214,8 +217,28 @@ class ModelSlimConfig(QuantizationConfig):
         boundary.
         """
         candidates = [prefix]
+        # Gemma checkpoints omit the runtime MoE wrapper and wrap vision linears.
+        if ".moe.experts" in prefix:
+            candidates.append(prefix.replace(".moe.experts", ".experts"))
+        if ".vision_tower." in prefix and not prefix.endswith(".linear"):
+            candidates.append(f"{prefix}.linear")
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+        # GDN (Qwen3-Next family) checkpoints quantize the projections under
+        # their checkpoint-split names, while the runtime module is the merged
+        # one. Without these aliases the merged prefix misses the description
+        # entirely and the projection silently falls back to BF16 (and its
+        # checkpoint scales then fail to find their params). The first
+        # candidate whose ".weight" exists in the description wins; a merged
+        # checkpoint key still takes precedence because it is tried first.
+        if ".in_proj_qkvz" in prefix:
+            parent = prefix.rsplit(".", 1)[0]
+            candidates.append(f"{parent}.in_proj_qkv")
+            candidates.append(f"{parent}.in_proj_z")
+        if ".in_proj_ba" in prefix:
+            parent = prefix.rsplit(".", 1)[0]
+            candidates.append(f"{parent}.in_proj_b")
+            candidates.append(f"{parent}.in_proj_a")
 
         for candidate in list(candidates):
             if candidate.startswith("language_model."):
@@ -230,6 +253,32 @@ class ModelSlimConfig(QuantizationConfig):
             if candidate + ".weight" in self.quant_description:
                 return candidate
         return prefix
+
+    def resolve_projection_scheme(self, prefix: str):
+        parent, projection = prefix.rsplit(".", 1)
+        aliases = {
+            "gate_proj": ("gate_proj", "w1"),
+            "up_proj": ("up_proj", "w3"),
+            "down_proj": ("down_proj", "w2"),
+        }
+        for name in aliases.get(projection, (projection,)):
+            resolved = self._resolve_quant_prefix(f"{parent}.{name}")
+            scheme = self.quant_description.get(resolved + ".weight")
+            if scheme is not None:
+                return scheme
+        return None
+
+    @staticmethod
+    def moe_scheme_types():
+        return {
+            "FLOAT": ModelSlimUnquantizedMoE,
+            "W4A4_MXFP4": ModelSlimW4A4MXFP4MoE,
+            "W4A8_MXFP": ModelSlimW4A8MXFP4MoE,
+            "W4A4_DYNAMIC": ModelSlimW4A4Int4MoE,
+            "W4A8_DYNAMIC": ModelSlimW4A8Int8MoE,
+            "W8A8_DYNAMIC": ModelSlimW8A8Int8MoE,
+            "W8A8_MXFP8": ModelSlimMXFP8MoEScheme,
+        }
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
@@ -271,8 +320,8 @@ class ModelSlimConfig(QuantizationConfig):
             elif "visual" in prefix:
                 key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
-                prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
-                prefix = prefix.replace(r"attn.proj", r"wo")
+                prefix = prefix.replace(".attn.qkv_proj", ".wqkv")
+                prefix = prefix.replace(".attn.proj", ".wo")
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
@@ -287,6 +336,21 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
+                if ".shared_expert." in prefix or ".shared_experts." in prefix:
+                    from sglang.srt.layers.moe import get_moe_a2a_backend
+                    from sglang.srt.runtime_context import get_parallel
+
+                    scheme = self.resolve_projection_scheme(prefix_in_quant_config)
+                    if (
+                        scheme not in (None, "FLOAT")
+                        and get_moe_a2a_backend().is_none()
+                        and get_parallel().moe_ep_size == 1
+                    ):
+                        raise ValueError(
+                            f"Shared projection {prefix} requests ModelSlim {scheme}, "
+                            "which has no dense NPU method. Use eligible shared-expert "
+                            "append or a checkpoint with a supported shared precision."
+                        )
                 return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -309,19 +373,10 @@ class ModelSlimConfig(QuantizationConfig):
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
 
-        linear_quant_schemes = [
-            ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
-            ("W8A8", ModelSlimW8A8Int8),
-            ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
-            ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
-            ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
-            ("W4A4_MXFP4", ModelSlimMXFP4Scheme),
-        ]
-
         prefix = self._resolve_quant_prefix(prefix)
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
 
-        for scheme_name, scheme_class in linear_quant_schemes:
+        for scheme_name, scheme_class in self.linear_scheme_types().items():
             if any(s == scheme_name for s in quant_schemes):
                 logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
@@ -331,19 +386,23 @@ class ModelSlimConfig(QuantizationConfig):
         )
         return None
 
+    @staticmethod
+    def linear_scheme_types():
+        return {
+            "W4A4_DYNAMIC": ModelSlimW4A4Int4,
+            "W8A8": ModelSlimW8A8Int8,
+            "W8A8_DYNAMIC": ModelSlimW8A8Int8,
+            "W8A8_MXFP8": ModelSlimMXFP8Scheme,
+            "W4A8_MXFP": ModelSlimMXFP4W4A8Scheme,
+            "W4A4_MXFP4": ModelSlimMXFP4Scheme,
+        }
+
     def get_moe_scheme(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ):
-        moe_quant_schemes = [
-            ("W4A4_MXFP4", ModelSlimW4A4MXFP4MoE),
-            ("W4A8_MXFP", ModelSlimW4A8MXFP4MoE),
-            ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
-            ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
-            ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
-            ("W8A8_MXFP8", ModelSlimMXFP8MoEScheme),
-        ]
+        moe_quant_schemes = self.moe_scheme_types()
 
         # Try multiple naming conventions:
         #   (gate_proj, up_proj, down_proj) – standard compressed-tensors format
@@ -353,37 +412,17 @@ class ModelSlimConfig(QuantizationConfig):
             ("w1", "w3", "w2"),
         ]
 
-        w13_scheme_name = None
-        w2_scheme_name = None
+        w13_names = [
+            self.resolve_projection_scheme(f"{prefix}.0.{projection}")
+            for projection in ("gate_proj", "up_proj")
+        ]
+        if w13_names[0] != w13_names[1]:
+            raise ValueError(
+                f"Mismatched ModelSlim quantization for W13 in layer {prefix}: {w13_names}"
+            )
+        w13_scheme_name = w13_names[0]
+        w2_scheme_name = self.resolve_projection_scheme(f"{prefix}.0.down_proj")
         resolved_prefix = prefix
-        for candidate in self._quant_prefix_candidates(prefix):
-            for gate_name, up_name, down_name in naming_conventions:
-                w13_keys = [
-                    f"{candidate}.0.{gate_name}.weight",
-                    f"{candidate}.0.{up_name}.weight",
-                ]
-                w2_key = f"{candidate}.0.{down_name}.weight"
-                w13_entries = {
-                    key: self.quant_description[key]
-                    for key in w13_keys
-                    if key in self.quant_description
-                }
-                if w13_entries and w2_key in self.quant_description:
-                    w13_names = list(w13_entries.values())
-                    # For w13, both projections must agree on the scheme
-                    unique_w13 = set(w13_names)
-                    if len(unique_w13) > 1:
-                        raise ValueError(
-                            "Mismatched ModelSlim quantization for W13 in layer "
-                            f"{prefix}: {w13_entries}"
-                        )
-                    w13_scheme_name = w13_names[0]
-                    w2_scheme_name = self.quant_description[w2_key]
-                    resolved_prefix = candidate
-                    break
-            if w13_scheme_name is not None:
-                break
-
         if w13_scheme_name is None:
             # Build a helpful error message listing all attempted key patterns
             all_attempted = []
@@ -536,8 +575,21 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            validate_tp_expert_weights,
+        )
+
+        validate_tp_expert_weights(layer, prepared=False)
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
+        validate_tp_expert_weights(layer)
+        core = getattr(
+            getattr(getattr(self, "runner", None), "runner_core", None),
+            "prepare_fused_gmm1",
+            None,
+        )
+        if core is not None:
+            core()
 
     def create_weights(
         self,
@@ -569,6 +621,14 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             weight_prefix="w2",
             **extra_weight_attrs,
         )
+        layer._npu_checkpoint_geometry = {
+            name: (tuple(param.shape), param.dtype)
+            for name, param in layer.named_parameters(recurse=False)
+            if name.startswith(("w13_", "w2_"))
+        }
+        for name, param in layer.named_parameters(recurse=False):
+            if name in layer._npu_checkpoint_geometry:
+                param._npu_shared_loaded_shards = set()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

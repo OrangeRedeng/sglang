@@ -12,7 +12,8 @@ non-NPU hosts.
 
 from __future__ import annotations
 
-import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -24,10 +25,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -54,7 +58,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -63,6 +67,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        # Reuse one device-bound worker for graph input updates.
+        self._update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="npu-graph-update",
+            initializer=self._device_module.set_device,
+            initargs=(self._device_id,),
+        )
+        # Event of the last replay; the next rebind waits on it so the device is
+        # done reading the host-side seq_lens array before we rewrite it.
+        self._rebind_fence = None
 
     @contextmanager
     def capture_session(self, stream):
@@ -150,8 +164,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa.
+        """Rebind seq_lens on the recorded NPU graph, then replay.
+
+        NPUGraph.update must complete before replay can consume the updated
+        KV lengths. Used when the model is not deepseek-nsa.
 
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
@@ -166,17 +182,91 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
-        def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+        if self._rebind_fence is not None:
+            self._rebind_fence.synchronize()
 
-        thread = threading.Thread(target=_update)
-        thread.start()
+        update_future = self._update_executor.submit(
+            graph.update, cpu_update_input=cpu_update_input
+        )
         graph.replay()
-        thread.join()
+        update_future.result()
+
+        fence = self._device_module.Event()
+        fence.record()
+        self._rebind_fence = fence
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+
+
+class NPUPrefillGraphBackend(NPUCudaGraphBackend):
+    """NPU backend for the prefill (extend) phase body capture.
+
+    Same torch.npu.NPUGraph capture/replay mechanics as decode; the prefill
+    runner treats this as a full-style body-capture backend: one graph per
+    token bucket records the transformer stack (layer_model.forward), while
+    the embedding and logits tails run eagerly at replay with live request
+    metadata.
+
+    Attention metadata is capture-stable on device (block tables, seq_lens
+    tensor: refreshed in place via copy_). The two FIA TND host-side inputs
+    (actual_seq_qlen cumsum and actual_seq_kvlen lists) cannot be baked at
+    capture, so the ascend backend stashes fresh values in
+    ``_npu_prefill_graph_update`` at metadata refresh time and replay routes
+    through NPUGraph.update, exactly like the decode runner's seq_lens
+    rebinding.
+    """
+
+    def __init__(self, cuda_graph_runner, *, enable_memory_saver: bool = False) -> None:
+        super().__init__(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
+        self._prefill_state_source = cuda_graph_runner.model_runner.attn_backend
+        # Optimistic until a capture probe proves otherwise: the extend
+        # metadata stashes a host rebinding on every init, and replay applies
+        # it through NPUGraph.update. Whether the dispatcher actually
+        # registered updatable records is only observable after capture, so
+        # capture_one probes each graph once and downgrades to eager prefill
+        # (via the capability flag) when the graph is record-less.
+        self._prefill_state_source._prefill_graph_updates_available = True
+
+    def capture_one(self, shape_key, forward_fn, **kwargs) -> None:
+        super().capture_one(shape_key, forward_fn, **kwargs)
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is None:
+            return
+        self._prefill_state_source._npu_prefill_graph_update = None
+        try:
+            # Apply the capture-consistent values: a no-op semantically, but
+            # it is the only reliable probe for "did the dispatcher record
+            # any updatable host args" on this torch_npu.
+            self._graphs[shape_key].update(cpu_update_input=pending)
+        except RuntimeError as exc:
+            if "0 operators" not in str(exc):
+                raise
+            self._prefill_state_source._prefill_graph_updates_available = False
+            logger.warning(
+                "NPU prefill graph: captured attention ops expose no updatable "
+                "host records on this torch_npu (the TND length lists were not "
+                "registered during capture); prefill will run eager while decode "
+                "keeps its graphs. %s",
+                exc,
+            )
+
+    def replay(
+        self,
+        shape_key: ShapeKey,
+        static_forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> Any:
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is not None:
+            self._prefill_state_source._npu_prefill_graph_update = None
+            return self.replay_with_input_update(
+                shape_key, seq_lens=None, cpu_update_input=pending
+            )
+        return super().replay(shape_key, static_forward_batch, **kwargs)

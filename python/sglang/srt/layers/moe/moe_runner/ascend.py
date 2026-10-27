@@ -7,11 +7,14 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
     NPUSitu,
+    NPUSituMXFP8Quant,
     NPUSwiglu,
+    NPUSwigluClamp,
     NPUSwigluDeepEPKernel,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
@@ -24,6 +27,37 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
+
+
+def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
+    """The fused activation emits MXFP8, which W2 must consume directly."""
+    from sglang.srt.hardware_backend.npu.moe.contracts import MXFP8, moe_input_contract
+
+    if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
+        return False
+    if not isinstance(
+        config.layer.w2_kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)
+    ):
+        return False
+    if (
+        moe_input_contract(kernel) != MXFP8
+        or moe_input_contract(config.layer.w2_kernel) != MXFP8
+        or getattr(config.layer, "w13_scale_bias", None) is not None
+        or getattr(config.layer, "w13_weight_bias", None) is not None
+    ):
+        return False
+    if (
+        config.activation != "silu"
+        or not config.is_gated
+        or config.swiglu_limit is not None
+        or config.gemm1_alpha is not None
+        or config.gemm1_beta is not None
+        or config.gemm1_clamp_limit is not None
+    ):
+        return False
+    return isinstance(kernel, NPUMXFP8MoEMethod) or kernel.use_fused_gmm1
+
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -35,15 +69,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-        AscendTPDispatchOutput,
-        AscendTPCombineInput,
     )
 
 from sglang.srt.layers.moe.utils import (
@@ -63,6 +97,7 @@ class AscendRunnerInput(RunnerInput):
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
     group_list_type: int  # 0 or 1 (passed to NPU ops)
+    source_dtype: Optional[torch.dtype] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -89,35 +124,52 @@ class AscendRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
+        if get_moe_a2a_backend().is_none() and (
+            not config.is_gated
+            or config.gemm1_beta is not None
+            or (config.activation == "silu" and config.gemm1_alpha is not None)
+        ):
+            raise ValueError(
+                "Native Ascend MoE requires gated activations without gemm1_beta; "
+                "scaled SiLU must use the explicit situ or npu_swiglu_oai method"
+            )
         kernel = config.layer.w2_kernel
-
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
-            # separate activation step — run() skips it. Left None on purpose so
-            # that reaching for it fails loudly instead of silently applying an
-            # unfused swiglu to already-requantised activations. This holds for
-            # both dispatchers: ascend_tp gets its activation quant fused into
-            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
-            self.activation = None
-        elif (
-            isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+        # Weight preparation decides layout eligibility; retain the ordinary path.
+        self.use_fused_gmm1 = False
+        self._fused_gmm1_prepared = False
+        if (
+            isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif config.activation == "silu" and config.swiglu_limit is not None:
+            self.activation = NPUSwigluClamp(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
             if config.activation == "situ":
-                self.activation = NPUSitu(
-                    need_quant=is_quant_kernel,
-                    beta=(
-                        config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
-                    ),
-                    linear_beta=config.gemm1_clamp_limit,
-                )
+                beta = config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
+                if (
+                    isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+                    and envs.SGLANG_NPU_MOE_SITU_MXFP8_FUSED.get()
+                ):
+                    if config.gemm1_clamp_limit is None:
+                        raise ValueError(
+                            "fused SiTU MXFP8 quantization requires gemm1_clamp_limit"
+                        )
+                    self.activation = NPUSituMXFP8Quant(
+                        beta=beta,
+                        linear_beta=config.gemm1_clamp_limit,
+                    )
+                else:
+                    self.activation = NPUSitu(
+                        need_quant=is_quant_kernel,
+                        beta=beta,
+                        linear_beta=config.gemm1_clamp_limit,
+                    )
             else:
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
@@ -127,8 +179,31 @@ class AscendRunnerCore(MoeRunnerCore):
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
-            if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+            if (
+                isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+                and config.activation == "silu"
+                and config.gemm1_alpha is None
+                and config.gemm1_clamp_limit is None
+                and config.swiglu_limit is None
+            ):
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_npu_op,
+                )
+
+                inner = (
+                    NPUSwigluQuant()
+                    if supports_npu_op("npu_dequant_swiglu_quant")
+                    else NPUSwiglu()
+                )
+            elif config.activation == "situ":
+                # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
+                # gmm2 requantizes the activations itself, so no quant is
+                # fused here. Matches the DeepEP branch below.
+                inner = NPUSitu(
+                    need_quant=False,
+                    beta=config.gemm1_alpha if config.gemm1_alpha is not None else 4.0,
+                    linear_beta=config.gemm1_clamp_limit,
+                )
             else:
                 if config.activation == "npu_swiglu_oai":
                     # NPUSwigluOAI requires the runner config to pass
@@ -150,6 +225,19 @@ class AscendRunnerCore(MoeRunnerCore):
             else:
                 self.activation = inner
 
+    def prepare_fused_gmm1(self):
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            supports_fused_mxfp_gmm,
+        )
+
+        layer = self.config.layer
+        self.use_fused_gmm1 = _uses_fused_gmm1(layer.w13_kernel, self.config) and (
+            supports_fused_mxfp_gmm(
+                layer.w13_kernel, layer.w13_weight, layer.w13_weight_scale
+            )
+        )
+        self._fused_gmm1_prepared = True
+
     def run(
         self,
         runner_input: AscendRunnerInput,
@@ -161,16 +249,23 @@ class AscendRunnerCore(MoeRunnerCore):
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
         x = runner_input.hidden_states
-        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        original_dtype = runner_input.source_dtype or (
+            torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        )
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        capture = get_is_capture_mode() or torch.compiler.is_compiling()
+        if not self._fused_gmm1_prepared and not capture:
+            self.prepare_fused_gmm1()
+        if self.use_fused_gmm1 and not capture:
             # --- w13 projection + activation, fused into one kernel ---
-            # MXFP8 gmm1 returns activations already requantised for gmm2, so
-            # there is no separate activation step to run.
+            # The fused gmm1 returns activations already requantised for gmm2,
+            # so there is no separate activation step to run.
             hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
                 quant_info,
                 x,
@@ -194,7 +289,12 @@ class AscendRunnerCore(MoeRunnerCore):
             # Grouped-row activations require dispatch metadata.
             if isinstance(
                 self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu, NPUSwigluMxfp8Quant),
+                (
+                    NPUSwigluDeepEPKernel,
+                    NPUSitu,
+                    NPUSituMXFP8Quant,
+                    NPUSwigluMxfp8Quant,
+                ),
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
@@ -255,6 +355,7 @@ def pre_permute_ascend_tp_to_ascend(
         hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=dispatch_output.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
+        source_dtype=dispatch_output.source_dtype,
     )
 
 

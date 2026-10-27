@@ -5,16 +5,15 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
-    get_moe_ep_group,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -78,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
+    process_model_config,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -148,13 +148,13 @@ def _maybe_copy_weight_view_before_h2d(
 
 
 def _get_deepep_comm_group(a2a_backend):
-    group = get_tp_group().device_group
+    group = get_parallel().tp_group.device_group
 
     if a2a_backend.is_mori():
-        group = get_tp_group()
+        group = get_parallel().tp_group
 
     elif _is_npu:
-        group = get_moe_ep_group().device_group
+        group = get_parallel().moe_ep_group.device_group
 
     return group
 
@@ -202,22 +202,26 @@ def create_moe_dispatcher(
             _deepep_v2_experts_are_fp8(quant_method)
         )
         return DeepEPv2Dispatcher(
-            group=get_tp_group().device_group,
+            group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             use_fp8_dispatch=output_dtype is DispatcherOutputDtype.FP8,
+            activation_scale_block_size=(
+                32
+                if isinstance(quant_method, Fp8MoEMethod) and quant_method.use_mxfp8
+                else 128
+            ),
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
-            group=get_tp_group().device_group,
+            group=get_parallel().tp_group.device_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
-            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -267,18 +271,19 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     reason = None
     if not isinstance(quant_method, Fp8MoEMethod):
         reason = f"selected {type(quant_method).__name__}"
-    elif quant_method.use_mxfp8:
-        reason = "selected MXFP8 weights"
     elif quant_method.is_fp4_expert:
         reason = "selected FP4 experts"
-    elif list(quant_method.weight_block_size or []) != [128, 128]:
-        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif list(quant_method.weight_block_size or []) != (
+        [1, 32] if quant_method.use_mxfp8 else [128, 128]
+    ):
+        quant_format = "MXFP8 " if quant_method.use_mxfp8 else ""
+        reason = f"has {quant_format}weight_block_size={quant_method.weight_block_size}"
     elif config.activation_scheme != "dynamic":
         reason = f"has activation_scheme={config.activation_scheme!r}"
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires either 128x128 blockwise FP8 "
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
             "experts with dynamic activation scaling or unquantized BF16 "
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
@@ -392,6 +397,11 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
+        # Set by the quant method when it repacks experts for MegaMoE.
+        self._mega_moe_weights_built = False
+        self._mega_moe_nvfp4 = False
+        # Read at construction: draft_model_build_scope applies the draft's own value.
+        self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
@@ -418,6 +428,19 @@ class FusedMoE(torch.nn.Module):
                 self.intermediate_size_per_partition, 128
             )
 
+        if _is_npu:
+            from sglang.srt.runtime_context import get_flags
+
+            online_scheme = (get_flags().moe.online_quantization or {}).get("moe")
+            if online_scheme is not None:
+                if online_scheme != "W8A8_MXFP8":
+                    raise ValueError(
+                        "Online MoE conversion currently supports only W8A8_MXFP8"
+                    )
+                if quant_config is None:
+                    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+                    quant_config = Fp8Config(use_mxfp8=True)
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
@@ -455,6 +478,7 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            layer=self,
         )
 
         self.quant_method = quant_method
@@ -479,6 +503,14 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
+        if (
+            get_moe_a2a_backend().is_deepep_v2()
+            and isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_mxfp8
+        ):
+            self.moe_runner_config.silu_mul_keep_fp32 = model_requires_fp32_silu_mul(
+                process_model_config().hf_config
+            )
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         )
@@ -487,9 +519,16 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
+        qwen4_bf16_deferred = (
+            isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            and params_dtype == torch.bfloat16
+            and hidden_size == 2560
+            and num_experts == 512
+            and top_k == 10
+        )
         self.supports_deferred_finalize = (
             get_moe_runner_backend().is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred)
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
@@ -553,6 +592,23 @@ class FusedMoE(torch.nn.Module):
         self._dwdp_bound = False
 
         self.runner = self.quant_method.runner
+
+    def configure_ascend_tp_finalize_fusion(self) -> Tuple[bool, bool]:
+        from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
+            NPUFinalizeRouting,
+        )
+
+        eligible = (
+            isinstance(self.dispatcher, AscendTPDispatcher)
+            and self.moe_ep_size == 1
+            and self.num_fused_shared_experts in (0, 1)
+            and not self.reduce_results
+            and not isinstance(self.quant_method, KTEPWrapperMethod)
+            and isinstance(self.dispatcher.finalize, NPUFinalizeRouting)
+            and not self.moe_runner_config.apply_router_weight_on_input
+        )
+        self.should_fuse_routed_scaling_factor_in_topk |= eligible
+        return eligible, eligible and self.num_fused_shared_experts == 0
 
     @property
     def num_global_routed_experts(self) -> int:
@@ -656,7 +712,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Load grouped weight scales for group quantization
@@ -667,7 +722,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
         elif shard_id in ("w1", "w3", "w13"):
@@ -676,7 +730,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
 
@@ -686,7 +739,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         # for per channel weight quantization
         if shard_id == "w2":
@@ -698,7 +750,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def _load_w13(
@@ -707,7 +758,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         # Index the loaded weight for tp sharding.
@@ -748,7 +798,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -764,7 +814,7 @@ class FusedMoE(torch.nn.Module):
                 # shard size from the loaded weight so we index correctly.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
@@ -791,7 +841,6 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
         is_bias: bool = False,
     ):
         """Load w2 weights for down projection.
@@ -801,7 +850,6 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
-            tp_rank: The tensor parallel rank
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -839,7 +887,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                shard_size * self.moe_tp_rank,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -852,7 +900,7 @@ class FusedMoE(torch.nn.Module):
                 # do not cause out-of-bounds indexing into the checkpoint.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
@@ -879,7 +927,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
         shard_dim: int,
-        tp_rank: int,
     ) -> bool:
         if (
             not self._has_fused_shared
@@ -947,14 +994,12 @@ class FusedMoE(torch.nn.Module):
             expert_data=weight_data,
             shard_id=shard_id,
             loaded_weight=fp4_weight,
-            tp_rank=tp_rank,
         )
         self._load_model_weight_or_group_weight_scale(
             shard_dim=shard_dim,
             expert_data=scale_data,
             shard_id=shard_id,
             loaded_weight=fp4_scale,
-            tp_rank=tp_rank,
         )
         return True
 
@@ -972,7 +1017,6 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         loaded_weight: torch.Tensor,
-        tp_rank: int,
     ):
         if shard_id == "w2":
             self._load_w2(
@@ -980,7 +1024,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
         else:
             assert shard_id in ("w1", "w3")
@@ -1035,6 +1078,12 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    record_tp_shared_load,
+                )
+
+                record_tp_shared_load(self, param, shard_id, expert_id)
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1100,6 +1149,12 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_tp_shared_load,
+            )
+
+            record_tp_shared_load(self, param, shard_id, expert_id)
 
     def _load_gguf_weight(
         self,
@@ -1107,7 +1162,6 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         shard_id: str,
         expert_id: int,
-        tp_rank: int,
     ) -> bool:
         """Handle GGUF weight loading.
 
@@ -1116,7 +1170,6 @@ class FusedMoE(torch.nn.Module):
             loaded_weight: The weight tensor to load.
             shard_id: The shard ID (w1, w2, or w3).
             expert_id: The expert ID.
-            tp_rank: The tensor parallel rank.
 
         Returns:
             True if the weight was handled as a GGUF weight, False otherwise.
@@ -1134,7 +1187,7 @@ class FusedMoE(torch.nn.Module):
             if self.moe_tp_size > 1:
                 if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
                     shard_size = loaded_weight.size(0) // self.moe_tp_size
-                    start_idx = tp_rank * shard_size
+                    start_idx = self.moe_tp_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
                         0, start_idx, shard_size
                     ).clone()
@@ -1158,10 +1211,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Special case for GGUF weights
-        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
+        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id):
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -1210,8 +1261,14 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
+        use_flashinfer_trtllm_weight_layout = (
+            method.use_flashinfer_trtllm_weight_layout
+            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
+            else self.use_flashinfer_trtllm_moe
+        )
+
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if self.use_flashinfer_trtllm_moe and (
+        if use_flashinfer_trtllm_weight_layout and (
             isinstance(method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
@@ -1244,7 +1301,6 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         ):
             return
 
@@ -1283,7 +1339,6 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1311,7 +1366,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             return
 
@@ -1333,7 +1387,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
@@ -1344,7 +1397,6 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1378,7 +1430,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
             return
 
@@ -1391,7 +1442,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
             )
 
     def weight_loader_fused(
@@ -1401,8 +1451,6 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
     ) -> None:
-        tp_rank = self.moe_tp_rank
-
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
         method = self.quant_method
@@ -1492,7 +1540,6 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
                 is_bias=is_bias,
             )
             return
@@ -1505,8 +1552,19 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pre_quant_input: Optional[Tuple] = None,
+        *,
+        shared_output: Optional[torch.Tensor] = None,
+        shared_output_ready: Optional[Callable[[], None]] = None,
     ):
+        if shared_output is not None:
+            return self.forward_impl(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+                shared_output_ready=shared_output_ready,
+            )
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1546,8 +1604,26 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pre_quant_input: Optional[Tuple] = None,
+        *,
+        shared_output: Optional[torch.Tensor] = None,
+        shared_output_ready: Optional[Callable[[], None]] = None,
     ):
+        if shared_output is not None and (
+            not isinstance(self.dispatcher, AscendTPDispatcher)
+            or self.reduce_results
+            or self.moe_ep_size != 1
+            or self.num_fused_shared_experts
+        ):
+            raise ValueError("Shared finalization requires unreduced TP expert output")
+        if shared_output is not None and (
+            shared_output.shape != hidden_states.shape
+            or shared_output.dtype != hidden_states.dtype
+            or shared_output.device != hidden_states.device
+        ):
+            raise ValueError(
+                "Shared finalization requires a matching rank-local output"
+            )
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1555,21 +1631,9 @@ class FusedMoE(torch.nn.Module):
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+        dispatch_output = self._dispatch_with_pre_quant(
+            hidden_states, topk_output, pre_quant_input
         )
-        if (
-            pre_quant_input is not None
-            and dispatch_output.format.is_standard()
-            and dispatch_output.hidden_states_scale is None
-        ):
-            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
-            # passthrough, so the caller's pre-quantized (q, scale) pair still
-            # matches dispatch_output.hidden_states; attach it for the triton
-            # fused runner to skip its own activation quant.
-            dispatch_output = dispatch_output._replace(
-                hidden_states_pre_quant=pre_quant_input
-            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
@@ -1578,8 +1642,17 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
+        if shared_output is not None:
+            # Shared compute must finish before finalization reads its output.
+            if shared_output_ready is not None:
+                shared_output_ready()
+                shared_output.record_stream(
+                    torch.get_device_module(shared_output.device).current_stream()
+                )
+            combine_input = combine_input._replace(shared_output=shared_output)
+
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
@@ -1593,16 +1666,53 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    def _dispatch_with_pre_quant(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple],
+    ) -> DispatchOutput:
+        if pre_quant_input is not None and isinstance(
+            self.dispatcher, AscendTPDispatcher
+        ):
+            if self.dispatcher._original_dispatch_func is not None:
+                raise ValueError(
+                    "Prequantized TP routing does not support dispatch hooks"
+                )
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        else:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
+        if (
+            pre_quant_input is not None
+            and dispatch_output.format.is_standard()
+            and dispatch_output.hidden_states_scale is None
+        ):
+            # Dropping an Mxfp8RoutedInputPreQuant here would leave its side
+            # stream unjoined under CUDA-graph capture.
+            dispatch_output = dispatch_output._replace(
+                hidden_states_pre_quant=pre_quant_input
+            )
+        return dispatch_output
+
     def forward_deferred_finalize(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         assert self.quant_method is not None
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             flashinfer_trtllm_deferred_finalize_context,
         )
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+        dispatch_output = self._dispatch_with_pre_quant(
+            hidden_states, topk_output, pre_quant_input
         )
 
         with flashinfer_trtllm_deferred_finalize_context():
