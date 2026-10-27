@@ -1870,6 +1870,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         from sglang.srt.hardware_backend.npu.autotune import initialize
 
         initialize(cfg)
+        from sglang.srt.hardware_backend.npu.hccl_config import initialize_hccl_buffer
+
+        initialize_hccl_buffer(cfg)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
