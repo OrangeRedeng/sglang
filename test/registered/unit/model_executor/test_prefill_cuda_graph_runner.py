@@ -283,6 +283,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
+        capture_events = []
         # The capture decision reads the graph configuration and the LoRA flag
         # out of the bags.
         override = get_context().override_server_args(
@@ -297,6 +298,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             device="cuda",
+            npu_task_queue_policy=SimpleNamespace(
+                set_mode=lambda mode: capture_events.append(mode)
+            ),
             gpu_id=0,
             is_draft_worker=False,
             # A real ModelRunner always has this attribute; the prefill gate
@@ -331,7 +335,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(
                 graph_setup,
                 "PrefillCudaGraphRunner",
-                return_value=prefill_runner,
+                side_effect=lambda runner: (
+                    capture_events.append("capture") or prefill_runner
+                ),
             ),
         ):
             capture = capture_prefill_graph(
@@ -340,6 +346,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
+        self.assertEqual(capture_events, [0, "capture"])
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()

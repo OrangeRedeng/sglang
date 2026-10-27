@@ -76,6 +76,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.npu.task_queue import NPUTaskQueuePolicy
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -460,6 +461,7 @@ class ModelRunner:
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.init_npu_task_queue_policy()
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
@@ -572,6 +574,11 @@ class ModelRunner:
             state.snapshot_active_to_last()
             state.sync_active_to_cpu()
             state.scale_phase = "syncing_new_world"
+
+    def init_npu_task_queue_policy(self):
+        self.npu_task_queue_policy = NPUTaskQueuePolicy.create(
+            device=self.device, is_draft_worker=self.is_draft_worker
+        )
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
@@ -1801,6 +1808,9 @@ class ModelRunner:
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
+        if self.npu_task_queue_policy is not None:
+            self.npu_task_queue_policy.before_forward(forward_batch.forward_mode)
 
         self.forward_pass_id += 1
 
