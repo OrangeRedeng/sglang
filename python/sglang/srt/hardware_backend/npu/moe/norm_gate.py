@@ -3,7 +3,6 @@
 import logging
 
 import torch
-
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT8,
     MXFP8,
@@ -149,7 +148,7 @@ class QuantizedMoEGateMethod(QuantizeMethodBase):
             )
         logger.info(
             "Online %s router gate: %s weights converted after loading "
-            "(original float weight retained; this changes routing numerics)",
+            "(this changes routing numerics)",
             self.scheme,
             tuple(weight.shape),
         )
@@ -222,6 +221,52 @@ def offline_gate_config(quant_config, prefix):
     return quant_config
 
 
+class StreamingGateMethod(QuantizedMoEGateMethod):
+    def install(self, layer):
+        from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+            NPUOnlineDenseWeightLoader,
+            get_npu_online_integer_quant_spec,
+        )
+        from sglang.srt.layers.parameter import ModelWeightParameter
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        shape = tuple(layer.weight.shape)
+        loader = NPUOnlineDenseWeightLoader(
+            layer,
+            torch.bfloat16,
+            default_weight_loader,
+            get_npu_online_integer_quant_spec("w8a8_int"),
+            lambda: self._convert(layer),
+        )
+        with torch.device("meta"):
+            weight = ModelWeightParameter(
+                data=torch.empty(shape, dtype=torch.bfloat16),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=loader.weight_loader,
+            )
+        layer.weight = weight
+        loader.register_source(weight)
+
+    def _convert(self, layer):
+        super().process_weights_after_loading(layer)
+        # The quantized buffers own the storage used by apply().
+        from sglang.srt.layers.parameter import ModelWeightParameter
+
+        layer.weight = ModelWeightParameter(
+            data=layer.gate_quant_weight,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=layer._npu_online_dense_loader.weight_loader,
+        )
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("online-gate")
+
+    def process_weights_after_loading(self, layer):
+        layer._npu_online_dense_loader.finish_post_load()
+
+
 def configure_online_gate(gate, layer_prefix: str = "", quant_config=None) -> bool:
     """Install the opt-in online gate quantization on ``gate``.
 
@@ -259,7 +304,8 @@ def configure_online_gate(gate, layer_prefix: str = "", quant_config=None) -> bo
     scheme = schemes.get("gate")
     if scheme is None:
         return False
-    method = QuantizedMoEGateMethod(scheme)
+    method = StreamingGateMethod(scheme)
+    method.install(gate)
     gate.quant_method = method
     gate._npu_online_gate = method
     gate._npu_gate_method = method
@@ -376,39 +422,14 @@ class OnlineLinearMethod(QuantizedMoEGateMethod):
 
 
 def online_linear_method(layer, prefix):
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        get_npu_online_linear_method,
+    )
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-    from sglang.srt.runtime_context import get_flags
 
-    parts = prefix.split(".")
-    name = parts[-1]
-    if "shared_experts" in parts or "shared_expert" in parts:
-        target = "shared_expert"
-    elif name in (
-        "qkv_proj",
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "q_a_proj",
-        "q_b_proj",
-        "kv_a_proj_with_mqa",
-        "kv_b_proj",
-    ):
-        target = "qkv"
-    elif (
-        "mlp" in parts
-        and "experts" not in parts
-        and name in ("gate_up_proj", "gate_proj", "up_proj", "down_proj")
-    ):
-        target = "dense"
-    else:
-        return layer.quant_method
-    scheme = (get_flags().moe.online_quantization or {}).get(target)
-    if scheme is None:
-        return layer.quant_method
-    if not isinstance(layer.quant_method, UnquantizedLinearMethod):
-        # Offline checkpoint storage cannot be interpreted as floating weights.
-        return layer.quant_method
-    return OnlineLinearMethod(scheme, layer.params_dtype)
+    if isinstance(layer.quant_method, UnquantizedLinearMethod):
+        return get_npu_online_linear_method(prefix) or layer.quant_method
+    return layer.quant_method
 
 
 def select_linear_boundary_quant_format(projections):

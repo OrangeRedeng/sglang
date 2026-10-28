@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import NamedTuple, Optional
 
 import torch
-
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     AllGatherFinalizeRoutingWrapper,
     NPUFinalizeRouting,
@@ -44,6 +43,9 @@ class AscendTPDispatchOutput(NamedTuple):
 class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     shared_output: Optional[torch.Tensor] = None
+    gmm2_input_scale: Optional[torch.Tensor] = None
+    gmm2_weight: Optional[torch.Tensor] = None
+    gmm2_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -57,6 +59,7 @@ class AscendTPDispatcher(BaseDispatcher):
         self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
+        self.fuse_gmm2_finalize = False
         self.quant_config: Optional[dict] = None
 
         # Initialise routing kernels with default (no quant config yet)
@@ -119,6 +122,7 @@ class AscendTPDispatcher(BaseDispatcher):
         *,
         pre_quant_input=None,
     ) -> AscendTPDispatchOutput:
+        self.init.row_idx_type = int(self.fuse_gmm2_finalize)
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
@@ -187,6 +191,25 @@ class AscendTPDispatcher(BaseDispatcher):
 
         dispatch_out = self._dispatch_output
 
+        if combine_input.gmm2_input_scale is not None:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                fused_gmm2_finalize,
+            )
+
+            if not self.fuse_gmm2_finalize:
+                raise RuntimeError("GMM2 finalize payload requires enabled fusion")
+            result = fused_gmm2_finalize(
+                combine_input.hidden_states,
+                combine_input.gmm2_input_scale,
+                combine_input.gmm2_weight,
+                combine_input.gmm2_weight_scale,
+                dispatch_out.expert_tokens,
+                dispatch_out.topk_weights,
+                dispatch_out.expanded_row_idx,
+                combine_input.shared_output,
+            )
+            self._dispatch_output = None
+            return result
         shared_kwargs = {}
         if combine_input.shared_output is not None:
             if not isinstance(self.finalize, NPUFinalizeRouting):
@@ -202,5 +225,9 @@ class AscendTPDispatcher(BaseDispatcher):
             **shared_kwargs,
         )
 
+        if combine_input.shared_output is not None:
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("tp-shared")
         self._dispatch_output = None
         return final_hidden_states

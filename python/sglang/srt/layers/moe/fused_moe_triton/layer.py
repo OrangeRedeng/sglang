@@ -8,8 +8,6 @@ from functools import cached_property
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch.nn.parameter import UninitializedParameter
-
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
@@ -93,6 +91,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch.nn.parameter import UninitializedParameter
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -444,14 +443,10 @@ class FusedMoE(torch.nn.Module):
         if _is_npu:
             online_scheme = (get_flags().moe.online_quantization or {}).get("moe")
             if online_scheme is not None:
-                if online_scheme != "W8A8_MXFP8":
+                if online_scheme not in ("W8A8_DYNAMIC", "W4A4_DYNAMIC"):
                     raise ValueError(
-                        "Online MoE conversion currently supports only W8A8_MXFP8"
+                        "Online MoE conversion requires an INT streaming scheme"
                     )
-                if quant_config is None:
-                    from sglang.srt.layers.quantization.fp8 import Fp8Config
-
-                    quant_config = Fp8Config(use_mxfp8=True)
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
@@ -654,8 +649,12 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.dispatcher.finalize, NPUFinalizeRouting)
             and not self.moe_runner_config.apply_router_weight_on_input
         )
-        self.should_fuse_routed_scaling_factor_in_topk |= eligible
-        return eligible, eligible and self.num_fused_shared_experts == 0
+        from sglang.srt.environ import envs
+
+        routed = eligible and envs.SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE.get()
+        shared = routed and envs.SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT.get()
+        self.should_fuse_routed_scaling_factor_in_topk |= routed
+        return routed, shared and self.num_fused_shared_experts == 0
 
     def _set_runner_flags(self) -> None:
         backend = self.runner_backend
@@ -1815,6 +1814,27 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple],
     ) -> DispatchOutput:
+        if isinstance(self.dispatcher, AscendTPDispatcher):
+            from sglang.srt.environ import envs
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import supports_npu_op
+
+            self.dispatcher.fuse_gmm2_finalize = (
+                envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
+                and self.w2_weight.dtype == torch.int8
+                and getattr(self, "w2_weight_offset", None) is None
+                and getattr(self, "w2_scale_bias", None) is None
+                and getattr(self, "w2_weight_bias", None) is None
+                and self.moe_runner_config.activation == "silu"
+                and self.moe_runner_config.swiglu_limit is None
+                and self.moe_runner_config.gemm1_alpha is None
+                and self.moe_runner_config.gemm1_clamp_limit is None
+                and supports_npu_op("npu_dequant_swiglu_quant")
+                and supports_npu_op(
+                    "npu_grouped_matmul_finalize_routing",
+                    ("scale", "pertoken_scale", "row_index", "output_bs"),
+                )
+                and supports_npu_op("npu_moe_init_routing_v2", ("row_idx_type",))
+            )
         if pre_quant_input is not None and isinstance(
             self.dispatcher, AscendTPDispatcher
         ):

@@ -3,12 +3,11 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
-from torch.nn.parameter import Parameter
-
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.dequantization import copy_missing_attrs
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.runtime_context import get_model
+from torch.nn.parameter import Parameter
 
 
 @dataclass(frozen=True)
@@ -40,7 +39,12 @@ def get_npu_online_integer_quant_spec(
 ) -> Optional[NPUOnlineIntegerQuantSpec]:
     if mode is None:
         mode = get_model().online_quantization
-    return _ONLINE_INTEGER_QUANT_SPECS.get(mode)
+    from sglang.srt.hardware_backend.npu.online_quant_config import (
+        resolve_online_quantization,
+    )
+
+    resolved = resolve_online_quantization(mode)
+    return _ONLINE_INTEGER_QUANT_SPECS.get(resolved.integer_mode())
 
 
 def get_npu_online_moe_integer_quant_spec(
@@ -48,6 +52,11 @@ def get_npu_online_moe_integer_quant_spec(
 ) -> Optional[NPUOnlineIntegerQuantSpec]:
     if mode is None:
         mode = get_model().online_quantization
+    from sglang.srt.hardware_backend.npu.online_quant_config import (
+        resolve_online_quantization,
+    )
+
+    mode = resolve_online_quantization(mode).integer_mode()
     if mode != "w4a4_int":
         return get_npu_online_integer_quant_spec(mode)
     if weight_prefix not in {"w13", "w2"}:
@@ -160,6 +169,9 @@ def npu_format_online_moe_scale(
     return _encode_online_int4_scale(scale)
 
 
+_CONVERSION_LOCK = threading.RLock()
+
+
 class NPUOnlineDenseWeightLoader:
     def __init__(
         self,
@@ -178,22 +190,24 @@ class NPUOnlineDenseWeightLoader:
         self.load_device = torch.get_default_device()
         self.lock = threading.Lock()
         self.loaded_numel = 0
+        self.loaded_shards = set()
         self.state = "loading"
         self.source_shape = None
         self.target_numel = 0
 
     def register_source(self, weight: Parameter) -> None:
         self.source_shape = tuple(weight.shape)
+        self.source_class = weight.__class__
         self.target_numel = weight.numel()
         self.layer._npu_online_dense_loader = self
 
     def _materialize_source(self) -> Parameter:
         current = self.layer.weight
-        source = current.__class__(
+        source = self.source_class(
             data=torch.empty(
                 self.source_shape,
                 dtype=self.params_dtype,
-                device=self.load_device,
+                device="cpu",
             ),
             input_dim=1,
             output_dim=0,
@@ -218,7 +232,11 @@ class NPUOnlineDenseWeightLoader:
             was_ready_reload = self.state == "ready_reload"
             if was_ready_reload:
                 self.loaded_numel = 0
+                self.loaded_shards.clear()
                 self.state = "loading"
+            if loaded_shard_id in self.loaded_shards:
+                raise RuntimeError("Duplicate dense online-quantized shard")
+            self.loaded_shards.add(loaded_shard_id)
             current = self.layer.weight
             if (
                 current.device.type == "meta"
@@ -231,7 +249,7 @@ class NPUOnlineDenseWeightLoader:
                 current = self._materialize_source()
             param = current
 
-        loaded_weight = loaded_weight.to(self.load_device)
+        loaded_weight = loaded_weight.to("cpu")
         kwargs = {}
         if loaded_shard_id is not None:
             kwargs["loaded_shard_id"] = loaded_shard_id
@@ -253,7 +271,12 @@ class NPUOnlineDenseWeightLoader:
                 should_quantize = True
 
         if should_quantize:
-            self.on_complete()
+            with _CONVERSION_LOCK:
+                self.layer.weight.data = self.layer.weight.data.to(self.load_device)
+                self.on_complete()
+            from sglang.srt.hardware_backend.npu.feature_evidence import loading_memory
+
+            loading_memory(self.layer, "online-dense")
             with self.lock:
                 self.state = "converted"
 
@@ -284,6 +307,7 @@ class NPUOnlineMoEWeightLoader:
         self.load_device = torch.get_default_device()
         self.lock = threading.Lock()
         self.loaded_numel = {"w13": 0, "w2": 0}
+        self.loaded_shards = {"w13": set(), "w2": set()}
         self.state = {"w13": "loading", "w2": "loading"}
         self.source_shapes = {}
         self.target_numel = {}
@@ -306,7 +330,7 @@ class NPUOnlineMoEWeightLoader:
             torch.empty(
                 self.source_shapes[weight_prefix],
                 dtype=self.params_dtype,
-                device=self.load_device,
+                device="cpu",
             ),
             requires_grad=False,
         )
@@ -365,14 +389,19 @@ class NPUOnlineMoEWeightLoader:
                 )
             if state == "ready_reload":
                 self.loaded_numel[weight_prefix] = 0
+                self.loaded_shards[weight_prefix].clear()
                 self.state[weight_prefix] = "loading"
+            shard = (expert_id, shard_id)
+            if shard in self.loaded_shards[weight_prefix]:
+                raise RuntimeError(f"Duplicate online MoE shard {shard}")
+            self.loaded_shards[weight_prefix].add(shard)
 
             current = getattr(self.layer, weight_attr)
             if current.device.type == "meta" or state == "ready_reload":
                 current = self._materialize_source(weight_prefix)
             param = current
 
-        loaded_weight = loaded_weight.to(self.load_device)
+        loaded_weight = loaded_weight.to("cpu")
         copy_counter = CopyNumelCounter()
         with copy_counter:
             self.original_weight_loader(
@@ -394,8 +423,15 @@ class NPUOnlineMoEWeightLoader:
                 should_quantize = True
 
         if should_quantize:
-            kernel = getattr(self.layer, f"{weight_prefix}_kernel")
-            kernel.process_weights_after_loading(self.layer, weight_prefix)
+            with _CONVERSION_LOCK:
+                getattr(self.layer, weight_attr).data = getattr(
+                    self.layer, weight_attr
+                ).data.to(self.load_device)
+                kernel = getattr(self.layer, f"{weight_prefix}_kernel")
+                kernel.process_weights_after_loading(self.layer, weight_prefix)
+            from sglang.srt.hardware_backend.npu.feature_evidence import loading_memory
+
+            loading_memory(self.layer, f"online-moe-{weight_prefix}")
             with self.lock:
                 self.state[weight_prefix] = "converted"
 

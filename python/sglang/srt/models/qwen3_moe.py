@@ -23,9 +23,6 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
@@ -79,6 +76,8 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
+from transformers import PretrainedConfig
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -288,6 +287,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
+
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+                offline_gate_config,
+            )
+
+            gate_prefix = add_prefix("gate", prefix)
+            if offline_gate_config(quant_config, gate_prefix) is None:
+                configure_online_gate(self.gate, gate_prefix)
 
         if _is_npu:
             from sglang.srt.hardware_backend.npu.moe.norm_gate import (

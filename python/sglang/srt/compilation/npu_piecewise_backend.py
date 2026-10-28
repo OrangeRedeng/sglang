@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import torch
 import torch.fx as fx
-
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compile_phase import (
@@ -108,6 +107,9 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = npugraph
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("graph-piecewise-capture")
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -126,4 +128,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
         entry.cudagraph.replay()
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("graph-piecewise-replay")
         return entry.output

@@ -37,20 +37,32 @@ def handle_npu_backends(server_args: Any):
     if cfg.device == "npu":
         from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
+        if cfg.fuseep_mode == 3:
+            from sglang.srt.hardware_backend.npu.moe.fuseep import (
+                _check_mega_moe_support,
+            )
+
+            _check_mega_moe_support()
         set_default_server_args(server_args)
 
         # Mixed W4A4/W8A8 online quantization is MoE-only: dense W4A4 has not
         # met the accuracy requirement, so reject dense architectures early.
-        if cfg.online_quantization == "w4a4_int":
+        from sglang.srt.hardware_backend.npu.online_quant_config import (
+            resolve_online_quantization,
+        )
+
+        if (
+            resolve_online_quantization(cfg.online_quantization).integer_mode()
+            == "w4a4_int"
+        ):
             architectures = model_config_of(server_args).hf_config.architectures
-            if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(
-                architectures
-            ):
+            if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(architectures):
                 raise ValueError(
                     "--online-quantization w4a4_int is disabled for dense models "
                     "because dense W4A4 is inaccurate; it is currently MoE-only. "
                     f"Got architectures={architectures}."
                 )
+
 
 def handle_mps_backends(server_args: Any):
     cfg = resolving_view(server_args)

@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from msgspec import structs
 from sgl_kernel_npu.norm.l1_norm import l1_norm as _l1_norm
-
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
@@ -211,4 +210,8 @@ def _finalize_topk_npu(
             (rows >= num_token_non_padded)[:, None], -1
         )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=recorder_ids)
+    if topk_config.apply_routed_scaling_factor_on_output:
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("tp-routed-scale")
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

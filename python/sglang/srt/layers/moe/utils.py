@@ -8,7 +8,6 @@ from enum import Enum, IntEnum
 from typing import NamedTuple
 
 import torch
-
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -544,7 +543,11 @@ def initialize_moe_config():
             # INT-only A3 stack: gate targets accept the INT gate contracts; the
             # routed 'moe' target has no scoped conversion (use bare
             # w8a8_int/w4a4_int load-time modes instead).
-            allowed = GATE_SCHEME_CONTRACTS if target != "moe" else ()
+            allowed = (
+                ("W8A8_DYNAMIC", "W4A4_DYNAMIC")
+                if target == "moe"
+                else GATE_SCHEME_CONTRACTS
+            )
             if scheme not in allowed:
                 raise ValueError(f"Online {target}:{scheme} conversion is unsupported")
     # Seeded with the user's intent; each model's gate refines the ACTIVE
@@ -657,6 +660,12 @@ def resolve_shared_experts_config(
         num_fused = 0
     else:
         num_fused = count_fusable(hf_config)
+    if _is_npu and count_fusable is not None and hasattr(hf_config, "n_shared_experts"):
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            npu_tp_shared_expert_count,
+        )
+
+        num_fused = npu_tp_shared_expert_count(hf_config, quant_config, num_fused)
     return SharedExpertsConfig(
         fusion_disabled=disabled,
         num_fused_shared_experts=num_fused,

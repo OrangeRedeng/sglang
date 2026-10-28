@@ -5,7 +5,6 @@ from functools import lru_cache
 from typing import List, Optional
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
@@ -25,7 +24,6 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
-
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -574,7 +572,16 @@ class DSANPUIndexerMixin:
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            if use_quant_indexer:
+                record(
+                    "indexer-int8"
+                    if pool.index_k_store_dtype == torch.int8
+                    else "indexer-mxfp8"
+                )
             if shard is not None:
+                record("indexer-query-shard")
                 topk_indices = shard.resolve(
                     topk_indices, num_query_tokens, forward_batch
                 )

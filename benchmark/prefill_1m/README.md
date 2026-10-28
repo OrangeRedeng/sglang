@@ -213,3 +213,75 @@ Packed INT8 KV uses a BF16 page read for DCP partial attention; its temporary
 read allocation and performance require A3 validation. HiCache disables INT8
 indexer storage as in the current #42224 head. Tests of removed experimental
 stream APIs have been removed; runtime state is explicit in the pool/graph tests.
+
+## A3 validation, individual MoE tests and TTFT benchmarks
+
+The primary checkpoint is ModelSlim INT. BF16 weights are used only as the
+source of online-quantization cases. Integer presets create meta parameters,
+stage incomplete local weights on CPU, and serialize completed-group NPU
+conversion. A preset can be followed by target overrides, for example
+`--online-quantization w8a8_int,gate:w8a8_dynamic`. The override wins for that
+target; routed experts remain streamed and compressed. Standalone scoped
+requests leave unselected weights floating. CPU staging consumes host memory
+for outstanding loading groups; this is separate from NPU peak memory.
+
+```bash
+# Host + device regressions, independent feature activation and numerical parity.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
+  --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
+  --bf16-model-path /home/weights/GLM-5.2 --tp 16 --dcp 8 --output validation.md
+
+# Small SGLang serving benchmarks: baseline and selected qualified variants.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage small \
+  --cases 'small-baseline,small-tp-*,small-megamoe' --output small.md
+
+# Cold and 99% shared-prefix TTFT, 32K/128K/256K/512K/1M, concurrency 1/16.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage long \
+  --benchmark-variants baseline,megamoe --tp 16 --dcp 8 --output long.md
+
+# Inspect commands before allocating devices or loading weights.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage long --dry-run \
+  --benchmark-variants baseline,megamoe --output long-plan.md
+```
+
+Use `--list` and `--cases` to select individual cases. Separate cases cover
+routed scaling, GMM2 finalization, shared finalization, INT8 input reuse,
+shared activation quantization, multistream scheduling, automatic thresholds,
+HCCL sizing, FuseEP modes 1/2 and MegaMoE mode 3. Online gate, QKV, dense and
+shared-expert overrides each have their own case. MXFP experiments are excluded.
+
+Every serving variant runs against an otherwise matching reference and checks
+teacher-forced input-token logprobs (`rtol=0.01`, `atol=0.01`). Dedicated NPU
+layer tests compare the same quantized operands numerically. `PASS` requires
+activation evidence where specified and numerical parity; generation-only
+cases retain `SMOKE_PASS`. Missing activation is `INACTIVE`; missing APIs are
+`DEPENDENCY_BLOCKED`. Skipped device tests remain visible as incomplete evidence.
+These states do not count as a fully validated suite.
+
+Small benchmarks use `python -m sglang.benchmark.serving`, exact random token
+IDs, 512/4096 inputs, 32 outputs, 32 requests, concurrency 1/8 and three repeats.
+Long benchmarks use 16 requests per repeat and one output token, with independent
+cold and 99% prefix-reuse workloads. Both restart the variant with diagnostic
+evidence disabled for timing. Warmup is excluded; cold repeats flush the cache,
+and prefix runs flush then prime their shared prefix. Observed cached-token
+counts are checked. The report includes individual TTFT samples, median/p95,
+repeat variability, commands and bounded diagnostic excerpts.
+
+Override workload sizes with `--small-lengths`, `--small-concurrency`,
+`--small-requests`, `--long-lengths`, `--long-concurrency`, `--long-requests`,
+`--benchmark-repeats` and `--request-timeout`. Length/concurrency arguments are
+comma-separated integers. Longer-than-supported contexts or insufficient KV
+capacity produce explicit blocked points; requests are never shortened. The
+server uses at most the checkpoint's declared context limit by default. A 1M
+point needs a checkpoint/configuration that actually supports that context.
+
+MegaMoE mode 3 requires an A3-compatible ModelSlim W4A8/W8A8 checkpoint and
+matching CANN/operator/DeepEP packages exposing `FuseMode.MEGA_MOE` and the
+current activation/bias API. Capability probes run before model loading.
+This runner does not install dependencies or reinterpret W4A4 as W4A8.
+The primary checkpoint is authoritative for its format; use a compatible W8A8
+checkpoint in a separate invocation to cover that mode-3 combination.
+
+Reports are a single fresh `.md` file per invocation. Source paths, commit,
+tracked-diff fingerprint and loading peak-memory evidence are embedded.
+Host checks do not establish target-NPU accuracy, graph replay or performance.

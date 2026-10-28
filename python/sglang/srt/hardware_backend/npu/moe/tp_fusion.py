@@ -5,7 +5,7 @@ from functools import lru_cache
 from types import SimpleNamespace
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT8,
     MXFP8,
@@ -143,7 +143,8 @@ def prequantize_tp_input(experts, hidden_states, shared_experts=None):
 
     dispatcher = experts.dispatcher
     if (
-        hidden_states.shape[0] == 0
+        not envs.SGLANG_NPU_TP_MOE_PREQUANT_INPUT.get()
+        or hidden_states.shape[0] == 0
         or get_is_capture_mode()
         or torch.compiler.is_compiling()
         or shared_experts is None
@@ -168,6 +169,9 @@ def prequantize_tp_input(experts, hidden_states, shared_experts=None):
         and supports_npu_op("npu_dynamic_quant")
     ):
         data, scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("tp-prequant")
         return QuantizedOperand(data, scale, INT8, tuple(hidden_states.shape))
     return None
 
@@ -187,7 +191,8 @@ def shared_gmm1_mode(mlp=None):
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
     if (
-        get_is_capture_mode()
+        not envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get()
+        or get_is_capture_mode()
         or torch.compiler.is_compiling()
         or not isinstance(getattr(mlp, "act_fn", None), SiluAndMul)
         or any(
@@ -239,7 +244,11 @@ def shared_gmm1(mlp, x, pre_quant_input=None):
         gate_up = mlp.gate_up_proj(x if pre_quant_input is None else pre_quant_input)[0]
         data, scale = NPUSwigluQuant()._apply_activation(gate_up)
         operand = QuantizedOperand(data, scale, INT8, tuple(data.shape), x.dtype)
-        return mlp.down_proj(operand)[0]
+        result = mlp.down_proj(operand)[0]
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("tp-shared-activation")
+        return result
     from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
         NPUMXFP8LinearMethod,
     )
@@ -537,3 +546,37 @@ def validate_tp_expert_weights(layer, *, prepared=True):
         for name, tensor in layer.named_parameters(recurse=False):
             if name.startswith(("w13_", "w2_")):
                 tensor._npu_shared_loaded_shards = set()
+
+
+def fused_gmm2_finalize(
+    x,
+    x_scale,
+    weight,
+    weight_scale,
+    expert_tokens,
+    topk_weights,
+    expanded_row_idx,
+    shared_output=None,
+):
+    from sglang.srt.hardware_backend.npu.feature_evidence import record
+    from sglang.srt.hardware_backend.npu.triton_kernel.tp_moe_fusion import (
+        pack_finalize_routing,
+    )
+
+    rows, logits = pack_finalize_routing(expanded_row_idx, topk_weights)
+    result = torch.ops.npu.npu_grouped_matmul_finalize_routing(
+        x,
+        weight,
+        expert_tokens,
+        scale=weight_scale,
+        pertoken_scale=x_scale,
+        shared_input=shared_output,
+        shared_input_weight=1.0,
+        logit=logits,
+        row_index=rows,
+        output_bs=topk_weights.shape[0],
+        group_list_type=1,
+        dtype=torch.float32,
+    )
+    record("tp-finalize")
+    return result.to(torch.bfloat16)

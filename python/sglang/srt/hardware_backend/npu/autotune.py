@@ -345,8 +345,7 @@ def context_from_server_args(server_args):
                     name: getattr(envs, name).get()
                     for name in (
                         "SGLANG_NPU_USE_MULTI_STREAM",
-                        "SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8",
-                        "SGLANG_NPU_TP_MOE_MXFP8_GATE",
+                        "SGLANG_NPU_TP_MOE_NORM_MXFP8",
                         "SGLANG_NPU_TP_MOE_PREQUANT_INPUT",
                         "SGLANG_NPU_TP_MOE_REUSE_MXFP8",
                         "SGLANG_NPU_TP_MOE_FUSED_SHARED_EXPERT",
@@ -358,7 +357,7 @@ def context_from_server_args(server_args):
                         "SGLANG_NPU_DSA_EAGER_INDEXER",
                         "SGLANG_NPU_ENABLE_DSA_CP",
                         "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING",
-                        "SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH",
+                        "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH",
                     )
                 },
                 sort_keys=True,
@@ -472,6 +471,9 @@ def initialize(server_args):
         log_decision(decision)
         if not dry and decision.value is not None:
             os.environ.setdefault(decision.name, str(decision.value))
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("auto-hccl", value=os.environ[decision.name], source=decision.source)
     if enabled("SGLANG_NPU_AUTO_STREAM_THRESHOLDS") or enabled(
         "SGLANG_NPU_TUNING_PROFILE"
     ):
@@ -488,6 +490,9 @@ def initialize(server_args):
             log_decision(decision)
             if not dry:
                 os.environ.setdefault(name, str(decision.value))
+                from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+                record("auto-stream-thresholds", threshold=name, value=decision.value)
 
 
 def threshold_allows(name, rows):

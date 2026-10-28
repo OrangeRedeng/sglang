@@ -19,7 +19,6 @@ from functools import lru_cache
 from typing import Optional, Sequence, Tuple
 
 import torch
-
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT4,
     INT8,
@@ -65,36 +64,11 @@ def parse_online_quantization(spec: Optional[str]) -> dict:
     reads the raw flag value. Raises ValueError on malformed input; 'all'
     expands to every target.
     """
-    if not spec:
-        return {}
-    if spec.strip().lower() in BARE_INTEGER_ONLINE_QUANT_MODES:
-        return {}
-    parsed = {}
-    for pair in spec.split(","):
-        pair = pair.strip().lower()
-        if not pair:
-            continue
-        target, sep, scheme = pair.partition(":")
-        target, scheme = target.strip(), scheme.strip()
-        if not sep or target not in ONLINE_QUANT_TARGETS:
-            raise ValueError(
-                f"--online-quantization expects TARGET:SCHEME pairs; got {pair!r}"
-            )
-        if scheme not in ONLINE_QUANT_SCHEMES:
-            raise ValueError(
-                f"--online-quantization scheme {scheme!r} is not one of "
-                f"{sorted(ONLINE_QUANT_SCHEMES)}"
-            )
-        if target in parsed:
-            raise ValueError(f"Duplicate --online-quantization target: {target}")
-        parsed[target] = ONLINE_QUANT_SCHEMES[scheme]
-    if "all" in parsed:
-        scheme = parsed.pop("all")
-        parsed = {
-            **{target: scheme for target in ONLINE_QUANT_TARGETS if target != "all"},
-            **parsed,
-        }
-    return parsed
+    from sglang.srt.hardware_backend.npu.online_quant_config import (
+        resolve_online_quantization,
+    )
+
+    return dict(resolve_online_quantization(spec).overrides)
 
 
 @dataclass(frozen=True)

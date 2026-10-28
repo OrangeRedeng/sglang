@@ -48,7 +48,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import tqdm
-
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
@@ -1900,6 +1899,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_warmup_hook=post_warmup_hook,
         )
+        if self._is_full_backend and self.model_runner.device == "npu":
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("graph-full-capture")
 
     def load_batch(
         self, forward_batch: ForwardBatch, **kwargs
@@ -2266,6 +2269,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            if self._is_full_backend and self.model_runner.device == "npu":
+                from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+                record("graph-full-replay")
             hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 

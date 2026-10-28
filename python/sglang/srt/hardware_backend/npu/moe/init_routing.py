@@ -44,7 +44,6 @@ def supports_packed_routing(kind, passthrough=False):
     """Check packed routing against the installed activation quantizer."""
     try:
         import torch_npu
-
         from sglang.srt.hardware_backend.npu.moe.contracts import INT4, MXFP4
         from sglang.srt.hardware_backend.npu.moe.quant import quantize_mxfp4_activation
         from sglang.srt.hardware_backend.npu.moe.tp_fusion import supports_npu_op
@@ -218,6 +217,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
                 quant_mode=quant_mode,
+                **({"row_idx_type": self.row_idx_type} if self.row_idx_type else {}),
                 **scale_kwargs,
             )
         )

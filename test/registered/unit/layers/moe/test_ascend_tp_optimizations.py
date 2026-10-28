@@ -7,11 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-import torch
-
 import sglang.srt.layers.quantization  # noqa: F401
-from sglang.srt.hardware_backend.npu.moe import tp_fusion
+import torch
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.hardware_backend.npu.moe import tp_fusion
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT4,
     INT8,
@@ -137,7 +136,10 @@ class TestAscendTPOptimizations(CustomTestCase):
             down_proj=SimpleNamespace(quant_method=NPUW8A8Int8DynamicLinearMethod()),
             act_fn=GeluAndMul(),
         )
+        from sglang.srt.environ import envs
+
         with (
+            envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.override(True),
             patch.object(tp_fusion, "supports_npu_op", return_value=True),
             patch.object(tp_fusion, "supports_cann_symbol", return_value=True),
         ):

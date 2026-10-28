@@ -37,9 +37,6 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.kernels.ops.activation.silu_and_mul_clamp import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
@@ -239,6 +236,8 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch import nn
+from transformers import PretrainedConfig
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -1057,7 +1056,11 @@ class DeepseekV2MoE(nn.Module):
                 can_overlap_tp_shared,
             )
 
-            self._npu_tp_shared_overlap = can_overlap_tp_shared(self.experts) and (
+            self._npu_tp_shared_overlap = (
+                envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                and envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM.get()
+                and can_overlap_tp_shared(self.experts)
+            ) and (
                 self.shared_experts is not None
                 and not (
                     self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
@@ -1186,7 +1189,14 @@ class DeepseekV2MoE(nn.Module):
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and (get_is_capture_mode() or self._npu_tp_shared_overlap)
+                and (
+                    get_is_capture_mode()
+                    or (
+                        self._npu_tp_shared_overlap
+                        and hidden_states.shape[0]
+                        >= envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
+                    )
+                )
                 and not torch.compiler.is_compiling()
                 and not is_in_breakable_cuda_graph()
             ):
@@ -1236,6 +1246,10 @@ class DeepseekV2MoE(nn.Module):
         # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("multistream")
         current_stream = torch.get_device_module(hidden_states.device).current_stream()
         # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
         # stream BEFORE the alt-stream fork so both consumers see it.

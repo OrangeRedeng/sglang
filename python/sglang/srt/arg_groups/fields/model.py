@@ -11,7 +11,6 @@ from typing import (
 )
 
 import msgspec
-
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
@@ -192,14 +191,13 @@ class Model(msgspec.Struct):
                 "integer mode -- 'w8a8_int' (W8A8 for supported dense "
                 "projections and MoE experts) or 'w4a4_int' (mixed: dense "
                 "W8A8, MoE w13 W4A4 / w2 W8A8; MoE-only architectures) -- "
-                "which converts weights during loading; or 'TARGET:SCHEME' "
+                "which converts weights during loading; optionally followed by 'TARGET:SCHEME' "
                 "pairs separated by commas (e.g. "
-                "'gate:w8a8_mxfp8,qkv:w8a8_mxfp8') which quantize once after "
-                "loading. Targets: 'gate' (the routed-expert MoE router "
+                "'w8a8_int,gate:w8a8_dynamic') which stream selected INT weights. Targets: 'gate' (the routed-expert MoE router "
                 "gate), 'moe', 'shared_expert', 'qkv', 'dense', 'all'. "
-                "Schemes alias the Ascend quantization registry: "
-                "'w8a8_mxfp8', 'w4a8_mxfp', 'w4a4_mxfp4', 'w8a8_dynamic' "
-                "(INT8), 'w4a4_dynamic' (INT4). Unlike --quantization this "
+                "INT schemes: 'w8a8_dynamic' (INT8) and 'w4a4_dynamic' "
+                "(INT4 routed experts). Dense projections and router overrides "
+                "currently require INT8. Unlike --quantization this "
                 "never changes checkpoint semantics by default and is an "
                 "explicit accuracy experiment."
             ),

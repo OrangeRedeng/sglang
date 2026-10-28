@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
@@ -311,6 +310,10 @@ class AscendRunnerCore(MoeRunnerCore):
 
         # --- w2 (down) projection ---
         if running_state.get("ascend_tp_fused_gmm2") and hidden_states.shape[0] > 0:
+            if pertoken_scale is None or hidden_states.dtype != torch.int8:
+                raise ValueError(
+                    "Fused GMM2 finalize requires quantized INT8 activations and per-token scales"
+                )
             return AscendRunnerOutput(hidden_states, pertoken_scale)
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -355,8 +358,8 @@ def pre_permute_ascend_tp_to_ascend(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
-    running_state["ascend_tp_fused_gmm2"] = getattr(
-        runner_config.layer, "_npu_tp_fuse_gmm2_finalize", False
+    running_state["ascend_tp_fused_gmm2"] = (
+        runner_config.layer.dispatcher.fuse_gmm2_finalize
     )
     return AscendRunnerInput(
         hidden_states=dispatch_output.hidden_states,

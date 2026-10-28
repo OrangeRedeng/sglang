@@ -29,6 +29,17 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
         if getattr(cfg, name) is None
     }
+    if cfg.device == "npu":
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get():
+            if cfg.dcp_replicate_q_proj:
+                raise ValueError(
+                    "Ascend DSA full-width Q conflicts with --dcp-replicate-q-proj; "
+                    "use --no-dcp-replicate-q-proj"
+                )
+            overrides["dcp_replicate_q_proj"] = False
+            return overrides
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides

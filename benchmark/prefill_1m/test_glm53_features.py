@@ -5,14 +5,12 @@ from __future__ import annotations
 
 import argparse
 import ast
-from contextlib import nullcontext
 import fnmatch
 import importlib.metadata
 import importlib.util
 import json
 import os
 import re
-from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -21,17 +19,20 @@ import tempfile
 import threading
 import time
 import traceback
-from types import SimpleNamespace
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = sys.executable
 
 # These suites include their own capability/skip checks. Keep skipped tests visible.
 UNIT_SUITES = {
+    "a3-regressions": ["unit/npu/quantization/test_glm_a3_regressions.py"],
     "scheduler-probes": ["unit/managers/test_scheduler_stage_latency.py"],
     "int-contracts": [
         "unit/npu/quantization/test_fused_norm_quant_contracts.py",
@@ -146,6 +147,78 @@ SCENARIOS = {
     },
     "dcp-kv-gather": {"dcp": True},
 }
+
+
+# Every opt-in family is compared with an otherwise identical reference.
+SCENARIOS["int8-dense-gate"]["quant"] = (
+    "w8a8_int,gate:w8a8_dynamic,qkv:w8a8_dynamic,dense:w8a8_dynamic,shared_expert:w8a8_dynamic"
+)
+SCENARIOS["tp-finalize"] = {
+    "env": {"SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE": "True"},
+    "expected": ["tp-finalize"],
+    "probe": "tp-finalize",
+}
+SCENARIOS["tp-shared"] = {
+    "env": {
+        "SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE": "True",
+        "SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT": "True",
+    },
+    "separate_shared": True,
+    "expected": ["tp-shared"],
+}
+SCENARIOS.update(
+    {
+        "tp-routed-scale": {
+            "env": {"SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE": "True"},
+            "expected": ["tp-routed-scale"],
+        },
+        "tp-prequant": {
+            "env": {"SGLANG_NPU_TP_MOE_PREQUANT_INPUT": "True"},
+            "separate_shared": True,
+            "expected": ["tp-prequant"],
+        },
+        "tp-shared-activation": {
+            "env": {"SGLANG_NPU_TP_MOE_SHARED_GMM1": "True"},
+            "separate_shared": True,
+            "expected": ["tp-shared-activation"],
+        },
+        "auto-stream-thresholds": {
+            "env": {"SGLANG_NPU_AUTO_STREAM_THRESHOLDS": "True"},
+            "expected": ["auto-stream-thresholds"],
+        },
+        "auto-hccl": {
+            "env": {"SGLANG_NPU_AUTO_HCCL_BUFFSIZE": "True"},
+            "expected": ["auto-hccl"],
+        },
+    }
+)
+SCENARIOS["multistream"].update(separate_shared=True, expected=["multistream"])
+SCENARIOS["autotune-hccl"]["expected"] = ["auto-hccl", "auto-stream-thresholds"]
+for target in ("gate", "qkv", "dense", "shared_expert"):
+    SCENARIOS["online-" + target] = {
+        "quant": "w8a8_int," + target + ":w8a8_dynamic",
+        "expected": [
+            "online-gate" if target == "gate" else "online-dense",
+            "online-moe-w13",
+            "online-moe-w2",
+        ],
+    }
+for name in ("w8a8-load", "w4a4-mixed-load", "int8-dense-gate"):
+    SCENARIOS[name]["expected"] = ["online-dense", "online-moe-w13", "online-moe-w2"]
+for mode in (1, 2, 3):
+    name = "megamoe" if mode == 3 else f"fuseep-{mode}"
+    SCENARIOS[name] = {
+        "fuseep": mode,
+        "probe": name,
+        "expected": [name],
+        "separate_shared": True,
+        "env": {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
+    }
+SCENARIOS["indexer-int8"].update(expected=["indexer-int8"], probe="indexer-int8")
+SCENARIOS["indexer-query-shard"]["expected"] = ["indexer-query-shard"]
+for name in ("graph-full", "graph-piecewise"):
+    SCENARIOS[name]["expected"] = [name + "-capture", name + "-replay"]
+SERVING_STAGES = ("serve", "small", "long")
 
 
 def stop(process):
@@ -372,6 +445,18 @@ def case_checkpoint(args, scenario):
 
 def server_command(args, scenario):
     model_path, checkpoint_format = case_checkpoint(args, scenario)
+    context_length = args.context_length
+    config_path = Path(model_path) / "config.json" if model_path else None
+    if (
+        getattr(args, "stage", "serve") == "long"
+        and config_path
+        and config_path.is_file()
+    ):
+        config = json.loads(config_path.read_text())
+        config = config.get("text_config", config)
+        declared = config.get("max_position_embeddings")
+        if isinstance(declared, int) and declared > 0:
+            context_length = min(context_length, declared)
     command = [
         PYTHON,
         "-m",
@@ -387,7 +472,7 @@ def server_command(args, scenario):
         "--port",
         str(args.port),
         "--context-length",
-        str(args.context_length),
+        str(context_length),
         "--chunked-prefill-size",
         str(args.chunk),
         "--mem-fraction-static",
@@ -411,6 +496,19 @@ def server_command(args, scenario):
         ]
     if scenario.get("quant"):
         command += ["--online-quantization", scenario["quant"]]
+    if scenario.get("separate_shared"):
+        command += ["--disable-shared-experts-fusion"]
+    if scenario.get("fuseep"):
+        command += [
+            "--moe-a2a-backend",
+            "ascend_fuseep",
+            "--fuseep-mode",
+            str(scenario["fuseep"]),
+            "--ep-size",
+            str(args.tp),
+            "--deepep-mode",
+            "low_latency",
+        ]
     if scenario.get("dcp"):
         command += ["--dcp-size", str(args.dcp)]
     return command
@@ -462,6 +560,8 @@ def serve(args, case, directory, env):
                         {
                             "text": text,
                             "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                            "return_logprob": True,
+                            "logprob_start_len": 0,
                         },
                         args.request_timeout,
                     )
@@ -484,6 +584,41 @@ def serve(args, case, directory, env):
                 if not chat.get("choices", [{}])[0].get("message", {}).get("content"):
                     raise RuntimeError(f"empty chat response: {chat}")
                 responses.append(chat)
+            from concurrent.futures import ThreadPoolExecutor
+
+            prompts = ["Explain addition briefly. " * size for size in (8, 64, 256)]
+            for text in prompts:
+                responses.append(
+                    request(
+                        base + "/generate",
+                        {
+                            "text": text,
+                            "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                            "return_logprob": True,
+                            "logprob_start_len": 0,
+                        },
+                        args.request_timeout,
+                    )
+                )
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                concurrent = list(
+                    pool.map(
+                        lambda text: request(
+                            base + "/generate",
+                            {
+                                "text": text,
+                                "sampling_params": {
+                                    "temperature": 0,
+                                    "max_new_tokens": 8,
+                                },
+                            },
+                            args.request_timeout,
+                        ),
+                        prompts[:2],
+                    )
+                )
+            if any(not item.get("text") for item in concurrent):
+                raise RuntimeError("concurrent generation failed")
             (directory / "responses.json").write_text(json.dumps(responses, indent=2))
             if args.long_context and scenario == SCENARIOS["baseline"]:
                 command = [
@@ -504,17 +639,127 @@ def serve(args, case, directory, env):
                 ]
                 if run(command, directory / "prefill.log", args.case_timeout, env):
                     raise RuntimeError("long-context benchmark failed; see prefill.log")
-            # A successful request does not prove a capability-gated optimization ran.
-            return {
-                "status": "smoke_pass",
-                "activation": "unverified",
-                "quality": "unverified",
-                "graph_replay": "unverified"
-                if scenario.get("graph")
+            from feature_checks import evidence
+
+            events = evidence((directory / "server.log").read_text(errors="replace"))
+            seen = {item["feature"] for item in events}
+            missing = set(scenario.get("expected", [])) - seen
+            outcome = dict(
+                status="inactive" if missing else "smoke_pass",
+                activation="verified"
+                if scenario.get("expected") and not missing
+                else "unverified",
+                missing=sorted(missing),
+                evidence=events,
+                quality="unverified",
+                graph_replay="verified"
+                if scenario.get("graph") and not missing
                 else "not_requested",
-            }
+            )
+            if case["stage"] == "small":
+                from feature_benchmarks import small_commands
+
+                # Timed runs use fresh processes with evidence disabled, configured by the caller.
+                points = []
+                for command, output in small_commands(args, directory):
+                    code = run(
+                        command, output.with_suffix(".log"), args.case_timeout, env
+                    )
+                    if code:
+                        raise RuntimeError(f"small benchmark exited {code}")
+                    rows = [
+                        json.loads(line)
+                        for line in output.read_text().splitlines()
+                        if line.strip()
+                    ]
+                    if not rows or any(
+                        row.get("completed", 0) < args.small_requests for row in rows
+                    ):
+                        raise RuntimeError(
+                            "small benchmark did not complete every request"
+                        )
+                    points.append(dict(command=command, results=rows))
+                outcome["benchmarks"] = points
+            elif case["stage"] == "long":
+                from feature_benchmarks import long_matrix
+
+                points = long_matrix(
+                    args, base, request, case["checkpoint_path"], directory
+                )
+                outcome["benchmarks"] = points
+                if any(point["status"] == "capacity_blocked" for point in points):
+                    outcome["status"] = "capacity_blocked"
+            return outcome
         finally:
             stop(process)
+
+
+_REFERENCE_RESPONSES = {}
+
+
+def validate_serving(args, case, directory, case_env, base_env):
+    from feature_checks import compare_responses
+
+    scenario = case["scenario"]
+    if scenario.get("graph") and scenario.get("dcp"):
+        return dict(status="blocked", reason="prefill graphs do not support DCP")
+    if scenario.get("probe"):
+        probe = [
+            PYTHON,
+            str(Path(__file__).resolve()),
+            "--probe-feature",
+            scenario["probe"],
+        ]
+        code = run(probe, directory / "capability.log", 60, case_env)
+        if code:
+            return dict(
+                status="dependency_blocked",
+                reason="required operator/API unavailable; see capability.log",
+            )
+    reference = {
+        key: value
+        for key, value in scenario.items()
+        if key in ("quant", "dcp", "separate_shared")
+    }
+    reference_key = json.dumps(reference, sort_keys=True)
+    if reference_key not in _REFERENCE_RESPONSES:
+        reference_case = dict(
+            case,
+            stage="serve",
+            scenario=reference,
+            command=server_command(args, reference),
+        )
+        reference_directory = directory / "reference"
+        reference_directory.mkdir()
+        serve(args, reference_case, reference_directory, base_env)
+        _REFERENCE_RESPONSES[reference_key] = json.loads(
+            (reference_directory / "responses.json").read_text()
+        )
+        # Embed the reference once, in the same Markdown report.
+        for artifact in reference_directory.iterdir():
+            artifact.rename(directory / ("reference-" + artifact.name))
+        reference_directory.rmdir()
+    diagnostic_case = dict(case, stage="serve")
+    result = serve(args, diagnostic_case, directory, case_env)
+    responses = json.loads((directory / "responses.json").read_text())
+    result["parity"] = compare_responses(_REFERENCE_RESPONSES[reference_key], responses)
+    result["quality"] = "verified"
+    if result["status"] != "inactive" and (scenario.get("expected") or not scenario):
+        result["status"] = "pass"
+    if case["stage"] in ("small", "long"):
+        if result["status"] != "pass":
+            return dict(result, benchmark="blocked: activation and parity required")
+        measured = directory / "measured"
+        measured.mkdir()
+        measured_env = dict(case_env, SGLANG_NPU_FEATURE_EVIDENCE="False")
+        timed = serve(args, case, measured, measured_env)
+        result["benchmarks"] = timed.get("benchmarks", [])
+        if timed["status"] == "capacity_blocked":
+            result["status"] = "capacity_blocked"
+        for artifact in measured.iterdir():
+            artifact.rename(directory / ("measured-" + artifact.name))
+        measured.rmdir()
+    return result
 
 
 def markdown_block(text, language="text"):
@@ -527,10 +772,19 @@ def append_result(path, result, directory):
     with path.open("a") as output:
         output.write(f"\n## {result['id']}: {result['status'].upper()}\n\n")
         output.write(markdown_block(json.dumps(result, indent=2), "json"))
-        for artifact in sorted(directory.iterdir()):
+        for artifact in sorted(directory.rglob("*")):
             if artifact.is_file():
-                output.write(f"\n<details><summary>{artifact.name}</summary>\n\n")
-                output.write(markdown_block(artifact.read_text(errors="replace")))
+                output.write(
+                    f"\n<details><summary>{artifact.relative_to(directory)}</summary>\n\n"
+                )
+                from feature_checks import bounded_log
+
+                text = artifact.read_text(errors="replace")
+                output.write(
+                    markdown_block(
+                        bounded_log(text) if artifact.suffix == ".log" else text
+                    )
+                )
                 output.write("\n</details>\n")
 
 
@@ -603,6 +857,17 @@ def plan(args):
     ]
     cases.append(
         {
+            "id": "host-workloads",
+            "stage": "host",
+            "command": [
+                PYTHON,
+                str(Path(__file__).resolve()),
+                "--self-check-workloads",
+            ],
+        }
+    )
+    cases.append(
+        {
             "id": "host-suite-commands",
             "stage": "host",
             "command": [
@@ -667,12 +932,35 @@ def plan(args):
             "junit": True,
         }
     )
+    cases.append(
+        {
+            "id": "npu-moe-parity",
+            "stage": "npu",
+            "junit": True,
+            "command": [
+                PYTHON,
+                "-m",
+                "pytest",
+                "-q",
+                "-ra",
+                "-p",
+                "no:cacheprovider",
+                "test/registered/unit/npu/quantization/test_glm_a3_device_features.py",
+            ],
+        }
+    )
     for name, scenario in SCENARIOS.items():
+        scenario = dict(scenario)
+        stage = args.stage if args.stage in ("small", "long") else "serve"
+        if stage == "long":
+            if name not in getattr(args, "benchmark_variants", "baseline").split(","):
+                continue
+            scenario["dcp"] = args.dcp > 1
         model_path, checkpoint_format = case_checkpoint(args, scenario)
         cases.append(
             {
-                "id": "serve-" + name,
-                "stage": "serve",
+                "id": stage + "-" + name,
+                "stage": stage,
                 "scenario": scenario,
                 "command": server_command(args, scenario),
                 "requires_bf16": bool(scenario.get("quant")),
@@ -744,7 +1032,9 @@ def suite_command_self_check():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--stage", choices=("host", "unit", "npu", "serve", "all"), default="host"
+        "--stage",
+        choices=("host", "unit", "npu", "serve", "small", "long", "all"),
+        default="host",
     )
     parser.add_argument(
         "--cases", default="*", help="Comma-separated case globs; see --list."
@@ -767,22 +1057,23 @@ def main():
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=os.environ.get("MODEL_PATH"),
+        default=os.environ.get("MODEL_PATH", "/home/weights/GLM5.2-w4a8-int/"),
         help="Local checkpoint directory (or set MODEL_PATH).",
     )
     parser.add_argument(
         "--checkpoint-format",
         choices=("bf16", "modelslim"),
-        default="bf16",
+        default="modelslim",
         help="Use modelslim for an offline W4A8/W8A8 INT checkpoint; online conversion cases require bf16.",
     )
     parser.add_argument(
         "--bf16-model-path",
         type=Path,
+        default=Path("/home/weights/GLM-5.2"),
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
-    parser.add_argument("--tp", type=int, default=8)
-    parser.add_argument("--dcp", type=int, default=2)
+    parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--dcp", type=int, default=8)
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument("--chunk", type=int, default=4096)
@@ -804,7 +1095,54 @@ def main():
         / time.strftime("%Y%m%d-%H%M%S.md", time.gmtime()),
         help="Single Markdown report path (default: timestamp.md).",
     )
+    parser.add_argument(
+        "--benchmark-variants",
+        default="baseline",
+        help="Long-context variants, comma separated",
+    )
+    parser.add_argument(
+        "--small-lengths",
+        type=lambda s: [int(x) for x in s.split(",")],
+        default=[512, 4096],
+    )
+    parser.add_argument(
+        "--small-concurrency",
+        type=lambda s: [int(x) for x in s.split(",")],
+        default=[1, 8],
+    )
+    parser.add_argument("--small-requests", type=int, default=32)
+    parser.add_argument(
+        "--long-lengths",
+        type=lambda s: [int(x) for x in s.split(",")],
+        default=[32768, 131072, 262144, 524288, 1048576],
+    )
+    parser.add_argument(
+        "--long-concurrency",
+        type=lambda s: [int(x) for x in s.split(",")],
+        default=[1, 16],
+    )
+    parser.add_argument("--long-requests", type=int, default=16)
+    parser.add_argument("--benchmark-repeats", type=int, default=3)
+    parser.add_argument(
+        "--self-check-workloads", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--probe-feature", choices=tuple(SCENARIOS), help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
+    if args.self_check_workloads:
+        from feature_checks import self_check_workloads
+
+        self_check_workloads()
+        return 0
+    if args.probe_feature:
+        from feature_checks import probe_feature
+
+        probe_feature(args.probe_feature)
+        return 0
+    if args.stage == "long" and args.context_length == 8192:
+        args.context_length = max(args.long_lengths) + 32
+
     if args.self_check_client:
         client_self_check()
         return 0
@@ -841,15 +1179,37 @@ def main():
         except FileNotFoundError:
             print("npu-smi unavailable")
         return 0
+    if (
+        any(
+            value < 1
+            for values in (
+                args.small_lengths,
+                args.small_concurrency,
+                args.long_lengths,
+                args.long_concurrency,
+            )
+            for value in values
+        )
+        or min(args.benchmark_repeats, args.small_requests, args.long_requests) < 1
+    ):
+        parser.error(
+            "benchmark lengths, concurrency, request counts and repeats must be positive"
+        )
     if args.tp < 1 or args.dcp < 1 or args.tp % args.dcp:
         parser.error("TP must be positive and divisible by DCP")
     if args.long_context and args.context_length <= args.long_context:
         parser.error("context-length must exceed long-context to leave output space")
+    if args.stage == "small" and max(args.small_lengths) + 32 > args.context_length:
+        parser.error(
+            "context-length must accommodate the largest small input plus 32 output tokens"
+        )
     cases = plan(args)
     if not cases:
         parser.error("no cases selected")
-    if any(case["stage"] in ("npu", "serve") for case in cases):
-        required = args.tp if any(case["stage"] == "serve" for case in cases) else 1
+    if any(case["stage"] in ("npu", *SERVING_STAGES) for case in cases):
+        required = (
+            args.tp if any(case["stage"] in SERVING_STAGES for case in cases) else 1
+        )
         cases.insert(
             0,
             {
@@ -882,13 +1242,24 @@ def main():
             + os.environ.get("PYTHONPATH", ""),
         )
         # Isolate opt-in families from inherited shell settings.
+        for name in list(env):
+            if name.startswith(
+                (
+                    "SGLANG_NPU_TP_MOE_",
+                    "SGLANG_NPU_DSA_",
+                    "SGLANG_NPU_ENABLE_DSA_",
+                    "SGLANG_NPU_ENABLE_DCP_",
+                )
+            ):
+                env.pop(name)
         for scenario in SCENARIOS.values():
             for name in scenario.get("env", {}):
-                env[name] = (
-                    "0"
-                    if name == "ASCEND_USE_FIA" or name.endswith("_MIN_TOKENS")
-                    else "False"
-                )
+                env.pop(name, None)
+        # These are boolean opt-ins; remove typed thresholds/modes instead of writing False into them.
+        for name in ("ASCEND_USE_FIA",):
+            env[name] = "0"
+        env["SGLANG_NPU_FEATURE_EVIDENCE"] = "True"
+        env.pop("HCCL_BUFFSIZE", None)
         env["SGLANG_NPU_TUNING_CACHE_DIR"] = str(Path(workspace) / "tuning-cache")
         env["SGLANG_NPU_TP_MOE_REUSE_MXFP8"] = "False"
         env["SGLANG_NPU_TP_MOE_NORM_MXFP8"] = "False"
@@ -916,6 +1287,10 @@ def main():
                     ["git", "status", "--porcelain"], cwd=ROOT, text=True
                 )
             ),
+            "source_paths": {"root": str(ROOT), "python": str(ROOT / "python")},
+            "tracked_diff_sha256": __import__("hashlib")
+            .sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT))
+            .hexdigest(),
             "environment": {
                 key: env.get(key)
                 for key in (
@@ -966,9 +1341,9 @@ def main():
                     )
                 elif args.dry_run:
                     result["status"] = "planned"
-                elif case["stage"] in ("npu", "serve") and not hardware_ready:
+                elif case["stage"] in ("npu", *SERVING_STAGES) and not hardware_ready:
                     result.update(status="blocked", reason="device preflight failed")
-                elif case["stage"] == "serve" and (
+                elif case["stage"] in SERVING_STAGES and (
                     not case.get("checkpoint_path")
                     or not Path(case["checkpoint_path"]).is_dir()
                 ):
@@ -980,8 +1355,10 @@ def main():
                     result.update(
                         status="blocked", reason="DCP scenario needs --dcp > 1"
                     )
-                elif case["stage"] == "serve":
-                    result.update(serve(args, case, directory, case_env))
+                elif case["stage"] in SERVING_STAGES:
+                    result.update(
+                        validate_serving(args, case, directory, case_env, env)
+                    )
                 else:
                     code = run(
                         result["command"],
@@ -1028,7 +1405,18 @@ def main():
         print(f"Results: {args.output}")
         statuses = {item["status"] for item in report["results"]}
         return (
-            1 if "fail" in statuses else 2 if statuses & {"blocked", "partial"} else 0
+            1
+            if "fail" in statuses
+            else 2
+            if statuses
+            & {
+                "blocked",
+                "partial",
+                "inactive",
+                "dependency_blocked",
+                "capacity_blocked",
+            }
+            else 0
         )
 
 

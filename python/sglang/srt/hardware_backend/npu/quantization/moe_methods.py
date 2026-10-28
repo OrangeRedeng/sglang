@@ -3,13 +3,12 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.nn.parameter import Parameter
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.contracts import MXFP4
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.utils import copy_or_rebind_param
+from torch.nn.parameter import Parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
@@ -301,6 +300,38 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
+
+    @staticmethod
+    def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:
+        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
+
+        Returns True when the FuseEP layout was (or has already been) applied,
+        so that the caller can skip its own ``process_weights_after_loading`` body.
+        """
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_ascend_fuseep():
+            return False
+
+        # Guard against double processing when called for multiple prefixes.
+        if getattr(layer, "_fuseep_weights_processed", False):
+            return True
+
+        from sglang.srt.hardware_backend.npu.moe.fuseep import process_fuseep_weights
+        from sglang.srt.runtime_context import get_exec
+
+        mode = get_exec().moe.fuseep_mode
+        if mode == 3:
+            process_fuseep_weights(layer, "w13")
+        else:
+            if not isinstance(layer.w13_kernel, NPUW8A8Int8MoEMethod) or not isinstance(
+                layer.w2_kernel, NPUW8A8Int8MoEMethod
+            ):
+                raise ValueError("FuseEP modes 1/2 require W8A8 INT expert projections")
+            for prefix in ("w13", "w2"):
+                process_fuseep_weights(layer, prefix)
+        layer._fuseep_weights_processed = True
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -661,34 +692,9 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
-    @staticmethod
-    def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:
-        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
-
-        Returns True when the FuseEP layout was (or has already been) applied,
-        so that the caller can skip its own ``process_weights_after_loading`` body.
-        """
-        from sglang.srt.layers.moe import get_moe_a2a_backend
-
-        if not get_moe_a2a_backend().is_ascend_fuseep():
-            return False
-
-        # Guard against double processing when called for multiple prefixes.
-        if getattr(layer, "_fuseep_weights_processed", False):
-            return True
-
-        from sglang.srt.hardware_backend.npu.moe.fuseep import process_fuseep_weights
-
-        for prefix in ("w13", "w2"):
-            process_fuseep_weights(layer, prefix)
-        layer._fuseep_weights_processed = True
-        return True
-
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
-        # If the FuseEP weight layout is used, process weights via
-        # maybe_apply_fuseep_weights and skip the rest of this method.
         if self.maybe_process_fuseep_weights(layer):
             return
 
@@ -772,6 +778,9 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        if self.maybe_process_fuseep_weights(layer):
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         # Process scale (and bias if needed)

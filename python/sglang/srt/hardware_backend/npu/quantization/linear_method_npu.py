@@ -3,8 +3,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT4,
     INT8,
@@ -24,6 +22,7 @@ from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.utils import copy_or_rebind_param
+from torch.nn.parameter import Parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -187,15 +186,29 @@ _W8A8_LINEAR_PROJECTIONS = frozenset(
 
 
 def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]:
-    spec = get_npu_online_integer_quant_spec()
-    if spec is None:
-        return None
+    from sglang.srt.hardware_backend.npu.online_quant_config import (
+        projection_target,
+        resolve_online_quantization,
+    )
+    from sglang.srt.runtime_context import get_model
 
-    projection = prefix.rsplit(".", 1)[-1]
-    if projection not in _W8A8_LINEAR_PROJECTIONS:
+    target = projection_target(prefix)
+    config = resolve_online_quantization(get_model().online_quantization)
+    mode = (
+        config.integer_mode(target)
+        if target
+        else (
+            "w8a8_int"
+            if config.preset and prefix.rsplit(".", 1)[-1] in _W8A8_LINEAR_PROJECTIONS
+            else None
+        )
+    )
+    if mode is None:
         return None
-    # w4a4_int is mixed precision: dense projections stay W8A8 while MoE
-    # expert projections use W4A4.
+    if mode != "w8a8_int":
+        raise ValueError(
+            "Scoped dense projections currently support streaming INT8 only"
+        )
     return NPUOnlineW8A8Int8LinearMethod()
 
 

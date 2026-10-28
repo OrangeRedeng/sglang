@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 import torch.distributed as dist
-
 from sglang.srt.arg_groups.overrides import (
     modelexpress_transport_of,
     modelexpress_url_of,
@@ -158,6 +157,9 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
 
 
 def report_online_quantization(*, model) -> None:
+    from sglang.srt.hardware_backend.npu.feature_evidence import loading_memory
+
+    loading_memory(model, "model-loaded")
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(
         getattr(model, "quant_config", None), "quantized_layers", None

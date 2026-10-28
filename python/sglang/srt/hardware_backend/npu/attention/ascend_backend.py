@@ -9,7 +9,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
 )
-
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -404,6 +403,8 @@ class AscendAttnBackend(AttentionBackend):
         # init_forward_metadata.
         self.quant_indexer_enabled = (
             self.use_mla
+            and getattr(model_runner.token_to_kv_pool, "index_k_store_dtype", None)
+            != torch.int8
             and getattr(model_runner.token_to_kv_pool, "index_k_scale_buffer", None)
             is not None
         )

@@ -162,6 +162,7 @@ def linear_input_contract(layer) -> Optional[ActivationContract]:
         NPU_W4A4DynamicLinearMethod,
         NPUMXFP4W4A8OfflineLinearMethod,
         NPUMXFP8LinearMethod,
+        NPUOnlineW8A8Int8LinearMethod,
         NPUSingleLevelMXFP4OfflineLinearMethod,
         NPUW8A8Int8DynamicLinearMethod,
     )
@@ -171,7 +172,9 @@ def linear_input_contract(layer) -> Optional[ActivationContract]:
         return kernel.contract
     if isinstance(kernel, (NPUMXFP8LinearMethod, NPUMXFP4W4A8OfflineLinearMethod)):
         return MXFP8
-    if isinstance(kernel, NPUW8A8Int8DynamicLinearMethod):
+    if isinstance(
+        kernel, (NPUW8A8Int8DynamicLinearMethod, NPUOnlineW8A8Int8LinearMethod)
+    ):
         return INT8
     if isinstance(kernel, NPU_W4A4DynamicLinearMethod):
         return INT4
