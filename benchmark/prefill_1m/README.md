@@ -70,7 +70,7 @@ point).
 Run from the repository root with the same Python environment used for serving:
 
 ```bash
-# Host checks: syntax, benchmark regression checks, decoder forwarding, 1M dry-run.
+# Host checks: syntax, benchmark regression checks, decoder forwarding, TP import consistency, 1M dry-run.
 python3 benchmark/prefill_1m/test_glm53_features.py
 
 # Inspect the full matrix without loading weights or initializing devices.
@@ -110,10 +110,12 @@ the optional 1M benchmark needs a much larger KV budget.
 | Host path | Pool/memo/raw encoding suites and chat-completion serving variants |
 | Scheduling | Autotune, HCCL sizing and resource-scheduling suites; multistream/autotune serving variants |
 
-Results go under `.codex-artifacts/glm53-feature-tests/<UTC timestamp>/`:
-`results.json`, per-case logs, pytest JUnit XML, hardware/version evidence,
-server model information and generated responses. `--output DIR` selects a
-fresh output directory. Commands and scenario environment overrides are saved.
+Each run produces one Markdown file under
+`.codex-artifacts/glm53-feature-tests/<UTC timestamp>.md`. It contains the
+summary, commands, environment/version evidence, complete logs, pytest JUnit
+results, server information and responses inline. `--output report.md` selects
+a fresh report path. Raw logs, JSON and XML are temporary and removed after
+they are included in the report; no separate result files need collecting.
 Failures do not stop the remaining independent cases. Failed device preflight
 blocks device cases; skipped pytest cases produce `partial`, never `pass`.
 Exit codes: `0` = selected checks completed, `1` = failure, `2` = blocked/partial.

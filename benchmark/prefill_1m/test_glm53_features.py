@@ -11,6 +11,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -289,7 +290,9 @@ def client_self_check():
             env=env,
             text=True,
         ).splitlines()
-        assert "--disable-cuda-graph" in argv and "--cuda-graph-backend" not in argv
+        for phase in ("decode", "prefill"):
+            assert argv[argv.index(f"--cuda-graph-backend-{phase}") + 1] == "disabled"
+        assert "--cuda-graph-backend" not in argv and "--disable-cuda-graph" not in argv
     print(
         "PASS: concurrent requests, cold/cache isolation, streamed TTFT, launcher args"
     )
@@ -403,7 +406,12 @@ def server_command(args, scenario):
             scenario["graph"],
         ]
     else:
-        command += ["--disable-cuda-graph"]
+        command += [
+            "--cuda-graph-backend-decode",
+            "disabled",
+            "--cuda-graph-backend-prefill",
+            "disabled",
+        ]
     if scenario.get("quant"):
         command += ["--online-quantization", scenario["quant"]]
     if scenario.get("dcp"):
@@ -512,6 +520,50 @@ def serve(args, case, directory, env):
             stop(process)
 
 
+def markdown_block(text, language="text"):
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", text)), default=0))
+    return f"{fence}{language}\n{text.rstrip()}\n{fence}\n"
+
+
+def append_result(path, result, directory):
+    with path.open("a") as output:
+        output.write(f"\n## {result['id']}: {result['status'].upper()}\n\n")
+        output.write(markdown_block(json.dumps(result, indent=2), "json"))
+        for artifact in sorted(directory.iterdir()):
+            if artifact.is_file():
+                output.write(f"\n<details><summary>{artifact.name}</summary>\n\n")
+                output.write(markdown_block(artifact.read_text(errors="replace")))
+                output.write("\n</details>\n")
+
+
+def fusion_import_self_check():
+    """Catch stale imports before they prevent pytest collection/server startup."""
+    module = "sglang.srt.hardware_backend.npu.moe.tp_fusion"
+    source = ROOT / "python/sglang/srt/hardware_backend/npu/moe/tp_fusion.py"
+    exported = set()
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            exported.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            exported.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+        elif isinstance(node, ast.Assign):
+            exported.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    for file in (ROOT / "python/sglang/srt").rglob("*.py"):
+        text = file.read_text()
+        if module not in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.ImportFrom) and node.module == module:
+                missing = {alias.name for alias in node.names} - exported
+                assert not missing, (
+                    f"{file.relative_to(ROOT)}:{node.lineno}: missing {sorted(missing)}"
+                )
+    print("PASS: TP fusion imports resolve against the current module exports")
+
+
 def plan(args):
     cases = [
         {
@@ -549,6 +601,13 @@ def plan(args):
     ]
     cases.append(
         {
+            "id": "host-fusion-imports",
+            "stage": "host",
+            "command": [PYTHON, str(Path(__file__).resolve()), "--self-check-imports"],
+        }
+    )
+    cases.append(
+        {
             "id": "host-boundary",
             "stage": "host",
             "command": [PYTHON, str(Path(__file__).resolve()), "--self-check-boundary"],
@@ -569,8 +628,11 @@ def plan(args):
                         PYTHON,
                         "-m",
                         "pytest",
+                        "pytest-asyncio",
                         "-q",
                         "-ra",
+                        "-p",
+                        "no:cacheprovider",
                         *[prefix + p for p in paths],
                     ],
                     "junit": True,
@@ -612,6 +674,9 @@ def main():
     parser.add_argument(
         "--self-check-boundary", action="store_true", help=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--self-check-imports", action="store_true", help=argparse.SUPPRESS
+    )
     parser.add_argument("--probe-npu", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--tp", type=int, default=8)
@@ -634,7 +699,8 @@ def main():
         "--output",
         type=Path,
         default=Path(".codex-artifacts/glm53-feature-tests")
-        / time.strftime("%Y%m%d-%H%M%S", time.gmtime()),
+        / time.strftime("%Y%m%d-%H%M%S.md", time.gmtime()),
+        help="Single Markdown report path (default: timestamp.md).",
     )
     args = parser.parse_args()
     if args.self_check_client:
@@ -642,6 +708,9 @@ def main():
         return 0
     if args.self_check_boundary:
         boundary_self_check()
+        return 0
+    if args.self_check_imports:
+        fusion_import_self_check()
         return 0
     if args.probe_npu:
         import torch
@@ -695,130 +764,161 @@ def main():
             print(f"{case['id']:32} {case['stage']}")
         return 0
     args.output = args.output.resolve()
-    args.output.mkdir(parents=True, exist_ok=True)
-    env = dict(
-        os.environ,
-        PYTHONPATH=str(ROOT / "python") + os.pathsep + os.environ.get("PYTHONPATH", ""),
-    )
-    # Isolate opt-in families from inherited shell settings.
-    for scenario in SCENARIOS.values():
-        for name in scenario.get("env", {}):
-            env[name] = (
-                "0"
-                if name == "ASCEND_USE_FIA" or name.endswith("_MIN_TOKENS")
-                else "False"
-            )
-    env["SGLANG_NPU_TUNING_CACHE_DIR"] = str(args.output / "tuning-cache")
-    env["SGLANG_NPU_TP_MOE_REUSE_MXFP8"] = "False"
-    env["SGLANG_NPU_TP_MOE_NORM_MXFP8"] = "False"
-    versions = {}
-    for package in (
-        "torch",
-        "torch-npu",
-        "sgl-kernel-npu",
-        "sglang",
-        "pytest",
-        "requests",
-    ):
-        try:
-            versions[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            versions[package] = None
-    report = {
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip(),
-        "versions": versions,
-        "working_tree_dirty": bool(
-            subprocess.check_output(
-                ["git", "status", "--porcelain"], cwd=ROOT, text=True
-            )
-        ),
-        "environment": {
-            key: env.get(key)
-            for key in (
-                "ASCEND_RT_VISIBLE_DEVICES",
-                "ASCEND_HOME_PATH",
-                "CANN_HOME",
-                "HCCL_BUFFSIZE",
-                "HCCL_SOCKET_IFNAME",
-                "HCCL_IF_IP",
-            )
-        },
-        "arguments": {
-            k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
-        },
-        "scope": "GLM-5.3 A3 INT integration; Gemma-only and MXFP additions excluded",
-        "results": [],
-        "limitations": [
-            "Unit/mock passes are host evidence only.",
-            "Serving smoke does not establish optimization activation, numerical quality, graph replay or performance.",
-            "D1v3 declared-boundary port remains deferred; activation must be checked on device.",
-        ],
-    }
-    hardware_ready = True
-    for case in cases:
-        directory = args.output / case["id"]
-        directory.mkdir()
-        result = dict(case, env=case.get("scenario", {}).get("env", {}))
-        started = time.monotonic()
-        case_env = dict(env, **result["env"])
-        if case.get("junit"):
-            result["command"] = case["command"] + [
-                "--junitxml=" + str(directory / "junit.xml")
-            ]
-        try:
-            if args.dry_run:
-                result["status"] = "planned"
-            elif case["stage"] in ("npu", "serve") and not hardware_ready:
-                result.update(status="blocked", reason="device preflight failed")
-            elif case["stage"] == "serve" and (
-                not args.model_path or not args.model_path.is_dir()
-            ):
-                result.update(
-                    status="blocked",
-                    reason="provide a local BF16 GLM-5.3 checkpoint with --model-path",
-                )
-            elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
-                result.update(status="blocked", reason="DCP scenario needs --dcp > 1")
-            elif case["stage"] == "serve":
-                result.update(serve(args, case, directory, case_env))
-            else:
-                code = run(
-                    result["command"],
-                    directory / "test.log",
-                    args.case_timeout,
-                    case_env,
-                )
-                result.update(status="pass" if code == 0 else "fail", returncode=code)
-                if case.get("junit") and (directory / "junit.xml").exists():
-                    suites = (
-                        ET.parse(directory / "junit.xml").getroot().iter("testsuite")
-                    )
-                    counts = {
-                        key: 0 for key in ("tests", "failures", "errors", "skipped")
-                    }
-                    for suite in suites:
-                        for key in counts:
-                            counts[key] += int(suite.get(key, 0))
-                    result["counts"] = counts
-                    if code == 0 and (counts["skipped"] or not counts["tests"]):
-                        result["status"] = "partial"
-        except Exception as error:
-            result.update(status="fail", error=str(error))
-            (directory / "exception.log").write_text(traceback.format_exc())
-        result["elapsed_s"] = round(time.monotonic() - started, 3)
-        if case["stage"] == "preflight" and result["status"] == "fail":
-            hardware_ready = False
-        report["results"].append(result)
-        (args.output / "results.json").write_text(json.dumps(report, indent=2))
-        print(
-            f"{result['status'].upper():12} {case['id']} ({result['elapsed_s']}s)",
-            flush=True,
+    if args.output.suffix.lower() != ".md":
+        parser.error("--output must name a .md file")
+    if args.output.exists():
+        parser.error("--output already exists; choose a fresh .md file")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="glm53-feature-tests-") as workspace:
+        env = dict(
+            os.environ,
+            PYTHONPATH=str(ROOT / "python")
+            + os.pathsep
+            + os.environ.get("PYTHONPATH", ""),
         )
-    print(f"Results: {args.output / 'results.json'}")
-    statuses = {item["status"] for item in report["results"]}
-    return 1 if "fail" in statuses else 2 if statuses & {"blocked", "partial"} else 0
+        # Isolate opt-in families from inherited shell settings.
+        for scenario in SCENARIOS.values():
+            for name in scenario.get("env", {}):
+                env[name] = (
+                    "0"
+                    if name == "ASCEND_USE_FIA" or name.endswith("_MIN_TOKENS")
+                    else "False"
+                )
+        env["SGLANG_NPU_TUNING_CACHE_DIR"] = str(Path(workspace) / "tuning-cache")
+        env["SGLANG_NPU_TP_MOE_REUSE_MXFP8"] = "False"
+        env["SGLANG_NPU_TP_MOE_NORM_MXFP8"] = "False"
+        versions = {}
+        for package in (
+            "torch",
+            "torch-npu",
+            "sgl-kernel-npu",
+            "sglang",
+            "pytest",
+            "pytest-asyncio",
+            "requests",
+        ):
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                versions[package] = None
+        report = {
+            "commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ).strip(),
+            "versions": versions,
+            "working_tree_dirty": bool(
+                subprocess.check_output(
+                    ["git", "status", "--porcelain"], cwd=ROOT, text=True
+                )
+            ),
+            "environment": {
+                key: env.get(key)
+                for key in (
+                    "ASCEND_RT_VISIBLE_DEVICES",
+                    "ASCEND_HOME_PATH",
+                    "CANN_HOME",
+                    "HCCL_BUFFSIZE",
+                    "HCCL_SOCKET_IFNAME",
+                    "HCCL_IF_IP",
+                )
+            },
+            "arguments": {
+                k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+            },
+            "scope": "GLM-5.3 A3 INT integration; Gemma-only and MXFP additions excluded",
+            "results": [],
+            "limitations": [
+                "Unit/mock passes are host evidence only.",
+                "Serving smoke does not establish optimization activation, numerical quality, graph replay or performance.",
+                "D1v3 declared-boundary port remains deferred; activation must be checked on device.",
+            ],
+        }
+        args.output.write_text(
+            "# GLM-5.3 A3 feature validation\n\n"
+            + markdown_block(
+                json.dumps(
+                    {k: v for k, v in report.items() if k != "results"}, indent=2
+                ),
+                "json",
+            )
+        )
+        hardware_ready = True
+        for case in cases:
+            directory = Path(workspace) / case["id"]
+            directory.mkdir()
+            result = dict(case, env=case.get("scenario", {}).get("env", {}))
+            started = time.monotonic()
+            case_env = dict(env, **result["env"])
+            if case.get("junit"):
+                result["command"] = case["command"] + [
+                    "--junitxml=" + str(directory / "junit.xml")
+                ]
+            try:
+                if args.dry_run:
+                    result["status"] = "planned"
+                elif case["stage"] in ("npu", "serve") and not hardware_ready:
+                    result.update(status="blocked", reason="device preflight failed")
+                elif case["stage"] == "serve" and (
+                    not args.model_path or not args.model_path.is_dir()
+                ):
+                    result.update(
+                        status="blocked",
+                        reason="provide a local BF16 GLM-5.3 checkpoint with --model-path",
+                    )
+                elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
+                    result.update(
+                        status="blocked", reason="DCP scenario needs --dcp > 1"
+                    )
+                elif case["stage"] == "serve":
+                    result.update(serve(args, case, directory, case_env))
+                else:
+                    code = run(
+                        result["command"],
+                        directory / "test.log",
+                        args.case_timeout,
+                        case_env,
+                    )
+                    result.update(
+                        status="pass" if code == 0 else "fail", returncode=code
+                    )
+                    if case.get("junit") and (directory / "junit.xml").exists():
+                        suites = (
+                            ET.parse(directory / "junit.xml")
+                            .getroot()
+                            .iter("testsuite")
+                        )
+                        counts = {
+                            key: 0 for key in ("tests", "failures", "errors", "skipped")
+                        }
+                        for suite in suites:
+                            for key in counts:
+                                counts[key] += int(suite.get(key, 0))
+                        result["counts"] = counts
+                        if code == 0 and (counts["skipped"] or not counts["tests"]):
+                            result["status"] = "partial"
+            except Exception as error:
+                result.update(status="fail", error=str(error))
+                (directory / "exception.log").write_text(traceback.format_exc())
+            result["elapsed_s"] = round(time.monotonic() - started, 3)
+            if case["stage"] == "preflight" and result["status"] == "fail":
+                hardware_ready = False
+            report["results"].append(result)
+            append_result(args.output, result, directory)
+            print(
+                f"{result['status'].upper():12} {case['id']} ({result['elapsed_s']}s)",
+                flush=True,
+            )
+        with args.output.open("a") as output:
+            output.write("\n## Summary\n\n| Case | Result | Seconds |\n|---|---|---|\n")
+            for result in report["results"]:
+                output.write(
+                    f"| {result['id']} | {result['status']} | {result['elapsed_s']} |\n"
+                )
+        print(f"Results: {args.output}")
+        statuses = {item["status"] for item in report["results"]}
+        return (
+            1 if "fail" in statuses else 2 if statuses & {"blocked", "partial"} else 0
+        )
 
 
 if __name__ == "__main__":

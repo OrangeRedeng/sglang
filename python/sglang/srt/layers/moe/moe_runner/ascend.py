@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.moe.tp_fusion import current_shared_pipeline
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
@@ -260,9 +259,6 @@ class AscendRunnerCore(MoeRunnerCore):
         group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
-        shared_pipeline = current_shared_pipeline()
-        if shared_pipeline is not None:
-            shared_pipeline.before_routed_gmm1()
 
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -325,8 +321,6 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-        if shared_pipeline is not None:
-            shared_pipeline.after_routed_gmm2()
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
