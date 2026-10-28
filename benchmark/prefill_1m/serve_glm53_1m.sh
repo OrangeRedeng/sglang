@@ -70,7 +70,7 @@ if [ -n "$ONLINE_QUANT" ]; then
   QUANT_ARGS=(--online-quantization "$ONLINE_QUANT")
 fi
 
-GRAPH_ARGS=(--cuda-graph-backend disabled)
+GRAPH_ARGS=(--disable-cuda-graph)
 if [ "$CAPTURE" = "1" ]; then
   GRAPH_ARGS=()
 fi

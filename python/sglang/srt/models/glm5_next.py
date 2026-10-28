@@ -808,9 +808,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_last_layer=terminal,
             ).residual_ops()
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
-        # GLM-5.3 (NPU): fuse the post-attention RMSNorm with the FFN boundary's
-        # INT quantization when the layer's MoE/linear block selected a format —
-        # the same NORM_QUANT_READOUT wiring DeepseekV2DecoderLayer uses.
+        # Fuse only when every FFN consumer accepts the selected format.
+        self.ffn_quant_format = ""
         from sglang.srt.utils import is_npu
 
         if is_npu() and type(self.post_attention_layernorm) is RMSNorm:
@@ -825,14 +824,12 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
             if isinstance(self.mlp, Glm5NextMoE):
-                ffn_quant_format = select_moe_boundary_quant_format(self.mlp)
+                self.ffn_quant_format = select_moe_boundary_quant_format(self.mlp)
             elif isinstance(self.mlp, Glm5NextMLP):
-                ffn_quant_format = select_linear_boundary_quant_format(
+                self.ffn_quant_format = select_linear_boundary_quant_format(
                     [self.mlp.gate_up_proj]
                 )
-            else:
-                ffn_quant_format = ""
-            if ffn_quant_format:
+            if self.ffn_quant_format:
                 ffn = _dataclasses.replace(ffn, read=NORM_QUANT_READOUT)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
@@ -1005,7 +1002,13 @@ class Glm5NextDecoderLayer(nn.Module):
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **(
+                {"quant_format": self.ffn_quant_format} if self.ffn_quant_format else {}
+            ),
+        )
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
@@ -1014,6 +1017,7 @@ class Glm5NextDecoderLayer(nn.Module):
             isinstance(self.mlp, Glm5NextMoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            and isinstance(hidden_states_orig, torch.Tensor)
             and hidden_states_orig.shape[0] == hidden_states.shape[0]
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx

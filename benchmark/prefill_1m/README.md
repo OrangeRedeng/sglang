@@ -8,8 +8,8 @@ switches.
 ## Files
 
 - `bench_glm53_prefill_1m.py` — client. Synthetic seeded token-id prompts
-  (no dataset or external aisbench checkout needed), `output_len=1`, batch
-  sweep, warmup + repeats, JSON output, `--dry-run` mode.
+  (no dataset or external aisbench checkout needed), `output_len=1`,
+  concurrent batch sweep, warmup + repeats, JSON output, `--dry-run` mode.
 - `serve_glm53_1m.sh` — server launcher, adapted from the bde_v2 print-build
   `p4_exit1_serve_dcp.sh` recipe (proxy handling, int8 LightningIndexer, DCP
   shared-gather envs, chat-encode opts).
@@ -45,6 +45,17 @@ ONLINE_QUANT=w4a4_int MODEL_PATH=... bash benchmark/prefill_1m/serve_glm53_1m.sh
 TP=16 DCP=8 SGLANG_NPU_SFA_KV_8BIT=True MODEL_PATH=... \
     bash benchmark/prefill_1m/serve_glm53_1m.sh
 ```
+
+The client defaults to `--cache-mode cold`: every warmup and measured batch
+uses fresh seeded prompts. `--cache-mode cached` primes all prompts at least
+once and reuses them for measurements. Run against a dedicated server with
+enough cache capacity; check each sample's `cached_tokens` to confirm hits.
+Use a different `--seed` when repeating cold runs against the same server.
+
+TTFT is measured per request from submission to its first output token.
+`prompt_tokens_per_s` counts all supplied tokens; `prefill_tokens_per_s`
+subtracts server-reported cached tokens and is null when those counts are
+unavailable. Each sample retains request timings and cache counts.
 
 KV budget note: a 1M-token prompt at one concurrency already needs a very
 large pool; `serve_glm53_1m.sh` defaults to `--mem-fraction-static 0.85` and

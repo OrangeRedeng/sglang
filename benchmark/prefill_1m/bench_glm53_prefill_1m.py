@@ -28,6 +28,7 @@ import argparse
 import json
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -48,7 +49,7 @@ def run_one(
     prompt_ids: list[int],
     max_new_tokens: int,
     timeout: float,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Send one request, stream, and time to the first output token."""
     payload = {
         "input_ids": prompt_ids,
@@ -60,17 +61,23 @@ def run_one(
     }
     start = time.perf_counter()
     first_token_ts: float | None = None
+    cached_tokens = None
     with requests.post(
         f"{base_url}/generate", json=payload, stream=True, timeout=timeout
     ) as resp:
         resp.raise_for_status()
-        for line in resp.iter_lines(decode_unicode=True):
+        for line in resp.iter_lines(chunk_size=1, decode_unicode=True):
             if not line or not line.startswith("data:"):
                 continue
             chunk = line[len("data:") :].strip()
             if chunk == "[DONE]":
                 break
-            if first_token_ts is None:
+            data = json.loads(chunk)
+            if "error" in data:
+                raise RuntimeError(data["error"])
+            meta = data.get("meta_info", {})
+            cached_tokens = meta.get("cached_tokens", cached_tokens)
+            if first_token_ts is None and meta.get("completion_tokens", 0) > 0:
                 first_token_ts = time.perf_counter()
     end = time.perf_counter()
     if first_token_ts is None:
@@ -78,6 +85,7 @@ def run_one(
     return {
         "ttft_s": first_token_ts - start,
         "e2e_s": end - start,
+        "cached_tokens": cached_tokens,
     }
 
 
@@ -90,34 +98,60 @@ def bench_batch(
     seed: int,
     max_new_tokens: int,
     timeout: float,
+    cache_mode: str = "cold",
 ) -> dict[str, Any]:
     """One batch-size point: warmup runs, then repeats, then aggregate."""
-    # One prompt per request in the batch; distinct seeds avoid identical
-    # payloads so the scheduler does not fold them into one prefix.
-    prompts = [build_prompt_ids(context_length, seed + i) for i in range(batch_size)]
-    for _ in range(warmup):
-        for ids in prompts[:1]:
-            run_one(base_url, ids, max_new_tokens, timeout)
+    rng = random.Random(seed)
+
+    def new_prompts():
+        return [
+            build_prompt_ids(context_length, rng.getrandbits(128))
+            for _ in range(batch_size)
+        ]
+
+    prompts = new_prompts() if cache_mode == "cached" else None
     samples = []
-    for r in range(repeats):
-        t0 = time.perf_counter()
-        for ids in prompts:
-            run_one(base_url, ids, max_new_tokens, timeout)
-        wall = time.perf_counter() - t0
-        samples.append(wall)
-        print(
-            f"  bs={batch_size} repeat={r + 1}/{repeats} "
-            f"wall={wall:.1f}s ttft_per_req≈{wall / batch_size:.1f}s"
-        )
-    best = min(samples)
+    warmup_runs = max(warmup, 1) if cache_mode == "cached" else warmup
+    with ThreadPoolExecutor(max_workers=batch_size) as pool:
+        for r in range(-warmup_runs, repeats):
+            batch_prompts = prompts if prompts is not None else new_prompts()
+            t0 = time.perf_counter()
+            futures = [
+                pool.submit(run_one, base_url, ids, max_new_tokens, timeout)
+                for ids in batch_prompts
+            ]
+            requests_result = [future.result() for future in futures]
+            wall = time.perf_counter() - t0
+            if r < 0:
+                continue
+            ttft = sum(item["ttft_s"] for item in requests_result) / batch_size
+            samples.append(
+                {"wall_s": wall, "ttft_s_mean": ttft, "requests": requests_result}
+            )
+            print(
+                f"  bs={batch_size} repeat={r + 1}/{repeats} "
+                f"wall={wall:.1f}s ttft_mean={ttft:.1f}s"
+            )
+    best = min(samples, key=lambda sample: sample["wall_s"])
+    cached = [item["cached_tokens"] for item in best["requests"]]
+    uncached_tokens = (
+        sum(context_length - count for count in cached)
+        if all(count is not None for count in cached)
+        else None
+    )
     return {
         "batch_size": batch_size,
         "context_length": context_length,
         "repeats": repeats,
-        "wall_s_best": best,
-        "wall_s_all": samples,
-        "ttft_s_best_avg_per_req": best / batch_size,
-        "prefill_tokens_per_s": context_length * batch_size / best,
+        "cache_mode": cache_mode,
+        "wall_s_best": best["wall_s"],
+        "wall_s_all": [sample["wall_s"] for sample in samples],
+        "ttft_s_best_avg_per_req": best["ttft_s_mean"],
+        "prompt_tokens_per_s": context_length * batch_size / best["wall_s"],
+        "prefill_tokens_per_s": (
+            uncached_tokens / best["wall_s"] if uncached_tokens is not None else None
+        ),
+        "samples": samples,
     }
 
 
@@ -134,6 +168,12 @@ def main() -> None:
     parser.add_argument("--batch-sizes", default="1,2,4,8")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--cache-mode",
+        choices=("cold", "cached"),
+        default="cold",
+        help="Fresh prefixes per batch, or reuse prompts after priming the cache.",
+    )
     parser.add_argument("--seed", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=3600.0)
@@ -146,6 +186,10 @@ def main() -> None:
     args = parser.parse_args()
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",") if b.strip()]
+    if not batch_sizes or min(batch_sizes) < 1 or args.repeats < 1 or args.warmup < 0:
+        parser.error("batch sizes/repeats must be positive and warmup nonnegative")
+    if args.context_length < 1 or args.max_new_tokens < 1:
+        parser.error("context length and max new tokens must be positive")
     print(
         f"plan: context_length={args.context_length} "
         f"batch_sizes={batch_sizes} repeats={args.repeats} warmup={args.warmup}"
@@ -176,6 +220,7 @@ def main() -> None:
                 args.seed + bs * 10_000,
                 args.max_new_tokens,
                 args.timeout,
+                args.cache_mode,
             )
         )
     report = {"config": vars(args), "results": results}
