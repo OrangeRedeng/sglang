@@ -65,6 +65,68 @@ to `1,2` if pool construction OOMs. Chunked prefill stays on
 (`--chunked-prefill-size 32768` default, the cookbook's long-input starting
 point).
 
+## Automatic feature checks
+
+Run from the repository root with the same Python environment used for serving:
+
+```bash
+# Host checks: syntax, benchmark regression checks, decoder forwarding, 1M dry-run.
+python3 benchmark/prefill_1m/test_glm53_features.py
+
+# Inspect the full matrix without loading weights or initializing devices.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all --list
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all --dry-run
+
+# Full A3 run: existing unit suites, NPU operator tests, sequential server variants.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
+    --model-path /path/to/GLM-5.3-BF16 --tp 16 --dcp 8
+
+# Optional 1M-token cold-prefill benchmark on the baseline server.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage serve \
+    --cases serve-baseline --model-path /path/to/GLM-5.3-BF16 \
+    --tp 16 --dcp 8 --context-length 1048608 --long-context 1048576
+
+# Rerun a subset; case globs are comma-separated.
+python3 benchmark/prefill_1m/test_glm53_features.py --stage unit \
+    --cases 'unit-int-*,unit-prefill-*'
+```
+
+Use a local BF16 GLM-5.3 checkpoint for the matrix: the online conversion
+cases need floating-point source weights. Install SGLang from this checkout
+and its matching CANN, PyTorch, torch_npu, sgl-kernel-npu, Triton-Ascend and
+pytest dependencies beforehand. Each serving case reloads the model, so the
+full matrix is expensive. Use an idle A3 host; TP must fit the visible NPU
+count and DCP must divide TP. Serving smoke uses 8K context by default;
+the optional 1M benchmark needs a much larger KV budget.
+
+| Coverage | Automated checks |
+|---|---|
+| Benchmark fixes | Concurrent HTTP requests, fresh cold prefixes, cached priming, first-token timing, launcher arguments |
+| GLM boundary fix | Actual decoder forward with host dependency stubs; selected INT format reaches its consumer |
+| INT quantization | Contract/loader suites; W8A8, mixed W4A4/W8A8, scoped INT8 boundary and scoped INT4 serving |
+| TP MoE | Routing/shared-weight/top-k suites; finalize fusion and shared-expert serving variants |
+| DCP/indexer/SFA | Layout, ownership, gather/overlap, sparse parity, query shard and index-pool suites; real NPU pool/INT8 round trips; sync/async/packed serving |
+| Graphs | Configuration, full-prefill and piecewise suites; non-DCP full/piecewise serving variants |
+| Host path | Pool/memo/raw encoding suites and chat-completion serving variants |
+| Scheduling | Autotune, HCCL sizing and resource-scheduling suites; multistream/autotune serving variants |
+
+Results go under `.codex-artifacts/glm53-feature-tests/<UTC timestamp>/`:
+`results.json`, per-case logs, pytest JUnit XML, hardware/version evidence,
+server model information and generated responses. `--output DIR` selects a
+fresh output directory. Commands and scenario environment overrides are saved.
+Failures do not stop the remaining independent cases. Failed device preflight
+blocks device cases; skipped pytest cases produce `partial`, never `pass`.
+Exit codes: `0` = selected checks completed, `1` = failure, `2` = blocked/partial.
+A dry run records `planned` and executes no checks.
+
+Serving success is recorded as `smoke_pass`, with activation, model quality
+and graph replay explicitly **unverified**. Capability gates can choose eager
+or unfused fallbacks. Inspect the saved logs/operator evidence before claiming
+an optimization ran; these checks do not establish speedups or full model
+accuracy. Existing component tests run unchanged, including any stale MXFP
+expectations that the INT-only policy now rejects. Gemma-only paths are outside
+this GLM matrix, and the deferred D1v3 boundary optimization remains unvalidated.
+
 ## Stage-latency breakdown
 
 The branch carries the bde_v2 print-build `[SGL-TS]` probes:
