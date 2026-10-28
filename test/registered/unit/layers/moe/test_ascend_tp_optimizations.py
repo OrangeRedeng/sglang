@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import sys
 import unittest
@@ -706,6 +707,60 @@ class TestAscendTPOptimizations(CustomTestCase):
         decoded = torch.where(decoded >= 8, decoded - 16, decoded)
         torch.testing.assert_close(decoded, original, atol=0, rtol=0)
 
+    def test_missing_shared_expert_module_does_not_enable_tp_shared_paths(self):
+        path = (
+            Path(__file__).resolve().parents[5]
+            / "python/sglang/srt/models/deepseek_v2.py"
+        )
+        tree = ast.parse(path.read_text())
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepseekV2MoE"
+        )
+        init = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        eligibility = next(
+            node
+            for node in init.body
+            if isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Attribute)
+            and node.target.attr == "_fuse_npu_tp_shared"
+        )
+        bind = next(
+            node
+            for node in init.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Assign)
+                and any(
+                    isinstance(t, ast.Attribute) and t.attr == "_npu_tp_shared"
+                    for t in child.targets
+                )
+                for child in ast.walk(node)
+            )
+        )
+        code = compile(
+            ast.Module(body=[eligibility, bind], type_ignores=[]), str(path), "exec"
+        )
+        for present in (False, True):
+            with self.subTest(shared=present):
+                block = SimpleNamespace(
+                    shared_experts=SimpleNamespace() if present else None,
+                    _fuse_npu_tp_shared=True,
+                    _shared_expert_tp1=False,
+                    _fuse_shared_experts_inside_sbo=False,
+                    _enable_a2a_moe=False,
+                    experts=SimpleNamespace(moe_ep_size=1),
+                )
+                exec(code, {"self": block, "_is_npu": True})
+                self.assertEqual(block._fuse_npu_tp_shared, present)
+                if present:
+                    self.assertTrue(block.shared_experts._npu_tp_shared)
+
     def test_topk_scales_only_routed_weights_before_appending_shared(self):
         path = Path(tp_fusion.__file__).with_name("topk.py")
         spec = importlib.util.spec_from_file_location("_test_npu_topk", path)
@@ -738,6 +793,9 @@ class TestAscendTPOptimizations(CustomTestCase):
                 return_value=SimpleNamespace(on_select_experts=lambda **kwargs: None),
             ),
             patch.object(module, "capture_routed_experts_if_allowed"),
+            patch.object(
+                module, "l1_norm", side_effect=lambda x: x / x.sum(-1, keepdim=True)
+            ),
         ):
             output = module.fused_topk_npu(torch.zeros(2, 64), logits, config)
         selected, ids = torch.softmax(logits, -1).topk(2, dim=-1)

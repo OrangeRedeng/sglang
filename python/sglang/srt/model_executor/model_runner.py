@@ -2169,7 +2169,7 @@ class ModelRunner:
         _ts_nseq = len(forward_batch.seq_lens)
         _ts_ntok = len(forward_batch.input_ids)
         print(
-            f"[SGL-TS] MODEL-FWD-START t={_ts_t0:.6f} rank={self.ps.tp_rank} "
+            f"[SGL-TS] MODEL-FWD-START t={_ts_t0:.6f} rank={get_parallel().tp_rank} "
             f"nseq={_ts_nseq} ntok={_ts_ntok} mode={forward_batch.forward_mode}",
             flush=True,
         )
@@ -2263,7 +2263,7 @@ class ModelRunner:
 
         _ts_t1 = time.perf_counter()
         print(
-            f"[SGL-TS] MODEL-FWD-END t={_ts_t1:.6f} rank={self.ps.tp_rank} "
+            f"[SGL-TS] MODEL-FWD-END t={_ts_t1:.6f} rank={get_parallel().tp_rank} "
             f"nseq={_ts_nseq} ntok={_ts_ntok} mode={forward_batch.forward_mode} "
             f"dur={_ts_t1 - _ts_t0:.3f}s",
             flush=True,

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -23,7 +25,10 @@ def _pool(hicache=False):
     with (
         envs.SGLANG_NPU_INDEXER_INT8.override(True),
         get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0, dcp_enabled=False),
-        get_memory().override(enable_hierarchical_cache=hicache),
+        patch(
+            "sglang.srt.hardware_backend.npu.memory_pool_npu.get_memory",
+            return_value=SimpleNamespace(enable_hierarchical_cache=hicache),
+        ),
     ):
         return NPUMLATokenToKVPool(
             size=SIZE,

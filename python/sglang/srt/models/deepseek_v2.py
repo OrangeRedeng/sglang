@@ -1048,7 +1048,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-        self._fuse_npu_tp_shared &= hasattr(self, "shared_experts") and not (
+        self._fuse_npu_tp_shared &= self.shared_experts is not None and not (
             self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
         )
         self._npu_tp_shared_overlap = False
@@ -1058,14 +1058,14 @@ class DeepseekV2MoE(nn.Module):
             )
 
             self._npu_tp_shared_overlap = can_overlap_tp_shared(self.experts) and (
-                hasattr(self, "shared_experts")
+                self.shared_experts is not None
                 and not (
                     self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
                 )
             )
         if _is_npu and self._npu_tp_shared_overlap and self.alt_stream is None:
             self.alt_stream = get_stream("npu_moe")
-        if _is_npu and hasattr(self, "shared_experts"):
+        if _is_npu and self.shared_experts is not None:
             self.shared_experts._npu_tp_shared = (
                 not (self._enable_a2a_moe or self._shared_expert_tp1)
                 and self.experts.moe_ep_size == 1

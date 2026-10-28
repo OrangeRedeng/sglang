@@ -1,4 +1,4 @@
-"""Stage-latency probes must format without removed Scheduler attributes."""
+"""Stage-latency probes must format without removed scheduler/runner attributes."""
 
 import ast
 from pathlib import Path
@@ -12,11 +12,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestSchedulerStageLatency(CustomTestCase):
-    def test_batch_probes_read_the_published_rank(self):
-        source = (
-            Path(__file__).resolve().parents[4]
-            / "python/sglang/srt/managers/scheduler.py"
-        )
+    def _assert_probes(self, relative_path, marker, **state):
+        source = Path(__file__).resolve().parents[4] / relative_path
         tree = ast.parse(source.read_text())
         probes = [
             node
@@ -25,7 +22,7 @@ class TestSchedulerStageLatency(CustomTestCase):
             and any(
                 isinstance(part, ast.Constant)
                 and isinstance(part.value, str)
-                and "[SGL-TS] BATCH-" in part.value
+                and marker in part.value
                 for part in node.values
             )
         ]
@@ -33,17 +30,33 @@ class TestSchedulerStageLatency(CustomTestCase):
         namespace = dict(
             self=SimpleNamespace(),
             get_parallel=lambda: SimpleNamespace(tp_rank=3),
-            batch=SimpleNamespace(
-                reqs=[1, 2], extend_num_tokens=32, forward_mode="EXTEND"
-            ),
             _ts_t0=1.0,
             _ts_t1=2.0,
+            **state,
         )
         for probe in probes:
             rendered = eval(
                 compile(ast.Expression(probe), str(source), "eval"), namespace
             )
             self.assertIn("rank=3", rendered)
+
+    def test_batch_probes_read_the_published_rank(self):
+        self._assert_probes(
+            "python/sglang/srt/managers/scheduler.py",
+            "[SGL-TS] BATCH-",
+            batch=SimpleNamespace(
+                reqs=[1, 2], extend_num_tokens=32, forward_mode="EXTEND"
+            ),
+        )
+
+    def test_model_runner_probes_read_the_published_rank(self):
+        self._assert_probes(
+            "python/sglang/srt/model_executor/model_runner.py",
+            "[SGL-TS] MODEL-FWD-",
+            forward_batch=SimpleNamespace(forward_mode="EXTEND"),
+            _ts_nseq=2,
+            _ts_ntok=32,
+        )
 
 
 if __name__ == "__main__":

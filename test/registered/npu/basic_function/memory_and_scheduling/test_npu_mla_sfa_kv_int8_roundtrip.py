@@ -199,10 +199,12 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
                     read = torch.tensor([physical], dtype=torch.int64, device=DEVICE)
                     k_nope, k_rope = pool.get_mla_kv_buffer(_FakeLayer(0), read)
                     with self.subTest(rank=rank, virtual=virtual):
-                        err = (k_nope.float() - latent[i].float()).abs()
-                        bound = _per_tile_int8_bound(latent[i])
+                        err = (k_nope.float() - latent[i : i + 1].float()).abs()
+                        bound = _per_tile_int8_bound(latent[i : i + 1])
                         self.assertLessEqual((err - bound).max().item(), 1e-2)
-                        self.assertTrue(torch.equal(k_rope, rope[i]))
+                        torch.testing.assert_close(
+                            k_rope, rope[i : i + 1], rtol=0, atol=0
+                        )
             del pool
             torch.npu.empty_cache()
 

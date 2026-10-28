@@ -159,6 +159,7 @@ class TestTokenShardUnderDcp(CustomTestCase):
     def _plan(self, dcp_enabled, gathers_kv=False, prefix_lens=(0,), index_topk=2048):
         batch = types.SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=None,
             extend_seq_lens_cpu=[16384] * len(prefix_lens),
             extend_prefix_lens_cpu=list(prefix_lens),
             attn_dcp_metadata=object() if gathers_kv else None,
@@ -172,6 +173,7 @@ class TestTokenShardUnderDcp(CustomTestCase):
                 attn_tp_rank=3,
                 dcp_enabled=dcp_enabled,
                 enable_prefill_cp=False,
+                attn_cp_size=1,
             ),
         ):
             return _build_dsa_token_shard_plan(batch, index_topk)
@@ -202,6 +204,7 @@ class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
     def _plan(self, num_rows):
         batch = types.SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=None,
             extend_seq_lens_cpu=[1000],
             extend_prefix_lens_cpu=[0],
             input_ids=torch.zeros(num_rows, dtype=torch.int64),
@@ -214,6 +217,7 @@ class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
                 attn_tp_rank=3,
                 dcp_enabled=False,
                 enable_prefill_cp=False,
+                attn_cp_size=1,
             ),
         ):
             return _build_dsa_token_shard_plan(batch)
