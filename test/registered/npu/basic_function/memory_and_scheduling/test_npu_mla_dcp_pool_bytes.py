@@ -129,7 +129,8 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
                 self.assertAlmostEqual(latent / base_latent, 1 / dcp_size, delta=0.02)
 
     def test_the_indexer_stays_flat(self):
-        """The replicated half. If this shrinks with c, the indexer has been
+        """The replicated half retains global rows plus one padding page per rank.
+        If this shrinks with c, the indexer has been
         given the sharded treatment and will run off the end of its buffer on
         the first position it does not own."""
         _, base_index = _measure(1)
@@ -137,7 +138,8 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         for dcp_size in (2, 4, 8):
             with self.subTest(dcp_size=dcp_size):
                 _, index = _measure(dcp_size)
-                self.assertEqual(index, base_index)
+                padding = (dcp_size - 1) * LAYER_NUM * PAGE_SIZE * INDEX_HEAD_DIM * 2
+                self.assertEqual(index, base_index + padding)
 
     def test_the_widened_indexer_reaches_its_last_global_position(self):
         """Flat bytes are necessary but not sufficient: a replicated indexer is
@@ -173,12 +175,13 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         base_latent, base_index = _measure(1, indexer_layer_ids=live_ids)
         latent, index = _measure(4, indexer_layer_ids=live_ids)
 
-        self.assertEqual(index, base_index)
+        padding = (4 - 1) * live * PAGE_SIZE * INDEX_HEAD_DIM * 2
+        self.assertEqual(index, base_index + padding)
         self.assertAlmostEqual(latent / base_latent, 1 / 4, delta=0.02)
 
         # The elision is still worth what it was: only live layers hold rows,
         # and the compacted buffer has exactly one slot per live layer.
-        pages = SERVED_CONTEXT // PAGE_SIZE + 1
+        pages = SERVED_CONTEXT // PAGE_SIZE + 4
         per_page = PAGE_SIZE * INDEX_HEAD_DIM * BYTES_PER_ELEM
         self.assertEqual(index, live * pages * per_page)
 

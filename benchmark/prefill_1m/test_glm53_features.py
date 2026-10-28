@@ -32,6 +32,7 @@ PYTHON = sys.executable
 
 # These suites include their own capability/skip checks. Keep skipped tests visible.
 UNIT_SUITES = {
+    "scheduler-probes": ["unit/managers/test_scheduler_stage_latency.py"],
     "int-contracts": [
         "unit/npu/quantization/test_fused_norm_quant_contracts.py",
         "unit/layers/moe/test_ascend_tp_optimizations.py",

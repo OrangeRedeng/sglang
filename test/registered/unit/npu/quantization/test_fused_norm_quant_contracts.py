@@ -345,7 +345,19 @@ class TestOnlineSharedFallback(unittest.TestCase):
         mlp = SimpleNamespace(
             gate_up_proj=linear, down_proj=linear, act_fn=SiluAndMul()
         )
-        self.assertEqual(shared_gmm1_mode(mlp), "baseline")
+        for available, expected in ((False, "baseline"), (True, "activation_quant")):
+            with (
+                self.subTest(available=available),
+                patch(
+                    "sglang.srt.hardware_backend.npu.moe.tp_fusion.supports_npu_op",
+                    return_value=available,
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.moe.tp_fusion.supports_cann_symbol",
+                    return_value=available,
+                ),
+            ):
+                self.assertEqual(shared_gmm1_mode(mlp), expected)
 
 
 if __name__ == "__main__":

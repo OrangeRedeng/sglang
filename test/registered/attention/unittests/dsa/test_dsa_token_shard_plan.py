@@ -19,6 +19,7 @@ Usage:
 import itertools
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -163,11 +164,15 @@ class TestTokenShardUnderDcp(CustomTestCase):
             attn_dcp_metadata=object() if gathers_kv else None,
             input_ids=torch.zeros(16384 * len(prefix_lens), dtype=torch.int64),
         )
-        with get_parallel().override(
-            attn_tp_size=16,
-            attn_tp_rank=3,
-            dcp_enabled=dcp_enabled,
-            enable_prefill_cp=False,
+        with (
+            patch("sglang.srt.layers.attention.dsa.dsa_token_shard.print_info_once"),
+            patch("sglang.srt.layers.dcp.layout.print_info_once"),
+            get_parallel().override(
+                attn_tp_size=16,
+                attn_tp_rank=3,
+                dcp_enabled=dcp_enabled,
+                enable_prefill_cp=False,
+            ),
         ):
             return _build_dsa_token_shard_plan(batch, index_topk)
 
@@ -201,8 +206,15 @@ class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
             extend_prefix_lens_cpu=[0],
             input_ids=torch.zeros(num_rows, dtype=torch.int64),
         )
-        with get_parallel().override(
-            attn_tp_size=16, attn_tp_rank=3, dcp_enabled=False, enable_prefill_cp=False
+        with (
+            patch("sglang.srt.layers.attention.dsa.dsa_token_shard.print_info_once"),
+            patch("sglang.srt.layers.dcp.layout.print_info_once"),
+            get_parallel().override(
+                attn_tp_size=16,
+                attn_tp_rank=3,
+                dcp_enabled=False,
+                enable_prefill_cp=False,
+            ),
         ):
             return _build_dsa_token_shard_plan(batch)
 

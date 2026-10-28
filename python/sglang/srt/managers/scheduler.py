@@ -4689,7 +4689,7 @@ class Scheduler(
         self._sched_idled = False
         _ts_t0 = time.perf_counter()
         print(
-            f"[SGL-TS] BATCH-START t={_ts_t0:.6f} rank={self.ps.tp_rank} "
+            f"[SGL-TS] BATCH-START t={_ts_t0:.6f} rank={get_parallel().tp_rank} "
             f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
             f"mode={batch.forward_mode}",
             flush=True,
@@ -5000,7 +5000,7 @@ class Scheduler(
         self._maybe_report_active_ranks()
         _ts_t1 = time.perf_counter()
         print(
-            f"[SGL-TS] BATCH-END t={_ts_t1:.6f} rank={self.ps.tp_rank} "
+            f"[SGL-TS] BATCH-END t={_ts_t1:.6f} rank={get_parallel().tp_rank} "
             f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
             f"mode={batch.forward_mode} dur={_ts_t1 - _ts_t0:.3f}s",
             flush=True,

@@ -2,6 +2,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from msgspec import structs
 from sgl_kernel_npu.norm.l1_norm import l1_norm as _l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -37,9 +38,9 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
-    if topk_config.num_fused_shared_experts:
+    if topk_config.num_shared_topk_slots:
         if (
-            topk_config.num_fused_shared_experts != 1
+            topk_config.num_shared_topk_slots != 1
             or not topk_config.apply_routed_scaling_factor_on_output
         ):
             raise ValueError(
@@ -49,7 +50,11 @@ def fused_topk_npu(
             hidden_states,
             router_logits,
             replace(
-                topk_config, top_k=topk_config.top_k - 1, num_fused_shared_experts=0
+                topk_config,
+                top_k=topk_config.top_k - 1,
+                shared_experts=structs.replace(
+                    topk_config.shared_experts, num_fused_shared_experts=0
+                ),
             ),
             num_token_non_padded,
             expert_location_dispatch_info,

@@ -177,7 +177,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         """The end-to-end shape of the bug this guards: an owner filter without
         its divide would still write plausible-looking data, c times too high."""
         first = PAGE_SIZE * DCP_SIZE
-        n = 64
+        n = PAGE_SIZE * DCP_SIZE
         loc = torch.arange(first, first + n, dtype=torch.int64, device=DEVICE)
         # Each virtual position carries its own value, so a misplaced row is
         # identifiable rather than merely wrong. Kept under 128 so every marker
@@ -194,10 +194,15 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
             k_rows = pool.get_key_buffer(0).view(-1, 1, KV_LORA_RANK)
             for i in range(n):
                 virtual = first + i
-                if virtual % DCP_SIZE != rank:
+                if (virtual // PAGE_SIZE) % DCP_SIZE != rank:
                     continue
                 with self.subTest(rank=rank, virtual=virtual):
-                    got = k_rows[virtual // DCP_SIZE, 0, 0].item()
+                    got = k_rows[
+                        (virtual // (PAGE_SIZE * DCP_SIZE)) * PAGE_SIZE
+                        + virtual % PAGE_SIZE,
+                        0,
+                        0,
+                    ].item()
                     self.assertEqual(got, float(virtual % 100))
             del pool
             torch.npu.empty_cache()

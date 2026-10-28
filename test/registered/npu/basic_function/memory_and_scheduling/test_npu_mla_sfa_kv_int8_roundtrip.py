@@ -173,7 +173,7 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
         what was written. An owner filter without its matching divide would write
         dcp_size times too many rows and this would find the misplaced data."""
         first = PAGE_SIZE * DCP_SIZE
-        n = 64
+        n = PAGE_SIZE * DCP_SIZE
         loc = torch.arange(first, first + n, dtype=torch.int64, device=DEVICE)
         g = torch.Generator().manual_seed(1)
         latent = (
@@ -191,9 +191,11 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
                 pool.set_kv_buffer(_FakeLayer(0), loc, latent, rope)
                 for i in range(n):
                     virtual = first + i
-                    if virtual % DCP_SIZE != rank:
+                    if (virtual // PAGE_SIZE) % DCP_SIZE != rank:
                         continue
-                    physical = virtual // DCP_SIZE
+                    physical = (
+                        virtual // (PAGE_SIZE * DCP_SIZE)
+                    ) * PAGE_SIZE + virtual % PAGE_SIZE
                     read = torch.tensor([physical], dtype=torch.int64, device=DEVICE)
                     k_nope, k_rope = pool.get_mla_kv_buffer(_FakeLayer(0), read)
                     with self.subTest(rank=rank, virtual=virtual):
