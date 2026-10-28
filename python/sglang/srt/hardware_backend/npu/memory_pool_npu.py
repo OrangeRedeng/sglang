@@ -1530,8 +1530,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
         assert layer_id in self.indexer_layer_id_to_slot, (
             f"layer {layer_id} owns no Indexer but wrote index-K; the pool's "
             "indexer_layer_ids disagrees with the model's indexer layout"

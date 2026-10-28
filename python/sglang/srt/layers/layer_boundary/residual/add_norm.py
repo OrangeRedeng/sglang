@@ -296,9 +296,7 @@ def _norm_quant_kernel(quant_format: str):
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
     if quant_format.startswith("npu_"):
-        return _functools_partial(
-            _update_and_read_residual_npu, quant_format=quant_format
-        )
+        return _functools_partial(_update_and_read_residual_npu, quant_format)
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":

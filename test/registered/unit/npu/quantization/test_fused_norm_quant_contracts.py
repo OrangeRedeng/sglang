@@ -145,7 +145,44 @@ class TestNpuNormQuantKernelDispatch(unittest.TestCase):
         for fmt in ("npu_mxfp8", "npu_mxfp4", "npu_int8", "npu_int4"):
             kernel = _norm_quant_kernel(fmt)
             self.assertIs(kernel.func, _update_and_read_residual_npu)
-            self.assertEqual(kernel.keywords, {"quant_format": fmt})
+            self.assertEqual(kernel.args, (fmt,))
+            self.assertEqual(kernel.keywords, {})
+
+    def test_bound_kernel_accepts_the_readout_calling_convention(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.layer_boundary.residual.add_norm import (
+            PLAIN_ADD,
+            NormQuantReadout,
+        )
+
+        hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+        norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+        operand = object()
+
+        def native(x, residual, weight, epsilon, contract):
+            self.assertEqual(contract, INT8)
+            torch.testing.assert_close(weight, norm.weight)
+            self.assertEqual(epsilon, norm.variance_epsilon)
+            return NormQuantizedReadout(
+                operand, x if residual is None else x + residual
+            )
+
+        for residual in (None, torch.full_like(hidden, 2)):
+            with (
+                self.subTest(residual=residual is not None),
+                patch(
+                    "sglang.srt.hardware_backend.npu.layernorm_quant.native_add_rmsnorm_quant",
+                    side_effect=native,
+                ),
+            ):
+                actual, updated = NormQuantReadout().update_and_read(
+                    PLAIN_ADD, hidden, residual, norm, quant_format="npu_int8"
+                )
+                self.assertIs(actual, operand)
+                torch.testing.assert_close(
+                    updated, hidden if residual is None else hidden + residual
+                )
 
     def test_non_npu_format_unchanged(self):
         from sglang.srt.layers.layer_boundary.residual.add_norm import (
