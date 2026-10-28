@@ -376,13 +376,20 @@ def boundary_self_check():
     )
 
 
+def case_checkpoint(args, scenario):
+    if scenario.get("quant") and args.checkpoint_format == "modelslim":
+        return args.bf16_model_path, "bf16"
+    return args.model_path, args.checkpoint_format
+
+
 def server_command(args, scenario):
+    model_path, checkpoint_format = case_checkpoint(args, scenario)
     command = [
         PYTHON,
         "-m",
         "sglang.launch_server",
         "--model-path",
-        str(args.model_path),
+        str(model_path),
         "--device",
         "npu",
         "--attention-backend",
@@ -398,6 +405,8 @@ def server_command(args, scenario):
         "--mem-fraction-static",
         str(args.mem_fraction),
     ]
+    if checkpoint_format == "modelslim":
+        command += ["--quantization", "modelslim"]
     if scenario.get("graph"):
         command += [
             "--cuda-graph-backend-decode",
@@ -649,12 +658,16 @@ def plan(args):
                 }
             )
     for name, scenario in SCENARIOS.items():
+        model_path, checkpoint_format = case_checkpoint(args, scenario)
         cases.append(
             {
                 "id": "serve-" + name,
                 "stage": "serve",
                 "scenario": scenario,
                 "command": server_command(args, scenario),
+                "requires_bf16": bool(scenario.get("quant")),
+                "checkpoint_path": str(model_path) if model_path else None,
+                "checkpoint_format": checkpoint_format,
             }
         )
     return [
@@ -674,6 +687,8 @@ def suite_command_self_check():
         stage="all",
         cases="*",
         model_path=None,
+        checkpoint_format="bf16",
+        bf16_model_path=None,
         tp=8,
         dcp=2,
         port=31000,
@@ -743,7 +758,18 @@ def main():
         "--model-path",
         type=Path,
         default=os.environ.get("MODEL_PATH"),
-        help="Local BF16 checkpoint directory (or set MODEL_PATH).",
+        help="Local checkpoint directory (or set MODEL_PATH).",
+    )
+    parser.add_argument(
+        "--checkpoint-format",
+        choices=("bf16", "modelslim"),
+        default="bf16",
+        help="Use modelslim for an offline W4A8/W8A8 INT checkpoint; online conversion cases require bf16.",
+    )
+    parser.add_argument(
+        "--bf16-model-path",
+        type=Path,
+        help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--dcp", type=int, default=2)
@@ -923,16 +949,22 @@ def main():
                     "--junitxml=" + str(directory / "junit.xml")
                 ]
             try:
-                if args.dry_run:
+                if case.get("requires_bf16") and not case.get("checkpoint_path"):
+                    result.update(
+                        status="blocked",
+                        reason="online conversion requires BF16 source weights; provide --bf16-model-path alongside the ModelSlim checkpoint",
+                    )
+                elif args.dry_run:
                     result["status"] = "planned"
                 elif case["stage"] in ("npu", "serve") and not hardware_ready:
                     result.update(status="blocked", reason="device preflight failed")
                 elif case["stage"] == "serve" and (
-                    not args.model_path or not args.model_path.is_dir()
+                    not case.get("checkpoint_path")
+                    or not Path(case["checkpoint_path"]).is_dir()
                 ):
                     result.update(
                         status="blocked",
-                        reason=f"checkpoint directory does not exist: {args.model_path!s}; set --model-path or MODEL_PATH to the real local BF16 checkpoint",
+                        reason=f"checkpoint directory does not exist: {case.get('checkpoint_path')}; set --model-path (or --bf16-model-path for online conversion) to the real local checkpoint",
                     )
                 elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
                     result.update(

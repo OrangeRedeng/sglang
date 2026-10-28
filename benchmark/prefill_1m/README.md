@@ -104,6 +104,33 @@ A3 machine. Alternatively, export `MODEL_PATH` to that directory and omit
 `--model-path`. A missing or example path leaves serving cases blocked;
 unit/operator suites can still run independently.
 
+For the offline INT checkpoint at `/home/weights/GLM5.2-w4a8-int/`:
+
+```bash
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
+    --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
+    --tp 16 --dcp 8 --output report.md
+```
+
+This passes `--quantization modelslim` to each server. The four online
+conversion cases remain blocked because they require BF16 source weights;
+the other suites and serving variants still run. Exit code 2 retains that
+incomplete coverage. The checkpoint's config selects its architecture;
+the GLM5.2 directory name alone does not establish GLM-5.3 coverage.
+
+To cover online conversion in the same run, add the BF16 checkpoint:
+
+```bash
+python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
+    --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
+    --bf16-model-path /actual/path/to/GLM-5.3-BF16 \
+    --tp 16 --dcp 8 --output report.md
+```
+
+Only the four online-conversion cases use `--bf16-model-path`; the other
+serving cases use the primary offline INT checkpoint. Each case records its
+checkpoint path and format. Use matching model revisions if comparing them.
+
 | Coverage | Automated checks |
 |---|---|
 | Benchmark fixes | Concurrent HTTP requests, fresh cold prefixes, cached priming, first-token timing, launcher arguments |
