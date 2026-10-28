@@ -167,6 +167,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):

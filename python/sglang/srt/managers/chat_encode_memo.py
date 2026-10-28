@@ -70,7 +70,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Minimum anchored-content length (chars) for family formation. Below it,
 # the re-encode savings are negligible and the BPE-boundary skew is not

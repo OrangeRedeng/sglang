@@ -47,6 +47,7 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
@@ -424,20 +425,18 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    # Resolve DSA-CP once per forward, here rather than in the core, because
-    # this is the half of the pair that receives layer_scatter_modes and the
-    # gate needs it: the slice assumes this rank was handed the whole batch.
-    # The result is cached on the batch and the core reads it back.
+    # Resolve DSA-CP once per forward, here rather than in the core. The
+    # result is cached on the batch and the core reads it back.
     # index_topk decides whether the multi-request lift may drop the operator's
     # causal crop, and this is the FIRST place in a forward that can supply it.
     # m.indexer exists only on the layers that compute a top-k
-    # (deepseek_v2.py:1828) -- layer 0 is one of them, and it is layer 0 that
+    # (deepseek_v2.py) -- layer 0 is one of them, and it is layer 0 that
     # resolves the cached plan -- but None is answered "keep the crop" rather
     # than trusted, so a model that ordered its layers differently degrades
-    # instead of breaking.
+    # instead of breaking. (Upstream #41438 removed the per-layer scatter-mode
+    # argument; the plan is token-sliced, so it no longer varies by layer.)
     dsa_cp_plan = get_dsa_cp_plan(
         forward_batch,
-        layer_scatter_modes,
         m.indexer.index_topk if m.indexer is not None else None,
     )
     mla_preprocess_used = (

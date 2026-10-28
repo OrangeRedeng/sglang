@@ -1204,7 +1204,11 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
-                    num_token_non_padded=num_token_non_padded,
+                    num_token_non_padded=(
+                        forward_batch.moe_num_token_non_padded()
+                        if forward_batch is not None
+                        else None
+                    ),
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
                     leave_output_sum=leave_output_sum,
@@ -1462,11 +1466,6 @@ class DeepseekV2MoE(nn.Module):
             hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
                 -1
             ).to(hidden_states.dtype)
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
         defer_shared = not self.experts.moe_runner_config.inplace and not (
             self._fuse_npu_tp_shared and not get_is_capture_mode()
         )

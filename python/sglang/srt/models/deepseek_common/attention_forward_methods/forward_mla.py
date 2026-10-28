@@ -88,6 +88,22 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
+def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    """Narrow DCP decode phase: decode / target-verify only.
+
+    The NPU DCP-extend-gather seam (npu_dcp_extend_kv in
+    deepseek_v2_attention_mla_npu) handles extend itself, so its decode-phase
+    branch must NOT admit DSA-extend -- unlike the mixin method of the same
+    name on DeepseekV2AttentionMLA, which deliberately does.
+    """
+    if not get_parallel().dcp_enabled:
+        return False
+    return (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    )
+
+
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     # Backends whose attention returns a natural-log LSE. A mismatch degrades
     # acceptance without failing -- test_the_wrong_log_base_is_not_silently_fine.

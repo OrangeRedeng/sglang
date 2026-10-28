@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_cp import get_dsa_cp_plan
-from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -167,7 +167,7 @@ def _build_indexer_query_shard(
 
 
 def _get_indexer_query_shard(
-    forward_batch: ForwardBatch, num_tokens: int, layer_scatter_modes
+    forward_batch: ForwardBatch, num_tokens: int
 ) -> Optional[_IndexerQueryShard]:
     """The query shard for a prefill indexer call, or None to score every row.
 
@@ -182,21 +182,9 @@ def _get_indexer_query_shard(
     Planned once per forward. Every input to the decision is identical across
     the attention-TP group, so all ranks take the collective or none do.
     """
-    if (
-        layer_scatter_modes is not None
-        and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
-    ):
-        # Same silent-fallback shape as the width check below, so it says so
-        # too. The plan assumes every attention-TP rank holds the whole batch,
-        # which is what TP_ATTN_FULL means; under any other scatter mode the
-        # rank already holds a slice and this would slice it twice. Refusing is
-        # correct -- going quiet about it is not, which is how the width check
-        # cost 16x the indexer for four weeks.
-        print_info_once(
-            "DSA indexer query sharding is off: attention scatter mode is "
-            f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
-        )
-        return None
+    # Upstream #41438 replaced per-layer scatter-mode selection with fixed
+    # declarations; attention input is TP_ATTN_FULL by construction now, so
+    # the former not-TP_ATTN_FULL refusal here can no longer trigger.
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
         forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
             forward_batch
@@ -530,7 +518,7 @@ class DSANPUIndexerMixin:
             num_query_tokens = query.shape[0]
             shard = (
                 _get_indexer_query_shard(
-                    forward_batch, num_query_tokens, layer_scatter_modes
+                    forward_batch, num_query_tokens
                 )
                 # Token sharding needs the plan's length vectors even when the
                 # standalone indexer-sharding switch is off, because the full
