@@ -5,10 +5,9 @@ Measures prefill-dominated latency at very long context: each request sends a
 TTFT (time to first token) and prefill tokens/s, reported per batch size with
 warmup and repeats.
 
-Modeled on the bde_v2 print-build `bench_ais.sh` workflow (prefix-cache style
-input, request_rate=0, concurrency sweep) but self-contained: prompts are
-synthetic seeded token-id sequences, so no external aisbench checkout or
-dataset is needed.
+Uses SGLang's native streaming API with synthetic seeded token-id sequences.
+For the standard serving benchmark, use python -m sglang.benchmark.serving;
+this client additionally verifies cache reuse during concurrent TTFT sweeps.
 
 Usage:
     # Against a running server:

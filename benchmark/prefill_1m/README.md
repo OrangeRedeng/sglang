@@ -8,17 +8,30 @@ switches.
 ## Files
 
 - `bench_glm53_prefill_1m.py` — client. Synthetic seeded token-id prompts
-  (no dataset or external aisbench checkout needed), `output_len=1`,
+  (no external dataset needed), `output_len=1`,
   concurrent batch sweep, warmup + repeats, JSON output, `--dry-run` mode.
 - `serve_glm53_1m.sh` — server launcher, adapted from the bde_v2 print-build
   `p4_exit1_serve_dcp.sh` recipe (proxy handling, int8 LightningIndexer, DCP
   shared-gather envs, chat-encode opts).
-- `reference/` — the original zip scripts (`bench_ais.sh`,
-  `p4_exit1_serve_dcp.sh`), kept for provenance. `bench_ais.sh` drives an
-  external `aisbench_test.py` checkout that is not part of this repo; the
-  Python bench replaces it.
+- `feature_benchmarks.py` — small workloads use the SGLang serving benchmark;
+  long-context sweeps use SGLang's native streaming API for cache verification.
+- `reference/p4_exit1_serve_dcp.sh` — original server recipe kept for provenance.
 
 ## Run
+
+Use SGLang's serving benchmark against an already running server for a
+single cold long-context point:
+
+```bash
+python3 -m sglang.benchmark.serving --backend sglang \
+  --host 127.0.0.1 --port 30000 --dataset-name random-ids --tokenize-prompt \
+  --random-input-len 131072 --random-output-len 1 --random-range-ratio 1 \
+  --num-prompts 16 --max-concurrency 1 --request-rate inf \
+  --warmup-requests 1 --flush-cache --seed 4 --output-file ttft-128k.jsonl
+```
+
+The server must support the input length plus output tokens and have sufficient
+KV capacity. Use the validation runner below for the multi-point report.
 
 ```bash
 # 1. Start the server (bf16 checkpoint, eager prefill baseline):
