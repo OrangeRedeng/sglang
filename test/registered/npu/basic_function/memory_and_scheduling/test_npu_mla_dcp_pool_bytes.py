@@ -30,6 +30,7 @@ import unittest
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -81,11 +82,14 @@ def _index_bytes(pool) -> int:
 
 def _measure(dcp_size, **overrides):
     """Bytes for serving SERVED_CONTEXT tokens at this DCP width."""
-    pool = _build(
-        size=SERVED_CONTEXT // dcp_size,
-        index_buf_size=SERVED_CONTEXT,
-        **overrides,
-    )
+    with get_parallel().override(
+        attn_dcp_size=dcp_size, attn_dcp_rank=0, dcp_enabled=dcp_size > 1
+    ):
+        pool = _build(
+            size=SERVED_CONTEXT // dcp_size,
+            index_buf_size=SERVED_CONTEXT,
+            **overrides,
+        )
     latent, index = _latent_bytes(pool), _index_bytes(pool)
     del pool
     torch.npu.empty_cache()
@@ -93,6 +97,12 @@ def _measure(dcp_size, **overrides):
 
 
 class TestNpuMlaDcpPoolBytes(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0, dcp_enabled=False)
+        )
+
     @classmethod
     def setUpClass(cls):
         import torch_npu  # noqa: F401

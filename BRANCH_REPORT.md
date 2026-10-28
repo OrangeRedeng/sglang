@@ -1,3 +1,39 @@
+# Current integration update (2026-10-28)
+
+Integrated code from the following live PR heads without changing their upstream PRs:
+
+| PR | Head | Scope |
+|---|---|---|
+| #42977 | 3941dc3719 | DSA indexer query sharding |
+| #42978 | ccbd6b1692 | Token sharding, padded-width/CP refusal, paged key frontier |
+| #44320 | a8866e572d | DCP prefix-KV gather and buffer reuse |
+| #44321 | 7c0c8398ad | Token shard composed with DCP KV gather |
+| #43141 | 3dd268b4f4 | DCP group nesting and KV-dtype validation |
+| #42224 | b71a0c85bd | INT8 indexer/FP16 scales, HiCache exclusion |
+
+The combined #44321 delta supplies its parent PRs; newer #42978 safety fixes
+are applied on top. These are semantic integrations onto the existing branch,
+not wholesale replacements with upstream main. Graph and INT components remain.
+
+Repaired the function-local `get_flags` shadow, added the GLM DSA W4A4 allowlist,
+restored the packed-read helper definitions needed during native model import,
+and updated the tests and feature matrix for supported INT contracts and the
+current runtime-context/shared-expert APIs. Legacy D1v3 is disabled in favor of
+the reviewed token-shard path. The indexer INT8 path follows the PR's HiCache
+exclusion. Physical KV write IDs are not translated a second time.
+
+Validation for this integration: all seven host-runner checks passed; 36
+host encoding/scheduling tests passed; 21 isolated CPU planner tests passed
+against real PyTorch with runtime/import boundaries stubbed. Compile checks,
+F821/F823 and diff checks passed. Broader local suite collection is blocked
+by missing TVM FFI/datasets/torchvision dependencies. A3 operator, native-model
+startup, NPUGraph replay, quality and performance must be rerun on the target.
+
+The original A3 report is user-provided evidence. Host/static verification
+does not establish A3 graph replay, quantized model quality or performance.
+
+---
+
 # Branch report: `a3_910c_int_glm53`
 
 **HEAD:** `24b0afbe9b` · worktree `.codex-artifacts/worktrees/a3-int-glm53` · clean

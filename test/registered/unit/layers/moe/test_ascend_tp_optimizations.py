@@ -10,6 +10,7 @@ import torch
 
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.moe import tp_fusion
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.hardware_backend.npu.moe.contracts import (
     INT4,
     INT8,
@@ -721,7 +722,7 @@ class TestAscendTPOptimizations(CustomTestCase):
         logits = torch.tensor([[1.0, -2.0, 3.0, 0.5], [0.0, 1.0, 2.0, 3.0]])
         config = TopKConfig(
             top_k=3,
-            num_fused_shared_experts=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             renormalize=True,
             routed_scaling_factor=2.5,
             apply_routed_scaling_factor_on_output=True,

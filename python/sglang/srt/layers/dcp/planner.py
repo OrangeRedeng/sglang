@@ -25,7 +25,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     update_kv_lens_and_indices,
 )
 from sglang.srt.layers.dcp.layout import (
-    localize_dcp_indices,
+    dcp_local_prefix_rows,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -114,29 +114,35 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
-    # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-    translator = get_attn_backend().kv_index_translator
     if is_npu():
-        local_indices = localize_dcp_indices(
+        # NPU pools shard in page_size runs (the translator's rank-local write),
+        # not round-robin, so this rank's prefix rows are not the stride below.
+        # A rank-local NPU pool is never a translating one: rows are physical.
+        dcp_local_prefix_kv_indices = dcp_local_prefix_rows(
             dcp_prefix_kv_indices,
+            extend_prefix_lens_cpu,
             parallel.dcp_size,
             parallel.dcp_rank,
-            interleave_size=get_attn_backend().page_size,
+            get_attn_backend().page_size,
         )
-        dcp_local_prefix_kv_indices = local_indices[local_indices >= 0]
+        # NPU gathers into its own reused buffers and never reads this one,
+        # which is context-sized: 1.15 GB per extend forward at a 1M prefix.
+        dcp_kv_buffer = None
     else:
+        # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+        # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+        translator = get_attn_backend().kv_index_translator
         dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
             dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         )
-    dcp_kv_buffer = torch.empty(
-        (
-            seq_lens_sum,
-            *kv_buffer_shape[1:],
-        ),
-        dtype=kv_cache_dtype,
-        device=kv_cache_device,
-    )
+        dcp_kv_buffer = torch.empty(
+            (
+                seq_lens_sum,
+                *kv_buffer_shape[1:],
+            ),
+            dtype=kv_cache_dtype,
+            device=kv_cache_device,
+        )
     attn_dcp_metadata = DecodeContextParallelMetadata(
         dcp_kv_indptr=dcp_kv_indptr,
         dcp_kv_buffer=dcp_kv_buffer,

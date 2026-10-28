@@ -442,8 +442,6 @@ class FusedMoE(torch.nn.Module):
         )
 
         if _is_npu:
-            from sglang.srt.runtime_context import get_flags
-
             online_scheme = (get_flags().moe.online_quantization or {}).get("moe")
             if online_scheme is not None:
                 if online_scheme != "W8A8_MXFP8":
@@ -1238,9 +1236,7 @@ class FusedMoE(torch.nn.Module):
     def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
         """Resolve checkpoint experts to destinations before allocating weights."""
         global_expert_location_metadata = (
-            get_global_expert_location_metadata()
-            if self.uses_expert_location
-            else None
+            get_global_expert_location_metadata() if self.uses_expert_location else None
         )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):

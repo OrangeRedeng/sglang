@@ -1215,7 +1215,7 @@ class Envs:
     # DSA prefill: shard the attention block's tokens across attention-TP, so
     # every rank computes every head for its own slice, with the query
     # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
-    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(False)
     # DSA-CP: also shard batches carrying more than one request, by passing
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
@@ -1393,6 +1393,9 @@ class Envs:
     # between the two. Under graph capture the synchronous gather is kept
     # (see the pre-issue site), so captured decode is unaffected.
     SGLANG_NPU_DCP_DECODE_Q_PREISSUE = EnvBool(True)
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa

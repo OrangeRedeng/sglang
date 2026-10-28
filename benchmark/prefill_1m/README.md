@@ -112,7 +112,7 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
     --tp 16 --dcp 8 --output report.md
 ```
 
-This passes `--quantization modelslim` to each server. The four online
+This passes `--quantization modelslim` to each server. The three online
 conversion cases remain blocked because they require BF16 source weights;
 the other suites and serving variants still run. Exit code 2 retains that
 incomplete coverage. The checkpoint's config selects its architecture;
@@ -127,7 +127,7 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
     --tp 16 --dcp 8 --output report.md
 ```
 
-Only the four online-conversion cases use `--bf16-model-path`; the other
+Only the three online-conversion cases use `--bf16-model-path`; the other
 serving cases use the primary offline INT checkpoint. Each case records its
 checkpoint path and format. Use matching model revisions if comparing them.
 
@@ -135,9 +135,9 @@ checkpoint path and format. Use matching model revisions if comparing them.
 |---|---|
 | Benchmark fixes | Concurrent HTTP requests, fresh cold prefixes, cached priming, first-token timing, launcher arguments |
 | GLM boundary fix | Actual decoder forward with host dependency stubs; selected INT format reaches its consumer |
-| INT quantization | Contract/loader suites; W8A8, mixed W4A4/W8A8, scoped INT8 boundary and scoped INT4 serving |
+| INT quantization | Contract/loader suites; W8A8, mixed W4A4/W8A8, scoped INT8 dense/router/shared serving |
 | TP MoE | Routing/shared-weight/top-k suites; finalize fusion and shared-expert serving variants |
-| DCP/indexer/SFA | Layout, ownership, gather/overlap, sparse parity, query shard and index-pool suites; real NPU pool/INT8 round trips; sync/async/packed serving |
+| DCP/indexer/SFA | Layout, ownership, gather/overlap, sparse parity, query shard and index-pool suites; real NPU pool/INT8 round trips; reviewed KV-gather/token-shard and packed serving |
 | Graphs | Configuration, full-prefill and piecewise suites; non-DCP full/piecewise serving variants |
 | Host path | Pool/memo/raw encoding suites and chat-completion serving variants |
 | Scheduling | Autotune, HCCL sizing and resource-scheduling suites; multistream/autotune serving variants |
@@ -199,3 +199,17 @@ load-time conversion, not the cookbook's FP8 checkpoints.
    pool construction at DCP > 1.
 4. **Prefill graph vs DCP**: `can_run_prefill_cuda_graph` excludes DCP runs,
    so the CAPTURE=1 win applies to the non-DCP 1M configuration only.
+
+## Integrated PR validation
+
+The matrix now follows #42977/#42978 indexer/token sharding, #44320/#44321
+DCP KV gather composition, #43141 nesting validation and #42224 INT8 indexer.
+Legacy D1v3 and asynchronous gather experiments are not selected by this matrix.
+Scoped routed-MoE/INT4 conversion is unsupported; use `w8a8_int`/`w4a4_int`
+load-time modes. The dense/router/shared INT8 case uses explicit targets and
+never requests unsupported `moe:W8A8_DYNAMIC`.
+
+Packed INT8 KV uses a BF16 page read for DCP partial attention; its temporary
+read allocation and performance require A3 validation. HiCache disables INT8
+indexer storage as in the current #42224 head. Tests of removed experimental
+stream APIs have been removed; runtime state is explicit in the pool/graph tests.

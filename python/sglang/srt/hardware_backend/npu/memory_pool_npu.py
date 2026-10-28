@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -15,11 +16,14 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     get_tensor_size_bytes,
     unwrap_write_loc,
+    write_loc_is_physical,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu, print_info_once
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -730,7 +734,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self.kr_cache_dim = 0 if self.sfa_packed_kv_storage else qk_rope_head_dim
 
-        self.indexer_kv_store_int8 = index_head_dim is not None and envs.SGLANG_NPU_INDEXER_INT8.get()
+        self.indexer_kv_store_int8 = (
+            index_head_dim is not None
+            and envs.SGLANG_NPU_INDEXER_INT8.get()
+            and not get_memory().enable_hierarchical_cache
+            and not self.dsa_kv_cache_store_fp8
+        )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
@@ -741,7 +750,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_store_dtype = (
                 self.dtype if self.sfa_kv_store_8bit else self.store_dtype
             )
-            self.index_k_scale_dtype = torch.float32 if self.dsa_kv_cache_store_fp8 else None
+            self.index_k_scale_dtype = (
+                torch.float32 if self.dsa_kv_cache_store_fp8 else None
+            )
 
         if self.sfa_kv_store_8bit and get_parallel().attn_dcp_size <= 1:
             raise ValueError(
@@ -752,7 +763,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 "of the packed rows is not wired here. Run with the flag "
                 "under DCP, or without the flag."
             )
-
 
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
@@ -841,7 +851,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if (self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8) and self.num_indexer_layers > 0:
+                if (
+                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -1055,9 +1067,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         packed row.
         """
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(
-                read_layer_id - self.start_layer
-            )
+            self.layer_transfer_counter.wait_until(read_layer_id - self.start_layer)
         storage = self.k_buffer[read_layer_id - self.start_layer].view(
             -1, self.kv_cache_dim
         )
@@ -1074,9 +1084,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             .reshape(-1, tiles, 1)
         )
         nope = (
-            rows[:, : self.kv_lora_rank]
-            .to(torch.float32)
-            .reshape(-1, tiles, 128)
+            rows[:, : self.kv_lora_rank].to(torch.float32).reshape(-1, tiles, 128)
             * scale
         ).reshape(-1, self.kv_lora_rank)
         rope = (
@@ -1107,9 +1115,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         its storage dtype with one view.
         """
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(
-                read_layer_id - self.start_layer
-            )
+            self.layer_transfer_counter.wait_until(read_layer_id - self.start_layer)
         storage = self.k_buffer[read_layer_id - self.start_layer].view(
             -1, self.kv_cache_dim
         )
@@ -1180,7 +1186,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        assert scale.dtype == self.index_k_scale_dtype, f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        assert scale.dtype == self.index_k_scale_dtype, (
+            f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        )
         torch_npu.npu_scatter_nd_update_(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
@@ -1358,11 +1366,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_v.index_select(0, owned_idx),
             )
 
-        owned = (loc % dcp_size) == get_parallel().attn_dcp_rank
+        local = localize_dcp_indices(
+            loc, dcp_size, get_parallel().attn_dcp_rank, self.page_size
+        )
+        owned = local >= 0
         # Static shape, no NonZero, no stream sync: capturable. See the note
         # above for why row 0 is the right place to send the rest.
         return (
-            torch.where(owned, loc // dcp_size, loc.new_zeros(())),
+            torch.where(owned, local, loc.new_zeros(())),
             cache_k,
             cache_v,
         )
@@ -1401,7 +1412,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """This forward's owner filter, computed once and reused by every layer."""
         if self._dcp_extend_write_plan is None:
             self._dcp_extend_write_plan = plan_dcp_owner_write(
-                loc, dcp_size, get_parallel().attn_dcp_rank
+                loc, dcp_size, get_parallel().attn_dcp_rank, self.page_size
             )
         return self._dcp_extend_write_plan
 
@@ -1427,7 +1438,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             # rank owns 1/dcp_size of an extend chunk's rows: filtering first
             # is what "each rank quantizes + writes only its owned rows"
             # means. At dcp_size 1 the filter is the no-op early return.
-            loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+            if not write_loc_is_physical(loc_info):
+                loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
             if loc.numel() == 0:
                 # Same reachable case as the bf16 path: a short extend chunk
                 # this rank owns none of. A zero-row scatter is not worth
@@ -1460,7 +1472,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+        if not write_loc_is_physical(loc_info):
+            loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
         if loc.numel() == 0:
             # A rank can own none of a short chunk's rows, and a zero-row
             # scatter is not worth trusting to a vendor operator.
@@ -1525,7 +1538,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
         if self.indexer_kv_store_int8:
-            assert index_k.dtype == self.index_k_store_dtype, f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            )
         else:
             if index_k.dtype != self.dtype:
                 index_k = index_k.to(self.dtype)

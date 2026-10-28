@@ -49,14 +49,12 @@ UNIT_SUITES = {
     ],
     "dcp-gather": [
         "dcp/test_dcp_extend_gather_plan.py",
-        "dcp/test_dcp_extend_gather_prefetch.py",
-        "dcp/test_dcp_sfa_gather_overlap.py",
         "dcp/test_dcp_sparse_attention_parity.py",
     ],
     "indexer-sharding": [
-        "dcp/test_dcp_indexer_query_shard.py",
+        "attention/unittests/dsa/test_dsa_npu_indexer_query_shard.py",
+        "attention/unittests/dsa/test_dsa_token_shard_plan.py",
         "dcp/test_dcp_quant_indexer_shard_plan.py",
-        "unit/npu/attention/test_npu_quant_lightning_indexer.py",
         "unit/npu/mem_cache/test_npu_dsa_index_k_scale_pool.py",
         "unit/mem_cache/test_dcp_index_buf_budget.py",
     ],
@@ -87,8 +85,9 @@ SCENARIOS = {
     "baseline": {},
     "w8a8-load": {"quant": "w8a8_int"},
     "w4a4-mixed-load": {"quant": "w4a4_int"},
-    "int8-boundary": {"quant": "all:w8a8_dynamic"},
-    "int4-scoped": {"quant": "moe:w4a4_dynamic"},
+    "int8-dense-gate": {
+        "quant": "gate:w8a8_dynamic,qkv:w8a8_dynamic,dense:w8a8_dynamic,shared_expert:w8a8_dynamic"
+    },
     "tp-finalize": {
         "env": {
             "SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE": "True",
@@ -118,30 +117,17 @@ SCENARIOS = {
     },
     "indexer-int8": {"env": {"SGLANG_NPU_INDEXER_INT8": "True"}},
     "indexer-query-shard": {
-        "env": {"SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS": "1"}
+        "env": {"SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING": "True"}
     },
-    "dcp-sync": {
+    "sfa-int8": {"dcp": True, "env": {"SGLANG_NPU_SFA_KV_8BIT": "True"}},
+    "dsa-token-shard": {"env": {"SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD": "True"}},
+    "dsa-token-shard-dcp": {
         "dcp": True,
         "env": {
-            "SGLANG_NPU_ENABLE_DCP_SHARED_GATHER": "True",
-            "SGLANG_NPU_DCP_GATHER_ASYNC": "False",
+            "SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD": "True",
+            "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING": "True",
         },
     },
-    "dcp-async": {
-        "dcp": True,
-        "env": {
-            "SGLANG_NPU_ENABLE_DCP_SHARED_GATHER": "True",
-            "SGLANG_NPU_DCP_GATHER_ASYNC": "True",
-        },
-    },
-    "sfa-int8": {
-        "dcp": True,
-        "env": {
-            "SGLANG_NPU_SFA_KV_8BIT": "True",
-            "SGLANG_NPU_ENABLE_DCP_SHARED_GATHER": "True",
-        },
-    },
-    "dsa-token-shard": {"env": {"SGLANG_NPU_DSA_CP_MIN_TOKENS": "1"}},
     "graph-full": {"graph": "full", "env": {"ASCEND_USE_FIA": "1"}},
     "graph-piecewise": {"graph": "tc_piecewise"},
     "chat-pool": {"env": {"SGLANG_ENABLE_CHAT_ENCODE_POOL": "True"}},
@@ -157,6 +143,7 @@ SCENARIOS = {
             "SGLANG_CHAT_ENCODE_RAW": "True",
         }
     },
+    "dcp-kv-gather": {"dcp": True},
 }
 
 
@@ -548,29 +535,34 @@ def append_result(path, result, directory):
 
 def fusion_import_self_check():
     """Catch stale imports before they prevent pytest collection/server startup."""
-    module = "sglang.srt.hardware_backend.npu.moe.tp_fusion"
-    source = ROOT / "python/sglang/srt/hardware_backend/npu/moe/tp_fusion.py"
-    exported = set()
-    for node in ast.parse(source.read_text()).body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            exported.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            exported.update(
-                alias.asname or alias.name.split(".")[0] for alias in node.names
-            )
-        elif isinstance(node, ast.Assign):
-            exported.update(t.id for t in node.targets if isinstance(t, ast.Name))
-    for file in (ROOT / "python/sglang/srt").rglob("*.py"):
-        text = file.read_text()
-        if module not in text:
-            continue
-        for node in ast.walk(ast.parse(text)):
-            if isinstance(node, ast.ImportFrom) and node.module == module:
-                missing = {alias.name for alias in node.names} - exported
-                assert not missing, (
-                    f"{file.relative_to(ROOT)}:{node.lineno}: missing {sorted(missing)}"
+    for module in (
+        "sglang.srt.hardware_backend.npu.moe.tp_fusion",
+        "sglang.srt.layers.dcp.layout",
+        "sglang.srt.layers.attention.dsa.dsa_token_shard",
+        "sglang.srt.layers.attention.dsa.dsa_token_shard_layout",
+    ):
+        source = ROOT / "python" / (module.replace(".", "/") + ".py")
+        exported = set()
+        for node in ast.parse(source.read_text()).body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                exported.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                exported.update(
+                    alias.asname or alias.name.split(".")[0] for alias in node.names
                 )
-    print("PASS: TP fusion imports resolve against the current module exports")
+            elif isinstance(node, ast.Assign):
+                exported.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        for file in (ROOT / "python/sglang/srt").rglob("*.py"):
+            text = file.read_text()
+            if module not in text:
+                continue
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.ImportFrom) and node.module == module:
+                    missing = {alias.name for alias in node.names} - exported
+                    assert not missing, (
+                        f"{file.relative_to(ROOT)}:{node.lineno}: missing {sorted(missing)}"
+                    )
+    print("PASS: TP fusion and DSA/DCP imports resolve against current exports")
 
 
 def plan(args):
@@ -657,6 +649,23 @@ def plan(args):
                     "junit": True,
                 }
             )
+    cases.append(
+        {
+            "id": "npu-int8-indexer",
+            "stage": "npu",
+            "command": [
+                PYTHON,
+                "-m",
+                "pytest",
+                "-q",
+                "-ra",
+                "-p",
+                "no:cacheprovider",
+                "test/registered/unit/npu/attention/test_npu_quant_lightning_indexer.py",
+            ],
+            "junit": True,
+        }
+    )
     for name, scenario in SCENARIOS.items():
         model_path, checkpoint_format = case_checkpoint(args, scenario)
         cases.append(
@@ -920,12 +929,12 @@ def main():
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
             },
-            "scope": "GLM-5.3 A3 INT integration; Gemma-only and MXFP additions excluded",
+            "scope": "GLM DSA A3 INT integration; Gemma-only and MXFP additions excluded",
             "results": [],
             "limitations": [
                 "Unit/mock passes are host evidence only.",
                 "Serving smoke does not establish optimization activation, numerical quality, graph replay or performance.",
-                "D1v3 declared-boundary port remains deferred; activation must be checked on device.",
+                "Legacy experimental D1v3 is disabled; reviewed PR token sharding is tested instead.",
             ],
         }
         args.output.write_text(

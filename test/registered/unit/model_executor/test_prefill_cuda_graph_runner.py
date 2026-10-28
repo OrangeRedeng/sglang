@@ -37,7 +37,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,6 +119,10 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(get_parallel().override(dcp_enabled=False))
+
     def test_full_backend_accepts_mixed_chunks(self):
         """Full pads the token and request axes and refreshes attention
         metadata on every replay, so the mixed-chunk startup guard must not
@@ -303,8 +307,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         model_runner = SimpleNamespace(
             device="cuda",
             npu_task_queue_policy=SimpleNamespace(
-                prefill_mode=0,
-                set_mode=lambda mode: capture_events.append(mode)
+                prefill_mode=0, set_mode=lambda mode: capture_events.append(mode)
             ),
             gpu_id=0,
             is_draft_worker=False,
@@ -351,7 +354,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
-        self.assertEqual(capture_events, [0, "capture"])
+        self.assertEqual(capture_events, ["capture"])
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()

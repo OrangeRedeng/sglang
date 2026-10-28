@@ -72,6 +72,12 @@ def _build(**overrides):
 
 
 class TestNpuMlaDcpShardedWrite(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0, dcp_enabled=False)
+        )
+
     @classmethod
     def setUpClass(cls):
         import torch_npu  # noqa: F401
@@ -80,6 +86,25 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
 
     def tearDown(self):
         torch.npu.empty_cache()
+
+    def test_physical_write_ids_are_not_localized_twice(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        pool = _build()
+        loc = torch.tensor([PAGE_SIZE, PAGE_SIZE + 1], dtype=torch.int64, device=DEVICE)
+        key = torch.ones((2, 1, KV_LORA_RANK), dtype=torch.bfloat16, device=DEVICE)
+        rope = torch.full(
+            (2, 1, QK_ROPE_HEAD_DIM), 2, dtype=torch.bfloat16, device=DEVICE
+        )
+        with patch.object(
+            pool, "_resolve_dcp_write", side_effect=AssertionError("already physical")
+        ):
+            pool.set_kv_buffer(_FakeLayer(0), KVWriteLoc(loc, physical=True), key, rope)
+        actual_key, actual_rope = pool.get_mla_kv_buffer(_FakeLayer(0), loc)
+        torch.testing.assert_close(actual_key, key, rtol=0, atol=0)
+        torch.testing.assert_close(actual_rope, rope, rtol=0, atol=0)
 
     def _resolve(self, pool, loc, rank, dcp_size=DCP_SIZE):
         """Run the write resolution as `rank` would see it."""
@@ -102,7 +127,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         claimed = []
         for rank in range(DCP_SIZE):
             with get_parallel().override(attn_dcp_size=DCP_SIZE, attn_dcp_rank=rank):
-                owned = (loc % DCP_SIZE) == get_parallel().attn_dcp_rank
+                owned = ((loc // PAGE_SIZE) % DCP_SIZE) == get_parallel().attn_dcp_rank
             claimed.append(loc[owned])
 
         all_claimed = torch.cat(claimed).sort().values
@@ -122,7 +147,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
             for rank in range(DCP_SIZE):
                 with self.subTest(page=page, rank=rank):
                     local = self._resolve(pool, loc, rank)
-                    owned = (loc % DCP_SIZE) == rank
+                    owned = ((loc // PAGE_SIZE) % DCP_SIZE) == rank
                     mine = local[owned]
                     self.assertEqual(mine.numel(), PAGE_SIZE)
                     self.assertEqual(mine.min().item(), page * PAGE_SIZE)
@@ -144,7 +169,7 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         for rank in range(DCP_SIZE):
             with self.subTest(rank=rank):
                 local = self._resolve(pool, loc, rank)
-                owned = (loc % DCP_SIZE) == rank
+                owned = ((loc // PAGE_SIZE) % DCP_SIZE) == rank
                 self.assertGreaterEqual(local[owned].min().item(), PAGE_SIZE)
                 self.assertTrue(torch.all(local[~owned] == 0))
 

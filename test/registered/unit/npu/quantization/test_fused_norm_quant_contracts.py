@@ -33,10 +33,10 @@ class TestOnlineQuantizationGrammar(unittest.TestCase):
 
     def test_single_pair(self):
         self.assertEqual(
-            parse_online_quantization("gate:w8a8_mxfp8"), {"gate": "W8A8_MXFP8"}
+            parse_online_quantization("gate:w8a8_int8"), {"gate": "W8A8_DYNAMIC"}
         )
         self.assertEqual(
-            parse_online_quantization("gate:w4a8_mxfp"), {"gate": "W4A8_MXFP"}
+            parse_online_quantization("gate:int8"), {"gate": "W8A8_DYNAMIC"}
         )
         self.assertEqual(
             parse_online_quantization("GATE:W8A8_DYNAMIC"), {"gate": "W8A8_DYNAMIC"}
@@ -44,14 +44,14 @@ class TestOnlineQuantizationGrammar(unittest.TestCase):
 
     def test_multiple_pairs(self):
         parsed = parse_online_quantization(
-            "gate:w8a8_mxfp8, moe:w4a8_mxfp ,qkv:w4a4_mxfp4"
+            "gate:w8a8_dynamic, moe:w4a4_dynamic ,qkv:int8"
         )
         self.assertEqual(
             parsed,
             {
-                "gate": "W8A8_MXFP8",
-                "moe": "W4A8_MXFP",
-                "qkv": "W4A4_MXFP4",
+                "gate": "W8A8_DYNAMIC",
+                "moe": "W4A4_DYNAMIC",
+                "qkv": "W8A8_DYNAMIC",
             },
         )
 
@@ -112,9 +112,8 @@ class TestNormQuantSelection(unittest.TestCase):
 
 class TestGateSchemes(unittest.TestCase):
     def test_supported_schemes(self):
-        method = QuantizedMoEGateMethod("W8A8_MXFP8")
-        self.assertEqual(method.contract, MXFP8)
-        self.assertEqual(method.output_dtype, torch.float32)
+        with self.assertRaisesRegex(ValueError, "MXFP excluded"):
+            QuantizedMoEGateMethod("W8A8_MXFP8")
 
     def test_int8_scheme_uses_bf16_output(self):
         method = QuantizedMoEGateMethod("W8A8_DYNAMIC")
@@ -132,7 +131,7 @@ class TestGateSchemes(unittest.TestCase):
             QuantizedMoEGateMethod("FP16")
 
     def test_create_weights_is_noop(self):
-        method = QuantizedMoEGateMethod("W8A8_MXFP8")
+        method = QuantizedMoEGateMethod("W8A8_DYNAMIC")
         self.assertIsNone(method.create_weights(object()))
 
 
@@ -273,7 +272,7 @@ class TestFusedNormABI(unittest.TestCase):
 
     def test_explicit_online_targets_override_all(self):
         self.assertEqual(
-            parse_online_quantization("all:w8a8_mxfp8,gate:w8a8_dynamic")["gate"],
+            parse_online_quantization("all:w4a4_dynamic,gate:w8a8_dynamic")["gate"],
             "W8A8_DYNAMIC",
         )
         with self.assertRaises(ValueError):
@@ -333,7 +332,7 @@ class TestOfflineRouterLoading(unittest.TestCase):
 
 
 class TestOnlineSharedFallback(unittest.TestCase):
-    def test_online_mxfp8_weight_buffers_do_not_use_offline_views(self):
+    def test_online_int8_weight_buffers_do_not_use_offline_views(self):
         from types import SimpleNamespace
 
         from sglang.srt.hardware_backend.npu.moe.norm_gate import OnlineLinearMethod
@@ -341,7 +340,7 @@ class TestOnlineSharedFallback(unittest.TestCase):
         from sglang.srt.layers.activation import SiluAndMul
 
         linear = SimpleNamespace(
-            quant_method=OnlineLinearMethod("W8A8_MXFP8", torch.bfloat16), bias=None
+            quant_method=OnlineLinearMethod("W8A8_DYNAMIC", torch.bfloat16), bias=None
         )
         mlp = SimpleNamespace(
             gate_up_proj=linear, down_proj=linear, act_fn=SiluAndMul()

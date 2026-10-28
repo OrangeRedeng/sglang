@@ -87,8 +87,9 @@ def _build_packed(dcp_size, **overrides):
     """A packed 8-bit SFA pool: flag on, bf16 compute, DCP > 1, 656 B row."""
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
-    with envs.SGLANG_NPU_SFA_KV_8BIT.override(True), get_parallel().override(
-        attn_dcp_size=dcp_size
+    with (
+        envs.SGLANG_NPU_SFA_KV_8BIT.override(True),
+        get_parallel().override(attn_dcp_size=dcp_size),
     ):
         return NPUMLATokenToKVPool(**_packed_kwargs(**overrides))
 
@@ -102,6 +103,12 @@ def _per_tile_int8_bound(ref: torch.Tensor) -> torch.Tensor:
 
 
 class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0, dcp_enabled=False)
+        )
+
     @classmethod
     def setUpClass(cls):
         import torch_npu  # noqa: F401
@@ -132,8 +139,14 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
         pool = _build_packed(DCP_SIZE)
         n = 32
         g = torch.Generator().manual_seed(0)
-        latent = torch.randn(n, 1, KV_LORA_RANK, generator=g).to(torch.bfloat16).to(DEVICE)
-        rope = torch.randn(n, 1, QK_ROPE_HEAD_DIM, generator=g).to(torch.bfloat16).to(DEVICE)
+        latent = (
+            torch.randn(n, 1, KV_LORA_RANK, generator=g).to(torch.bfloat16).to(DEVICE)
+        )
+        rope = (
+            torch.randn(n, 1, QK_ROPE_HEAD_DIM, generator=g)
+            .to(torch.bfloat16)
+            .to(DEVICE)
+        )
         loc = torch.arange(n, dtype=torch.int64, device=DEVICE)
 
         # DCP 1 during the round trip: no sharding, so each loc maps to itself.
@@ -142,7 +155,9 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
             key_nope, key_rope = pool.get_mla_kv_buffer(_FakeLayer(0), loc)
 
         # rope is a straight bf16 byte reinterpretation: exact, not approximate.
-        self.assertTrue(torch.equal(key_rope, rope), "the rope did not round-trip exactly")
+        self.assertTrue(
+            torch.equal(key_rope, rope), "the rope did not round-trip exactly"
+        )
         # int8 per-tile: absolute error bounded by the tile's dynamic range.
         err = (key_nope.float() - latent.float()).abs()
         bound = _per_tile_int8_bound(latent)
@@ -161,8 +176,14 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
         n = 64
         loc = torch.arange(first, first + n, dtype=torch.int64, device=DEVICE)
         g = torch.Generator().manual_seed(1)
-        latent = torch.randn(n, 1, KV_LORA_RANK, generator=g).to(torch.bfloat16).to(DEVICE)
-        rope = torch.randn(n, 1, QK_ROPE_HEAD_DIM, generator=g).to(torch.bfloat16).to(DEVICE)
+        latent = (
+            torch.randn(n, 1, KV_LORA_RANK, generator=g).to(torch.bfloat16).to(DEVICE)
+        )
+        rope = (
+            torch.randn(n, 1, QK_ROPE_HEAD_DIM, generator=g)
+            .to(torch.bfloat16)
+            .to(DEVICE)
+        )
 
         for rank in range(DCP_SIZE):
             pool = _build_packed(DCP_SIZE)
@@ -199,8 +220,9 @@ class TestNpuMlaSfaKvInt8RoundTrip(CustomTestCase):
         than serve rows it cannot decode."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
-        with envs.SGLANG_NPU_SFA_KV_8BIT.override(True), get_parallel().override(
-            attn_dcp_size=1
+        with (
+            envs.SGLANG_NPU_SFA_KV_8BIT.override(True),
+            get_parallel().override(attn_dcp_size=1),
         ):
             with self.assertRaises(ValueError):
                 NPUMLATokenToKVPool(**_packed_kwargs())

@@ -102,26 +102,22 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert to internal format. E1 (branch E): for chat workloads
-            # this call renders + encodes the full prompt synchronously
-            # (serving_chat._render_and_encode_chat_template, ~3.6 s per
-            # ~1M-token prompt), so 16 concurrent phase-2 requests serialize
-            # on the asyncio loop and the NPU idles ~2.2 s per request
-            # between forwards. Run it on the tokenizer manager's off-loop
-            # pool when engaged; None falls back to the default executor.
-            # Either way the conversion runs off the event loop: jinja render
-            # + full-prompt tokenization blocks the loop on long prompts, and
-            # the rust tokenizer releases the GIL.
+            # Keep synchronous conversion when the optional chat pool is off.
             chat_encode_pool = getattr(
                 self.tokenizer_manager, "chat_encode_executor", None
             )
-            loop = asyncio.get_running_loop()
-            adapted_request, processed_request = await loop.run_in_executor(
-                chat_encode_pool,
-                self._convert_to_internal_request,
-                request,
-                raw_request,
-            )
+            if chat_encode_pool is not None:
+                loop = asyncio.get_running_loop()
+                adapted_request, processed_request = await loop.run_in_executor(
+                    chat_encode_pool,
+                    self._convert_to_internal_request,
+                    request,
+                    raw_request,
+                )
+            else:
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
