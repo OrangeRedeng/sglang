@@ -139,6 +139,69 @@ class TestStreamingDenseLifecycle(CustomTestCase):
             loader.weight_loader(weight, torch.ones((4, 4), dtype=torch.bfloat16))
 
 
+class TestOnlineOperandReuse(CustomTestCase):
+    def test_fused_norm_operand_is_not_quantized_again(self):
+        from sglang.srt.hardware_backend.npu.moe.contracts import (
+            INT8,
+            QuantizedOperand,
+            unpack_operand,
+        )
+
+        tree = ast.parse(
+            (
+                ROOT
+                / "python/sglang/srt/hardware_backend/npu/quantization/linear_method_npu.py"
+            ).read_text()
+        )
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "_NPUOnlineIntegerLinearMethod"
+        )
+        method = next(
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "apply"
+        )
+        ns = dict(
+            torch=torch,
+            QuantizedOperand=QuantizedOperand,
+            unpack_operand=unpack_operand,
+            INT8=INT8,
+            Optional=__import__("typing").Optional,
+        )
+        exec(
+            compile(
+                ast.Module(body=[method], type_ignores=[]), "<online-apply>", "exec"
+            ),
+            ns,
+        )
+        q = torch.tensor([[1, 2], [3, 4]], dtype=torch.int8)
+        scale = torch.tensor([0.5, 0.25])
+        operand = QuantizedOperand(q, scale, INT8, (2, 2))
+        layer = SimpleNamespace(
+            weight=torch.eye(2, dtype=torch.int8), weight_scale=torch.ones(2)
+        )
+
+        def matmul(x, w, ws, **kwargs):
+            return ((x.float() @ w.float()) * kwargs["pertoken_scale"][:, None]).to(
+                kwargs["output_dtype"]
+            )
+
+        with (
+            patch.object(QuantizedOperand, "record_stream"),
+            patch.object(
+                torch.ops.npu, "npu_quant_matmul", side_effect=matmul, create=True
+            ),
+            patch.object(
+                torch.ops.npu,
+                "npu_dynamic_quant",
+                side_effect=AssertionError("quantized twice"),
+                create=True,
+            ),
+        ):
+            result = ns["apply"](SimpleNamespace(), layer, operand)
+        torch.testing.assert_close(result, (q.float() * scale[:, None]).bfloat16())
+
+
 class TestStreamingMoELifecycle(CustomTestCase):
     def test_independent_projections_nonlocal_experts_and_duplicates(self):
         from sglang.srt.hardware_backend.npu.quantization.online_quantization import (

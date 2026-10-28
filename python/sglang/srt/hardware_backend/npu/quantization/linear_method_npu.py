@@ -147,11 +147,16 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        input_shape = x.shape
-        original_dtype = x.dtype
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-            x.reshape(-1, x.shape[-1]), dst_type=self.spec.activation_dtype
-        )
+        if isinstance(x, (tuple, QuantizedOperand)):
+            quantized_x, dynamic_scale, original_dtype, input_shape = unpack_operand(
+                x, INT8
+            )
+        else:
+            input_shape = x.shape
+            original_dtype = x.dtype
+            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+                x.reshape(-1, x.shape[-1]), dst_type=self.spec.activation_dtype
+            )
         output = torch.ops.npu.npu_quant_matmul(
             quantized_x,
             layer.weight,

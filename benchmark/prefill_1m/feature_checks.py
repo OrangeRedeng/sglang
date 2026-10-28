@@ -172,6 +172,44 @@ def self_check_workloads():
             pass
         else:
             raise AssertionError("bad numerical parity accepted")
+    import importlib.util
+
+    runner_path = Path(__file__).with_name("test_glm53_features.py")
+    spec = importlib.util.spec_from_file_location(
+        "workload_validation_runner", runner_path
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    with TemporaryDirectory() as temp:
+        directory = Path(temp)
+        case = dict(
+            id="long-baseline",
+            stage="long",
+            scenario={"dcp": True},
+            command=[],
+            checkpoint_path=str(directory),
+        )
+        runner._REFERENCE_RESPONSES[json.dumps({"dcp": True}, sort_keys=True)] = (
+            reference
+        )
+
+        def serve(args, case, path, env):
+            (path / "responses.json").write_text(json.dumps(reference))
+            return dict(status="smoke_pass", benchmarks=[{"status": "pass"}])
+
+        with patch.object(runner, "serve", side_effect=serve):
+            result = runner.validate_serving(SimpleNamespace(), case, directory, {}, {})
+        assert result["status"] == "pass" and result["benchmarks"]
+        from feature_benchmarks import CapacityBlocked
+
+        def no_capacity(args, case, path, env):
+            if case["stage"] == "long":
+                raise CapacityBlocked("KV capacity unavailable")
+            return serve(args, case, path, env)
+
+        with patch.object(runner, "serve", side_effect=no_capacity):
+            result = runner.validate_serving(SimpleNamespace(), case, directory, {}, {})
+        assert result["status"] == "capacity_blocked"
     print(
         "PASS: long cache regimes, flush/prime lifecycle, exact token lengths, benchmark commands and parity failure"
     )

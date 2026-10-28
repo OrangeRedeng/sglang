@@ -744,7 +744,9 @@ def validate_serving(args, case, directory, case_env, base_env):
     responses = json.loads((directory / "responses.json").read_text())
     result["parity"] = compare_responses(_REFERENCE_RESPONSES[reference_key], responses)
     result["quality"] = "verified"
-    if result["status"] != "inactive" and (scenario.get("expected") or not scenario):
+    if result["status"] != "inactive" and (
+        scenario.get("expected") or not scenario or case["id"].endswith("-baseline")
+    ):
         result["status"] = "pass"
     if case["stage"] in ("small", "long"):
         if result["status"] != "pass":
@@ -752,7 +754,13 @@ def validate_serving(args, case, directory, case_env, base_env):
         measured = directory / "measured"
         measured.mkdir()
         measured_env = dict(case_env, SGLANG_NPU_FEATURE_EVIDENCE="False")
-        timed = serve(args, case, measured, measured_env)
+        from feature_benchmarks import CapacityBlocked
+
+        try:
+            timed = serve(args, case, measured, measured_env)
+        except CapacityBlocked as exc:
+            timed = dict(status="capacity_blocked", reason=str(exc))
+            result["reason"] = str(exc)
         result["benchmarks"] = timed.get("benchmarks", [])
         if timed["status"] == "capacity_blocked":
             result["status"] = "capacity_blocked"
