@@ -70,7 +70,7 @@ point).
 Run from the repository root with the same Python environment used for serving:
 
 ```bash
-# Host checks: syntax, benchmark regression checks, decoder forwarding, TP import consistency, 1M dry-run.
+# Host checks: syntax, benchmark regressions, decoder forwarding, imports, pytest commands, 1M dry-run.
 python3 benchmark/prefill_1m/test_glm53_features.py
 
 # Inspect the full matrix without loading weights or initializing devices.
@@ -98,6 +98,11 @@ pytest dependencies beforehand. Each serving case reloads the model, so the
 full matrix is expensive. Use an idle A3 host; TP must fit the visible NPU
 count and DCP must divide TP. Serving smoke uses 8K context by default;
 the optional 1M benchmark needs a much larger KV budget.
+
+Replace `/path/to/GLM-5.3-BF16` with an existing checkpoint directory on the
+A3 machine. Alternatively, export `MODEL_PATH` to that directory and omit
+`--model-path`. A missing or example path leaves serving cases blocked;
+unit/operator suites can still run independently.
 
 | Coverage | Automated checks |
 |---|---|

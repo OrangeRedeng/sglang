@@ -601,6 +601,17 @@ def plan(args):
     ]
     cases.append(
         {
+            "id": "host-suite-commands",
+            "stage": "host",
+            "command": [
+                PYTHON,
+                str(Path(__file__).resolve()),
+                "--self-check-suite-commands",
+            ],
+        }
+    )
+    cases.append(
+        {
             "id": "host-fusion-imports",
             "stage": "host",
             "command": [PYTHON, str(Path(__file__).resolve()), "--self-check-imports"],
@@ -628,7 +639,6 @@ def plan(args):
                         PYTHON,
                         "-m",
                         "pytest",
-                        "pytest-asyncio",
                         "-q",
                         "-ra",
                         "-p",
@@ -658,6 +668,54 @@ def plan(args):
     ]
 
 
+def suite_command_self_check():
+    """Verify generated pytest commands actually collect their selected file."""
+    args = SimpleNamespace(
+        stage="all",
+        cases="*",
+        model_path=None,
+        tp=8,
+        dcp=2,
+        port=31000,
+        context_length=8192,
+        chunk=4096,
+        mem_fraction=0.85,
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        sentinel = directory / "collected"
+        probe = directory / "test_selection_probe.py"
+        probe.write_text(f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n")
+        for case in plan(args):
+            if not case.get("junit"):
+                continue
+            selections = [
+                value
+                for value in case["command"]
+                if value.startswith("test/registered/")
+            ]
+            assert selections and all(
+                (ROOT / value).is_file() for value in selections
+            ), case["id"]
+            command = [value for value in case["command"] if value not in selections]
+            command += ["--collect-only", "-c", os.devnull, str(probe)]
+            sentinel.unlink(missing_ok=True)
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"),
+            )
+            # Exit 5 is expected: the probe module is collected but defines no tests.
+            if completed.returncode != 5 or not sentinel.exists():
+                raise AssertionError(
+                    f"{case['id']}: invalid pytest command\n{completed.stdout}\n{completed.stderr}"
+                )
+    print("PASS: all unit/NPU suite commands collect their intended selection")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -678,7 +736,15 @@ def main():
         "--self-check-imports", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument("--probe-npu", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--model-path", type=Path)
+    parser.add_argument(
+        "--self-check-suite-commands", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=os.environ.get("MODEL_PATH"),
+        help="Local BF16 checkpoint directory (or set MODEL_PATH).",
+    )
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--dcp", type=int, default=2)
     parser.add_argument("--port", type=int, default=31000)
@@ -711,6 +777,9 @@ def main():
         return 0
     if args.self_check_imports:
         fusion_import_self_check()
+        return 0
+    if args.self_check_suite_commands:
+        suite_command_self_check()
         return 0
     if args.probe_npu:
         import torch
@@ -863,7 +932,7 @@ def main():
                 ):
                     result.update(
                         status="blocked",
-                        reason="provide a local BF16 GLM-5.3 checkpoint with --model-path",
+                        reason=f"checkpoint directory does not exist: {args.model_path!s}; set --model-path or MODEL_PATH to the real local BF16 checkpoint",
                     )
                 elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
                     result.update(
