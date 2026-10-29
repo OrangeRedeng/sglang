@@ -2581,6 +2581,55 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def _forward_mtp_bsnd(
+        self, query, k_cache, v_cache, block_table, query_ends, kv_lens, layer, sinks
+    ):
+        output = query.new_empty(
+            (query.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        )
+        start = 0
+        for seq_idx, end in enumerate(query_ends):
+            end = int(end)
+            q_len = end - start
+            if q_len == 0:
+                continue
+            kv_len = int(kv_lens[seq_idx])
+            mask, sparse_mode = self.ascend_attn_mask_builder.get_paged_prefill_mask(
+                q_len, kv_len, block_table.shape[1] * self.page_size
+            )
+            if layer.sliding_window_size != -1 and sparse_mode == 0:
+                positions = torch.arange(kv_len - q_len, kv_len, device=query.device)
+                keys = torch.arange(mask.shape[-1], device=query.device)
+                mask = mask | (
+                    keys[None, None, :]
+                    < positions[None, :, None] - layer.sliding_window_size
+                )
+            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query[None, start:end],
+                k_cache,
+                v_cache,
+                block_table=block_table[seq_idx : seq_idx + 1],
+                block_size=self.page_size,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=mask,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=[q_len],
+                actual_seq_kvlen=[kv_len],
+                sparse_mode=sparse_mode,
+                pre_tokens=(
+                    layer.sliding_window_size
+                    if layer.sliding_window_size != -1
+                    else FULL_ATTENTION_WINDOW
+                ),
+                next_tokens=0,
+                learnable_sink=sinks,
+            )
+            output[start:end] = result.squeeze(0)
+            start = end
+        return output
+
     def forward_mtp(
         self,
         q,
@@ -2688,28 +2737,40 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode = 4 if is_swa_layer else 3
 
             if self.is_hybrid_swa:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                    query,
-                    k_cache,
-                    v_cache,
-                    block_table=block_table,
-                    block_size=self.page_size,
-                    num_query_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
-                    atten_mask=mask,
-                    softmax_scale=layer.scaling,
-                    actual_seq_qlen=actual_seq_lengths,
-                    actual_seq_kvlen=actual_seq_lengths_kv,
-                    sparse_mode=sparse_mode,
-                    pre_tokens=(
-                        layer.sliding_window_size
-                        if is_swa_layer
-                        else FULL_ATTENTION_WINDOW
-                    ),
-                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
-                    learnable_sink=sinks,
-                )
+                if not self._can_use_tnd(layer):
+                    attn_output = self._forward_mtp_bsnd(
+                        query,
+                        k_cache,
+                        v_cache,
+                        block_table,
+                        actual_seq_lengths,
+                        actual_seq_lengths_kv,
+                        layer,
+                        sinks,
+                    )
+                else:
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        query,
+                        k_cache,
+                        v_cache,
+                        block_table=block_table,
+                        block_size=self.page_size,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        atten_mask=mask,
+                        softmax_scale=layer.scaling,
+                        actual_seq_qlen=actual_seq_lengths,
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                        sparse_mode=sparse_mode,
+                        pre_tokens=(
+                            layer.sliding_window_size
+                            if is_swa_layer
+                            else FULL_ATTENTION_WINDOW
+                        ),
+                        next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                        learnable_sink=sinks,
+                    )
             else:
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     query,

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -233,6 +234,75 @@ class TestFiaLengthMetadata(unittest.TestCase):
                     else:
                         self.assertGreater(mode.count, 0)
                     torch.testing.assert_close(result, q)
+
+
+class TestMTPAttentionLayout(unittest.TestCase):
+    def test_verify_512_uses_bsnd_with_per_request_prefix_masks(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.graph_mode = False
+        backend.is_hybrid_swa = True
+        backend.page_size = 128
+        backend.speculative_num_draft_tokens = 4
+        builder = object.__new__(AscendAttnMaskBuilder)
+        builder.device = "cpu"
+        builder.fia_mask = builder.generate_mask_flag(2048)
+        builder.paged_fia_mask = None
+        backend.ascend_attn_mask_builder = builder
+        backend.mtp_mask = builder.fia_mask
+        blocks = torch.arange(46, dtype=torch.int32).reshape(2, 23)
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_cpu_int=torch.tensor([2933, 9]),
+            extend_seq_lens_cpu_int=None,
+            block_tables=blocks,
+        )
+        cache = torch.zeros(46, 128, 512)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=AttentionType.DECODER,
+            sliding_window_size=-1,
+            qk_head_dim=512,
+            v_head_dim=512,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            scaling=512**-0.5,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            global_num_token_non_padded_cpu=8,
+        )
+        calls = []
+
+        def fia(query, key, value, **kwargs):
+            index = len(calls)
+            calls.append(kwargs)
+            self.assertEqual(kwargs["input_layout"], "BSND")
+            self.assertEqual(tuple(query.shape), (1, 4, 1, 512))
+            self.assertEqual(kwargs["actual_seq_qlen"], [4])
+            kv_len = (2933, 9)[index]
+            self.assertEqual(kwargs["actual_seq_kvlen"], [kv_len])
+            torch.testing.assert_close(kwargs["block_table"], blocks[index : index + 1])
+            mask = kwargs["atten_mask"]
+            self.assertEqual(kwargs["sparse_mode"], 0)
+            self.assertGreaterEqual(mask.shape[-1], 23 * 128)
+            self.assertFalse(mask[0, 0, kv_len - 4].item())
+            self.assertTrue(mask[0, 0, kv_len - 3].item())
+            self.assertFalse(mask[0, -1, kv_len - 1].item())
+            return query.clone(), None
+
+        query = torch.randn(8, 512)
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "torch_npu.npu_fused_infer_attention_score_v2",
+            side_effect=fia,
+        ):
+            result = backend.forward_mtp(query, None, None, layer, batch, False)
+        self.assertEqual(len(calls), 2)
+        torch.testing.assert_close(result, query)
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
