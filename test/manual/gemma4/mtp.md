@@ -21,7 +21,7 @@ Keep the assistant's original BF16 weights and the target's existing precision.
 Stop the previous server first. Start with top-k 1 and all graphs disabled:
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=2,3 \
+ASCEND_RT_VISIBLE_DEVICES=2 \
 TASK_QUEUE_ENABLE=1 \
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
 ASCEND_USE_FIA=1 \
@@ -35,7 +35,7 @@ python3 -m sglang.launch_server \
   --speculative-num-draft-tokens 4 \
   --host 0.0.0.0 --port 30014 \
   --device npu --attention-backend ascend \
-  --tp-size 1 --dp-size 2 \
+  --tp-size 1 \
   --dtype bfloat16 --context-length 8192 \
   --max-running-requests 29 \
   --max-prefill-tokens 8192 --chunked-prefill-size 8192 \
@@ -63,7 +63,9 @@ Reference: [Google Gemma MTP documentation](https://ai.google.dev/gemma/docs/mtp
 ## NPU graph trial
 
 After eager MTP correctness passes, stop the server and compare these profiles
-on the same source/runtime. Both use memory0.82, disable overlap and delaying,
+on the same source/runtime. The helpers default to one NPU2, TP1, without DP; set `GEMMA_DEVICES=3`
+to select NPU3, or `GEMMA_DEVICES=2,3` to restore the two-replica test.
+Both use memory0.82, disable overlap and delaying,
 and keep prefill eager. They retain the supplied full-decode buckets. The MTP
 profile captures target verification and the assistant's recurrent draft loop.
 The non-MTP graph control captures ordinary decode. This does not enable or
@@ -101,7 +103,7 @@ python3 test/manual/gemma4/quality_check.py compare \
 
 Use fresh filenames. Also exercise concurrent mixed lengths, cached prefixes
 beyond the SWA window, changing request-slot assignments, and partial graph
-buckets. Verify both replicas and inspect a bounded trace for actual target
+buckets. Verify every active replica and inspect a bounded trace for actual target
 verify and draft-loop graph replay; startup capture alone does not establish
 that serving uses graphs. Only then run three unprofiled benchmark repetitions.
 If capture fails, retain the full traceback and return to `mtp`; do not assume

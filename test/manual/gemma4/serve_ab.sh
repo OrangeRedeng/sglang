@@ -13,6 +13,9 @@ root=${GEMMA_ROOT:-$(cd -- "$script_dir/../../.." && pwd)}
 server_root=$root
 model=${GEMMA_MODEL:-/home/test1/models/gemma4-26B-A4B-w8a8}
 python=${GEMMA_PYTHON:-python3}
+devices=${GEMMA_DEVICES:-2}
+IFS=',' read -r -a device_ids <<< "$devices"
+dp_size=${#device_ids[@]}
 norm=${SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM:-1}
 ratio=0.5
 delay=50
@@ -52,7 +55,7 @@ case "$profile" in
     *) echo "Unknown profile: $profile" >&2; exit 2 ;;
 esac
 
-export ASCEND_RT_VISIBLE_DEVICES=2,3
+export ASCEND_RT_VISIBLE_DEVICES="$devices"
 export TASK_QUEUE_ENABLE=1
 export ASCEND_USE_FIA=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -71,18 +74,22 @@ fi
 cmd=("$python" -m sglang.launch_server
     --model-path "$model" --served-model-name gemma4-w8a8-test
     --host 0.0.0.0 --port 30014 --device npu --attention-backend ascend
-    --tp-size 1 --dp-size 2 --context-length 8192 --max-running-requests 64
+    --tp-size 1 --context-length 8192 --max-running-requests 64
     --max-prefill-tokens 8192 --chunked-prefill-size 8192 --mem-fraction-static "$memory"
     --cuda-graph-config "{\"prefill\":$prefill,\"decode\":$decode}"
     --prefill-max-requests "$cap" --prefill-delayer-queue-min-ratio "$ratio"
     --prefill-delayer-max-delay-ms "$delay" --prefill-delayer-max-delay-passes 4
     --trust-remote-code)
+if (( dp_size > 1 )); then
+    cmd+=(--dp-size "$dp_size")
+fi
 if [[ "$delayer" == 1 ]]; then
     cmd+=(--enable-prefill-delayer)
 fi
 cmd+=("${extra[@]}")
 
 printf 'Profile=%s source=%q\n' "$profile" "$server_root"
+printf 'ASCEND_RT_VISIBLE_DEVICES=%s TP_SIZE=1 DP_SIZE=%s\n' "$devices" "$dp_size"
 printf 'TASK_QUEUE_ENABLE=1 QKV_NORM=%s\n' "$norm"
 printf 'FIA_METADATA_REUSE=%s FIA_KV_VIEW_REUSE=%s\n' \
     "${SGLANG_ENABLE_NPU_FIA_METADATA_REUSE:-0}" "${SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE:-0}"

@@ -392,6 +392,102 @@ class TestMTPAttentionLayout(unittest.TestCase):
         torch.testing.assert_close(result, query)
 
 
+class TestVerifyGraphMetadata(CustomTestCase):
+    def make_backend(self, hybrid):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.page_size = 16
+        backend.max_context_len = 512
+        backend.speculative_num_draft_tokens = 4
+        backend.is_frozen_kv_mtp = True
+        backend.is_draft_worker = False
+        backend.is_hybrid_swa = hybrid
+        backend.use_sliding_window_kv_pool = False
+        backend.enable_sparsity_driven_kv_offload = False
+        backend.q_head_num_padding = None
+        backend.reuse_fia_metadata = False
+        backend.req_to_token = torch.arange(4 * 512).reshape(4, 512)
+        backend.full_to_swa_index_mapping = torch.arange(4 * 512)
+        backend.sliding_window_size = 128
+        backend.init_cuda_graph_state(2, 8)
+        return backend
+
+    def test_verify_capture_and_replay_do_not_enter_prefill_or_mutate_prefix(self):
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        ):
+            for hybrid in (False, True):
+                with self.subTest(hybrid=hybrid):
+                    backend = self.make_backend(hybrid)
+                    prefix = torch.zeros(2, dtype=torch.int32)
+                    batch = SimpleNamespace(
+                        batch_size=2,
+                        forward_mode=ForwardMode.TARGET_VERIFY,
+                        req_pool_indices=torch.tensor([1, 2]),
+                        seq_lens=prefix,
+                        seq_lens_cpu=prefix.clone(),
+                        out_cache_loc=None,
+                        spec_info=None,
+                    )
+                    backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                    metadata = backend.forward_metadata
+                    self.assertIs(metadata, backend.graph_metadata[2])
+                    self.assertFalse(hasattr(backend, "prefill_graph_state"))
+                    self.assertFalse(hasattr(metadata, "extend_seq_lens"))
+                    self.assertEqual(metadata.actual_seq_lengths_q.tolist(), [4, 8])
+                    self.assertEqual(metadata.seq_lens_cpu_list, [4, 4])
+                    torch.testing.assert_close(prefix, torch.zeros_like(prefix))
+                    for lengths in ([35, 280], [290, 15]):
+                        prefix.copy_(torch.tensor(lengths))
+                        batch.seq_lens_cpu.copy_(prefix)
+                        backend.init_forward_metadata_out_graph(batch)
+                        self.assertIs(backend.forward_metadata, metadata)
+                        self.assertEqual(prefix.tolist(), lengths)
+                        self.assertEqual(
+                            metadata.seq_lens.tolist(),
+                            [length + 4 for length in lengths],
+                        )
+                        pages = (max(lengths) + 4 + 15) // 16
+                        expected = (
+                            backend.req_to_token[[1, 2], : max(lengths) + 4 : 16] // 16
+                        ).to(torch.int32)
+                        torch.testing.assert_close(
+                            metadata.block_tables[:, :pages], expected
+                        )
+                        if hybrid:
+                            torch.testing.assert_close(
+                                metadata.block_tables_swa[:, :pages], expected
+                            )
+                    self.assertFalse(hasattr(backend, "_npu_prefill_graph_update"))
+
+    def test_ordinary_prefill_still_refreshes_extend_lengths(self):
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        ):
+            backend = self.make_backend(False)
+            batch = SimpleNamespace(
+                batch_size=2,
+                forward_mode=ForwardMode.EXTEND,
+                req_pool_indices=torch.tensor([1, 2]),
+                seq_lens=torch.tensor([3, 4]),
+                seq_lens_cpu=torch.tensor([3, 4]),
+                out_cache_loc=None,
+                spec_info=None,
+                extend_seq_lens_cpu=[2, 0],
+            )
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+            metadata = backend.forward_metadata
+            self.assertIs(metadata, backend.prefill_graph_state["metadata"][2])
+            self.assertEqual(metadata.extend_seq_lens[:2].tolist(), [2, 0])
+            self.assertEqual(metadata.seq_lens_list_cumsum, [2, 2])
+            self.assertEqual(
+                backend._npu_prefill_graph_update,
+                [{"actual_seq_qlen": [2, 2]}, {"actual_seq_kvlen": [3, 4]}],
+            )
+
+
 class TestExpandDsaSparseIndices(unittest.TestCase):
     def test_2d_input_adds_unsqueeze(self):
         """A [T, K] tensor becomes [T, 1, K]."""

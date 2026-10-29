@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
 
+def _is_prefill_graph_mode(forward_mode: ForwardMode) -> bool:
+    # is_extend() also includes target verification, which owns decode graph state.
+    return forward_mode.is_extend() and not forward_mode.is_target_verify()
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -575,7 +580,7 @@ class AscendAttnBackend(AttentionBackend):
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             extend_seq_lens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
         )
-        if forward_batch.forward_mode.is_extend():
+        if _is_prefill_graph_mode(forward_batch.forward_mode):
             # The captured extend kernels read this metadata object; replay
             # refreshes its contents in place before each NPUGraph replay.
             self.forward_metadata = self.prefill_graph_state["metadata"][bs]
@@ -924,7 +929,7 @@ class AscendAttnBackend(AttentionBackend):
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
-        if forward_mode.is_extend():
+        if _is_prefill_graph_mode(forward_mode):
             # Prefill body capture: the graph reads extend lengths from a
             # stable device buffer; host-side cumsum/kv-len lists are rebound
             # at replay via NPUGraph.update (see _apply_cuda_graph_metadata).
@@ -974,7 +979,14 @@ class AscendAttnBackend(AttentionBackend):
                 length + self.speculative_num_draft_tokens
                 for length in metadata.seq_lens_cpu_list
             ]
-        metadata.seq_lens = seq_lens
+        # Verify attention lengths include draft tokens; keep them separate from
+        # the committed-prefix input buffer used by positions and graph replay.
+        metadata.seq_lens = (
+            seq_lens.clone()
+            if forward_mode.is_target_verify()
+            and getattr(self, "is_frozen_kv_mtp", False)
+            else seq_lens
+        )
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -1046,7 +1058,7 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         prefill_state = None
-        if forward_mode.is_extend():
+        if _is_prefill_graph_mode(forward_mode):
             prefill_state = self._ensure_prefill_graph_state(bs)
             metadata = prefill_state["metadata"][bs]
         else:
@@ -1055,7 +1067,7 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            if forward_mode.is_extend():
+            if _is_prefill_graph_mode(forward_mode):
                 # Prefill owns a separate stable token buffer (allocated at
                 # first _apply, i.e. the largest bucket during reversed-order
                 # capture); decode's cuda_graph_swa_out_cache_loc does not
@@ -1136,7 +1148,7 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
 
-        if forward_mode.is_extend():
+        if _is_prefill_graph_mode(forward_mode):
             # Prefill replay/capture refresh: extend lengths go through the
             # stable device buffer; the FIA TND kernel additionally consumes
             # two host-side lists (actual_seq_qlen cumsum and

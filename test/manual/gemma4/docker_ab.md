@@ -1,6 +1,9 @@
 # Three launch tests: SGLang and a separate vLLM container
 
-Run each server separately and stop it before starting the next. Use host
+Run each server separately and stop it before starting the next.
+The helper now defaults to one NPU (`GEMMA_DEVICES=2`), TP1, with no DP flag.
+Use `GEMMA_DEVICES=3` to select another card; `GEMMA_DEVICES=2,3` restores TP1/DP2.
+Keep device count identical between comparisons. Use host
 networking for both containers with URL `http://127.0.0.1:30014`. With a shared
 bridge network, set `GEMMA_BENCH_URL=http://<sglang-container-name>:30014` in the
 benchmark container. Mount the tokenizer and `bench_ab.sh` there.
@@ -27,7 +30,7 @@ Keep the same QKV/FIA switches for the matched MTP comparison.
 All three use serial QKV. Experimental tiled QKV and RoPE/KV paths were removed
 after target-NPU launch crashes. No tiled validation report or row flag is needed.
 
-Test1 keeps NPUs2/3, TP1/DP2, queue1, FIA, context8192, max-running64, token
+Test1 keeps queue1, FIA, context8192, max-running64, token
 budgets8192, memory0.92, supplied graph buckets, and delayer0.5/50ms/4/cap6.
 Tests2/3 both disable graphs, overlap and the prefill delayer and use memory0.82.
 The delayer requires overlap scheduling. Compare2 against3

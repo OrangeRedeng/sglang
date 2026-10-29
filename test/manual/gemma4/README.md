@@ -12,6 +12,10 @@ tiled QKV and RoPE/KV fusion were removed after target-NPU launch crashes.
 
 Use the [three-launch Docker plan](docker_ab.md):
 
+The helper currently defaults to one NPU2, TP1, without DP for debugging.
+Set `GEMMA_DEVICES=2,3` for two TP1 replicas. The full scenario matrix below
+retains its two-NPU target and configuration.
+
 | Order | Profile | Comparison |
 | --- | --- | --- |
 | 1 | `metadata` | Reference, serial QKV, existing graphs and delayer |
