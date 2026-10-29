@@ -37,8 +37,45 @@ def test_draft_rebinds_unchanged_prefix_for_seed_and_each_recurrent_step():
         runner.backend.replay_with_input_update.assert_called_with(
             ShapeKey(size=4),
             seq_lens=None,
-            cpu_update_input=[{"actual_seq_kvlen": lengths + [0, 0]}] * 3,
+            cpu_update_input=[{"actual_seq_kvlen": lengths + [0, 0]}],
         )
+
+
+@pytest.mark.parametrize("operator_count", [4, 12, 24])
+def test_probe_and_replay_update_every_captured_operator(operator_count):
+    runner = draft_runner()
+    key = ShapeKey(size=4)
+    records = [None] * operator_count
+
+    def update(*, cpu_update_input):
+        # torch_npu accepts a broadcast entry or exactly one per captured op.
+        if len(cpu_update_input) not in (1, operator_count):
+            raise RuntimeError("Update count must match recorded operators")
+        entries = (
+            cpu_update_input * operator_count
+            if len(cpu_update_input) == 1
+            else cpu_update_input
+        )
+        records[:] = [list(entry["actual_seq_kvlen"]) for entry in entries]
+
+    graph = SimpleNamespace(update=update)
+
+    def replay(shape_key, *, seq_lens, cpu_update_input):
+        assert shape_key == key
+        assert seq_lens is None
+        graph.update(cpu_update_input=cpu_update_input)
+        return "replayed"
+
+    runner.backend = SimpleNamespace(
+        _graphs={key: graph}, replay_with_input_update=replay
+    )
+    runner._probe_graph_updates()
+    assert key in runner._updatable_graphs
+    assert records == [[0, 0, 0, 0]] * operator_count
+    for lengths in ([7, 1030], [2929, 19]):
+        batch = SimpleNamespace(seq_lens_cpu=torch.tensor(lengths + [0, 0]))
+        assert runner._replay_graph(key, batch) == "replayed"
+        assert records == [lengths + [0, 0]] * operator_count
 
 
 def test_recordless_draft_bucket_falls_back_to_eager():
@@ -58,6 +95,17 @@ def test_recordless_draft_bucket_falls_back_to_eager():
             SimpleNamespace(batch_size=3, seq_lens_cpu=torch.tensor([8, 9, 10]))
         )
         assert not runner.can_run_graph(SimpleNamespace(seq_lens_cpu=None))
+
+
+def test_empty_dispatch_records_are_rejected_even_when_broadcast_update_is_a_noop():
+    runner = draft_runner()
+    graph = SimpleNamespace(
+        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]), update=Mock()
+    )
+    runner.backend._graphs = {ShapeKey(size=2): graph}
+    runner._probe_graph_updates()
+    assert not runner._updatable_graphs
+    graph.update.assert_not_called()
 
 
 def test_unexpected_update_failure_is_not_hidden():

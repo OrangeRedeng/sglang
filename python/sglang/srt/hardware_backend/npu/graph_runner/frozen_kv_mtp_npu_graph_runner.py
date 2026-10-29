@@ -31,6 +31,14 @@ class FrozenKVMTPNpuGraphRunner(FrozenKVMTPCudaGraphRunner):
     def _probe_graph_updates(self):
         self._updatable_graphs = set()
         for key, graph in self.backend._graphs.items():
+            dispatch = getattr(graph, "graph_dispatch_mode", None)
+            records = getattr(dispatch, "graph_dispatch_records", None)
+            if isinstance(records, list) and not records:
+                logger.warning(
+                    "Frozen-KV draft bucket %s has no FIA update records; using eager.",
+                    key.size,
+                )
+                continue
             try:
                 graph.update(cpu_update_input=self._length_updates([0] * key.size))
             except RuntimeError as error:
@@ -44,11 +52,9 @@ class FrozenKVMTPNpuGraphRunner(FrozenKVMTPCudaGraphRunner):
                 self._updatable_graphs.add(key)
 
     def _length_updates(self, lengths):
-        # Seed and recurrent forwards read the same committed target prefix.
-        return [
-            {"actual_seq_kvlen": list(lengths)}
-            for _ in range(self.speculative_num_steps)
-        ]
+        # One entry broadcasts to every recorded operator, including all layers
+        # in the seed and recurrent forwards that share the committed prefix.
+        return [{"actual_seq_kvlen": list(lengths)}]
 
     def can_run_graph(self, forward_batch):
         if forward_batch.seq_lens_cpu is None or not super().can_run_graph(
