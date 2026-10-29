@@ -147,6 +147,7 @@ class AscendAttnMaskBuilder:
         # Initialize FIA mask
         fia_mask_len = 2048
         self.fia_mask = self.generate_mask_flag(fia_mask_len).to(self.device)
+        self.paged_fia_mask = None
 
         # Initialize MTP mask
         mtp_mask_len = 2048
@@ -176,6 +177,17 @@ class AscendAttnMaskBuilder:
         # Create upper triangle matrix used to mark mask positions.
         mask_flag = ~mask_flag
         return mask_flag
+
+    def get_paged_prefill_mask(self, q_len: int, kv_len: int, kv_capacity: int):
+        if max(q_len, kv_capacity) <= self.fia_mask.shape[-1]:
+            return self.fia_mask.unsqueeze(0), 3
+
+        # BSND paged FIA may require a full mask covering every block-table column.
+        if self.paged_fia_mask is None or self.paged_fia_mask.shape[-1] < kv_capacity:
+            self.paged_fia_mask = self.generate_mask_flag(kv_capacity).to(self.device)
+        # Align query rows with their absolute positions after the cached prefix.
+        mask = self.paged_fia_mask[kv_len - q_len : kv_len]
+        return mask.unsqueeze(0), 0
 
     @staticmethod
     def generate_attn_mask(max_seq_len, mode, dtype=torch.float16):
@@ -1972,6 +1984,14 @@ class AscendAttnBackend(AttentionBackend):
                         if q_len == 0:
                             continue
                         total_kv_len = seq_lens_cpu[seq_idx]
+                        atten_mask, sparse_mode = (
+                            self.ascend_attn_mask_builder.get_paged_prefill_mask(
+                                q_len,
+                                total_kv_len,
+                                self.forward_metadata.block_tables.shape[1]
+                                * self.page_size,
+                            )
+                        )
                         result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                             query=q[None, q_len_offset : q_len_offset + q_len],
                             key=k_cache.view(
@@ -1993,8 +2013,10 @@ class AscendAttnBackend(AttentionBackend):
                             block_size=self.page_size,
                             actual_seq_qlen=[q_len],
                             actual_seq_kvlen=[total_kv_len],
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3,
+                            atten_mask=atten_mask,
+                            sparse_mode=sparse_mode,
+                            pre_tokens=FULL_ATTENTION_WINDOW,
+                            next_tokens=FULL_ATTENTION_WINDOW,
                             softmax_scale=layer.scaling,
                         )
                         attn_output[q_len_offset : q_len_offset + q_len] = result[0]

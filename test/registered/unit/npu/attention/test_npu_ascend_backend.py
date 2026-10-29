@@ -4,7 +4,8 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -142,6 +143,98 @@ class TestGenerateMaskFlag(unittest.TestCase):
             for j in range(i + 1, n):
                 self.assertTrue(mask[i, j].item())
                 self.assertFalse(mask[j, i].item())
+
+
+class TestPagedPrefillMask(unittest.TestCase):
+    def setUp(self):
+        self.builder = object.__new__(AscendAttnMaskBuilder)
+        self.builder.device = "cpu"
+        self.builder.fia_mask = AscendAttnMaskBuilder.generate_mask_flag(2048)
+        self.builder.paged_fia_mask = None
+
+    def test_short_sequences_keep_compressed_mask(self):
+        mask, sparse_mode = self.builder.get_paged_prefill_mask(1200, 2000, 2048)
+        self.assertEqual(sparse_mode, 3)
+        self.assertEqual(mask.data_ptr(), self.builder.fia_mask.data_ptr())
+        self.assertIsNone(self.builder.paged_fia_mask)
+
+    def test_long_paged_masks_preserve_absolute_causality(self):
+        for q_len, kv_len, kv_capacity in (
+            (1200, 2929, 23 * 128),
+            (3500, 3500, 28 * 128),
+            (1200, 1200, 32 * 128),
+        ):
+            with self.subTest(q_len=q_len, kv_len=kv_len, capacity=kv_capacity):
+                mask, sparse_mode = self.builder.get_paged_prefill_mask(
+                    q_len, kv_len, kv_capacity
+                )
+                self.assertEqual(sparse_mode, 0)
+                self.assertGreaterEqual(mask.shape[-1], kv_capacity)
+                self.assertEqual(mask.shape[:2], (1, q_len))
+                self.assertTrue(mask.is_contiguous())
+                positions = torch.arange(kv_len - q_len, kv_len)
+                keys = torch.arange(mask.shape[-1])
+                torch.testing.assert_close(mask[0], keys[None, :] > positions[:, None])
+
+    def test_reuses_full_mask_storage_for_prefix_changes(self):
+        first, _ = self.builder.get_paged_prefill_mask(1200, 2929, 2944)
+        second, _ = self.builder.get_paged_prefill_mask(1200, 2800, 2816)
+        self.assertEqual(
+            first.untyped_storage().data_ptr(), second.untyped_storage().data_ptr()
+        )
+
+    def test_bsnd_forward_covers_long_paged_kv(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.use_fia = True
+        backend.is_dllm_model = False
+        backend.is_hybrid_swa = False
+        backend.attn_cp_size = 1
+        backend.page_size = 128
+        backend.ascend_attn_mask_builder = self.builder
+        backend.fia_mask = self.builder.fia_mask
+        backend.forward_metadata = SimpleNamespace(
+            block_tables=torch.arange(23, dtype=torch.int32).reshape(1, -1)
+        )
+        cache = torch.zeros(23, 128, 512)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            qk_head_dim=512,
+            v_head_dim=512,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            scaling=512**-0.5,
+        )
+        batch = SimpleNamespace(
+            forward_mode=MagicMock(),
+            seq_lens_cpu=torch.tensor([2929]),
+            extend_seq_lens_cpu=[1200],
+        )
+        batch.forward_mode.is_target_verify.return_value = False
+        batch.forward_mode.is_draft_extend_v2.return_value = False
+        batch.forward_mode.is_context_parallel_extend.return_value = False
+
+        def fia(**kwargs):
+            mask = kwargs["atten_mask"]
+            capacity = kwargs["block_table"].shape[1] * kwargs["block_size"]
+            self.assertGreaterEqual(mask.shape[-1], capacity)
+            self.assertEqual(kwargs["sparse_mode"], 0)
+            self.assertFalse(mask[0, 0, 1729].item())
+            self.assertTrue(mask[0, 0, 1730].item())
+            return kwargs["query"].clone(), None
+
+        q = torch.randn(1200, 512)
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "torch_npu.npu_fused_infer_attention_score_v2",
+            side_effect=fia,
+        ):
+            output = backend.forward_extend(q, None, None, layer, batch, False)
+        torch.testing.assert_close(output, q)
 
 
 class TestGenerateAttnMask(unittest.TestCase):
