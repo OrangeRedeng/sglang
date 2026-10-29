@@ -108,3 +108,46 @@ verify and draft-loop graph replay; startup capture alone does not establish
 that serving uses graphs. Only then run three unprofiled benchmark repetitions.
 If capture fails, retain the full traceback and return to `mtp`; do not assume
 that a CPU pass proves NPU graph numerics or a throughput improvement.
+
+## Isolate a device stall
+
+A wait copying accepted sequence lengths to CPU after MTP returns means the
+queued device work has not completed. It does not identify which kernel or
+which graph caused the stall. Do not remove this necessary scheduler copy.
+Use these NPU-only switches to test each graph phase independently:
+
+| Trial | `SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH` | `SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH` |
+| --- | --- | --- |
+| Target verification graph only | `1` | `0` |
+| Assistant draft graph only | `0` | `1` |
+| Eager control | `1` | `1` |
+| Both graphs | `0` | `0` |
+
+Both disable switches default0; other speculative families are unchanged.
+`SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=1` explicitly synchronizes after prefill,
+draft, verify and next-draft seed preparation, logging begin/complete markers.
+This is diagnostic instrumentation; do not use its timing for performance.
+
+First run target-only, then stop/restart for draft-only with the two disable
+values exchanged. Keep NPU, model, memory, QKV and FIA settings fixed:
+
+```bash
+GEMMA_DEVICES=2 \
+SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH=1 \
+SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH=0 \
+SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=1 \
+bash test/manual/gemma4/serve_ab.sh mtp-graph 2>&1 | tee /tmp/mtp-target-only.log
+```
+
+From another terminal, send one short request rather than benchmark traffic:
+
+```bash
+curl --max-time 60 -sS http://127.0.0.1:30014/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-w8a8-test","messages":[{"role":"user","content":"Count from one to ten."}],"temperature":0,"max_tokens":16,"stream":false}'
+```
+
+Report the last `synchronize begin` without a matching `synchronize complete`,
+the complete startup log, and a Python thread dump while frozen. A completed
+HTTP header or successful graph capture does not establish decode completion.
+Turn diagnostic sync off before unprofiled benchmarks after the stall is fixed.

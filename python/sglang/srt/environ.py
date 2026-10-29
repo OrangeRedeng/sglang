@@ -1035,6 +1035,9 @@ class Envs:
     SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM = EnvBool(False)
     SGLANG_ENABLE_NPU_FIA_METADATA_REUSE = EnvBool(False)
     SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE = EnvBool(False)
+    SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH = EnvBool(False)
+    SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH = EnvBool(False)
+    SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the

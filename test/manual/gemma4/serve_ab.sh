@@ -93,6 +93,10 @@ printf 'ASCEND_RT_VISIBLE_DEVICES=%s TP_SIZE=1 DP_SIZE=%s\n' "$devices" "$dp_siz
 printf 'TASK_QUEUE_ENABLE=1 QKV_NORM=%s\n' "$norm"
 printf 'FIA_METADATA_REUSE=%s FIA_KV_VIEW_REUSE=%s\n' \
     "${SGLANG_ENABLE_NPU_FIA_METADATA_REUSE:-0}" "${SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE:-0}"
+printf 'MTP_DRAFT_GRAPH_DISABLED=%s MTP_VERIFY_GRAPH_DISABLED=%s MTP_DEBUG_SYNC=%s\n' \
+    "${SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH:-0}" \
+    "${SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH:-0}" \
+    "${SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC:-0}"
 printf '%q ' "${cmd[@]}"
 printf '\n'
 if [[ "$print_only" == --print ]]; then

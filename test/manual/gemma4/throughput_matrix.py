@@ -288,6 +288,9 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM",
                         "SGLANG_ENABLE_NPU_FIA_METADATA_REUSE",
                         "SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE",
+                        "SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH",
+                        "SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH",
+                        "SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC",
                         "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },

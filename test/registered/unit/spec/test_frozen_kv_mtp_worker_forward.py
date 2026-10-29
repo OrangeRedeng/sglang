@@ -47,7 +47,9 @@ class TestFrozenKVMTPForward(CustomTestCase):
                     next_token_ids=object(),
                 )
                 worker = SimpleNamespace(
-                    target_worker=Mock(), draft_worker=Mock(draft_owns_attention=False)
+                    target_worker=Mock(),
+                    draft_worker=Mock(draft_owns_attention=False),
+                    _debug_graph_stage=Mock(),
                 )
                 worker.target_worker.forward_batch_generation.return_value = output
                 publish = Mock()
@@ -87,6 +89,7 @@ class TestFrozenKVMTPForward(CustomTestCase):
                 verify_input.is_verify_input.return_value = True
                 worker = SimpleNamespace(
                     activate_step_by_batch=Mock(),
+                    _debug_graph_stage=Mock(),
                     draft_worker=Mock(draft_owns_attention=False),
                     verify=Mock(return_value=output),
                 )
@@ -110,6 +113,18 @@ class TestFrozenKVMTPForward(CustomTestCase):
                 worker.draft_worker._draft_extend_for_decode.assert_called_once_with(
                     batch, output
                 )
+
+    def test_debug_sync_is_explicitly_opt_in(self):
+        for enabled in (False, True):
+            worker = SimpleNamespace(debug_npu_mtp_graph_sync=enabled)
+            synchronize = Mock()
+            with patch(
+                "sglang.srt.speculative.frozen_kv_mtp_worker_v2.torch.npu",
+                SimpleNamespace(synchronize=synchronize),
+                create=True,
+            ):
+                FrozenKVMTPWorkerV2._debug_graph_stage(worker, "draft")
+            self.assertEqual(synchronize.call_count, int(enabled))
 
 
 if __name__ == "__main__":
