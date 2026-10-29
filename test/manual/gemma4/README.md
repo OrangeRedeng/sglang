@@ -4,13 +4,29 @@ Target: recommendation **21.75 completed requests/s**, RAG **8 completed request
 for all four cases each, with total concurrency below 30. Preserve checkpoint
 precision, datasets, output lengths and scenario latency SLOs. No draft model.
 
-This change implements host length-list reuse and hoists repeated BSND cache
-views. Tiled QKV candidates are **opt-in**, with baseline defaults
-unchanged. The matrix runner requires complete, matching NPU correctness and
-graph-replay reports before it launches a candidate. Source hashes, CANN,
-torch/torch_npu, sgl-kernel-npu, Triton and NPU model must match. CPU diagnostics
-cannot authorize serving selection. No candidate is accepted from an operator
-timing or a single serving run.
+This change implements batch-level FIA length-list reuse and hoists repeated
+BSND views. The existing opt-in serial QKV fusion remains available. Experimental
+tiled QKV and RoPE/KV fusion were removed after target-NPU launch crashes.
+
+## Current experiment order
+
+Use the [three-launch Docker plan](docker_ab.md):
+
+| Order | Profile | Comparison |
+| --- | --- | --- |
+| 1 | `metadata` | Serial QKV, existing graphs and delayer |
+| 2 | `mtp-baseline` | Serial QKV, graphs/overlap off, memory0.82 |
+| 3 | `mtp` | Same as2 plus the matching assistant |
+
+Run three unprofiled repetitions per launch with the same random C24/RPS87/1600
+workload. Compare MTP against its matched eager control. Validate fixed-prompt
+greedy outputs/logprobs and long-prefix SWA/shared-KV behavior first. Report
+per-replica batches alongside TTFT, TPOT, E2E and completed throughput.
+
+The supplied serial validation log passes108 cases. This does not establish
+serving performance or full scenario acceptance. Do not rerun removed tiled
+or RoPE/KV candidates. `run_plan.py` covers the original no-assistant matrix;
+MTP remains a separate comparison, requiring its own full scenario acceptance.
 
 ## Prerequisites
 
@@ -78,35 +94,24 @@ Compare matching concurrency/case rows and quality files. The runner records
 prefill/decode report counts and means separately for DP0/DP1. Lower kernel or
 host timing alone is not a serving speedup.
 
-## Round 2: native versus serial, then tiled QKV
+## Round 2: native versus serial QKV
 
-First repeat the same matrix with `--qkv native` and a new output directory.
-This disables only the existing QKV fusion flag; it does not change weights or
-quantization. Compare against `--qkv serial` at identical settings.
+Repeat the candidate matrix with `--qkv native` and a new output directory.
+Compare with `--qkv serial` at identical settings. This changes only the existing
+QKV fusion flag; weights and checkpoint precision remain unchanged.
 
-With serving stopped, validate the serial and tiles4/8/16 on one NPU:
+Optional serial-only correctness/timing rerun, with serving stopped:
 
 ```bash
-cd "$GEMMA_ROOT"
-ASCEND_RT_VISIBLE_DEVICES=2 PYTHONPATH=python \
+ASCEND_RT_VISIBLE_DEVICES=2 TASK_QUEUE_ENABLE=1 PYTHONPATH=python \
 python3 test/manual/kernels/benchmark_gemma4_qkv_norm_npu.py \
-  --candidate all --output "$GEMMA_RUNS/qkv-validation.json"
+  --candidate serial --output "$GEMMA_RUNS/qkv-serial-validation.json"
 ```
 
-The validator checks FP16/BF16, head dimensions128/256/512, representative token
-counts, strided shared-buffer Q/K/V, unweighted V, Q-only shared-KV layers,
-untouched sentinel storage, fullgraph tracing and graph replay in queue modes0/1.
-It reports native and candidate device/wall medians, and saves partial evidence
-if a case fails. Compilation/correctness must pass before timing each case.
-After validation, use `--qkv tile4`, `tile8` or `tile16` together with
-`--qkv-validation "$GEMMA_RUNS/qkv-validation.json"` in a candidate matrix.
-For one concurrency use `--phase candidate --concurrency 28`.
-The direct expert toggle is `SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=4|8|16`, with the
-existing fusion flag enabled; zero retains the serial implementation. Do not
-set the toggle outside controlled validation before correctness has passed.
-
-The experimental RoPE/KV-write candidate was removed after a target-NPU crash.
-Standard rotary embedding and KV writes remain in use.
+The validator covers FP16/BF16, dimensions128/256/512, strided QKV, shared KV,
+fullgraph tracing and graph replay in queue modes0/1. Use a fresh output path.
+It cannot select a tiled kernel: the implementation and selectors were removed.
+Standard rotary embedding and KV writes remain unchanged.
 
 ## Bounded profiles
 
@@ -197,10 +202,10 @@ python3 "$GEMMA_ROOT/test/manual/gemma4/run_plan.py" \
 Use a clean source checkout and a new output directory. The runner executes:
 
 1. Pinned TP1/DP2 baseline, then metadata candidate at C24/C28/C29.
-2. Native versus serial QKV, full operator validation, and serving trials of tiles4/8/16.
-4. The pinned GLM compatibility audit, retaining existing precision/INT8/GeGLU contracts.
-5. Disabled delaying and the one-knob scheduling grid, with kernel settings fixed.
-6. Separate timing and shape diagnostic profiles, followed by all eight cases in three unprofiled repetitions.
+2. Native versus serial QKV and serial-only operator validation.
+3. The pinned GLM compatibility audit, retaining existing precision/INT8/GeGLU contracts.
+4. Disabled delaying and the one-knob scheduling grid, with kernel settings fixed.
+5. Separate timing and shape diagnostic profiles, followed by all eight cases in three unprofiled repetitions.
 
 Exploratory configurations are ranked by the geometric mean of completed RPS
 normalized by their fixed scenario targets. This ranking does not accept a

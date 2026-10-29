@@ -198,8 +198,6 @@ def main():
         ]
         if quality is not None:
             cmd += ["--quality-baseline", str(quality)]
-        if qkv.startswith("tile"):
-            cmd += ["--qkv-validation", str(args.output / "qkv-validation.json")]
         ok = run(name, cmd)
         environment_path = destination / "environment.json"
         if environment_path.exists():
@@ -275,28 +273,17 @@ def main():
     consider("02-native-qkv", native, {**best, "qkv": "native"})
     # Kernel checks run with the serving processes stopped by matrix's finally.
     kernels = scripts.parent / "kernels"
-    qkv_ok = run(
+    run(
         "02-qkv-correctness",
         [
             sys.executable,
             str(kernels / "benchmark_gemma4_qkv_norm_npu.py"),
             "--candidate",
-            "all",
+            "serial",
             "--output",
             str(args.output / "qkv-validation.json"),
         ],
     )
-    if qkv_ok:
-        for tile in ("tile4", "tile8", "tile16"):
-            report = matrix(
-                f"02-{tile}",
-                args.server_root,
-                "candidate",
-                qkv=tile,
-                concurrency=concurrency,
-                quality=quality,
-            )
-            consider(f"02-{tile}", report, {**best, "qkv": tile})
     record(
         round="04-glm-audit",
         decision="no-additional-port",
@@ -396,26 +383,9 @@ def main():
         quality=quality,
     )
     rows = accepted["results"] if accepted else []
-    executed = {"qkv_tiled": set()}
-    for path in (args.output / "06-profile-timing").rglob("coverage.json"):
-        for report in json.loads(path.read_text()).get("reports", []):
-            for name, devices in report.get("candidate_kernel_rows", {}).items():
-                if name in executed:
-                    executed[name].update(
-                        device for device, count in devices.items() if count > 0
-                    )
-    execution_verified = not best["qkv"].startswith("tile") or executed[
-        "qkv_tiled"
-    ] == {"2", "3"}
     baseline_rows = [r for r in baseline["results"] if r["concurrency"] == concurrency]
     baseline_score = exploratory_score(baseline_rows)
-    passed = bool(
-        accepted
-        and accepted["acceptance_pass"]
-        and timing
-        and shape_ok
-        and execution_verified
-    )
+    passed = bool(accepted and accepted["acceptance_pass"] and timing and shape_ok)
     case_results = feasibility(rows)
     for result in case_results:
         observed = [
@@ -434,10 +404,6 @@ def main():
         "baseline_normalized_geomean_rps": baseline_score,
         "exploratory_speedup": score / baseline_score if baseline_score else None,
         "profiles_complete": bool(timing and shape_ok),
-        "candidate_execution_verified": execution_verified,
-        "candidate_execution_devices": {
-            name: sorted(devices) for name, devices in executed.items()
-        },
         "cases": case_results,
         "note": "Targets are unchanged. A failed run is not an accepted configuration or a proven hardware ceiling.",
     }

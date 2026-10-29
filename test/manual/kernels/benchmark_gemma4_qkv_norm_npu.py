@@ -1,14 +1,12 @@
-"""Validate opt-in serial and tiled QKV norm through the serving op boundary."""
+"""Validate serial QKV norm through the serving op boundary."""
 
 import argparse
 import json
 import sys
-from functools import partial
 from pathlib import Path
 
 import torch
 import torch_npu
-from sglang.srt.hardware_backend.npu.gemma4_ops import npu_gemma4_qkv_rmsnorm
 from validate_gemma4_qkv_norm_npu import validate
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,8 +17,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--candidate",
-        choices=["all", "serial", "tile4", "tile8", "tile16"],
-        default="all",
+        choices=["serial"],
+        default="serial",
     )
     p.add_argument(
         "--tokens",
@@ -35,11 +33,7 @@ def main():
         p.error("Sample count and token counts must be positive")
     if args.output.exists():
         p.error("Use a new output file")
-    names = (
-        ["serial", "tile4", "tile8", "tile16"]
-        if args.candidate == "all"
-        else [args.candidate]
-    )
+    names = ["serial"]
     report = new_report("qkv", torch, torch_npu)
     report["candidate_results"] = {}
     torch.manual_seed(0)
@@ -47,15 +41,6 @@ def main():
         for name in names:
             print(f"BEGIN candidate={name}", flush=True)
             try:
-                kwargs = (
-                    {}
-                    if name == "serial"
-                    else {
-                        "norm": partial(
-                            npu_gemma4_qkv_rmsnorm, rows_per_program=int(name[4:])
-                        )
-                    }
-                )
                 for dtype in (torch.float16, torch.bfloat16):
                     for head_dim in (128, 256, 512):
                         for tokens in args.tokens:
@@ -73,7 +58,6 @@ def main():
                                     dtype,
                                     shared,
                                     samples=args.samples,
-                                    **kwargs,
                                 )
                                 report["cases"].append(
                                     {

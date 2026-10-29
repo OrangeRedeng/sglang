@@ -91,14 +91,10 @@ def summarize(output):
         details = path.parent / "kernel_details.csv"
         devices = []
         launches = Counter()
-        candidates = {"qkv_tiled": Counter()}
         if details.is_file():
             with details.open() as f:
                 for row in csv.DictReader(f):
                     launches[row["Device_id"]] += 1
-                    name = row.get("Name", "")
-                    if "qkv_rmsnorm_npu_tiled_kernel" in name:
-                        candidates["qkv_tiled"][row["Device_id"]] += 1
             devices = sorted(launches)
         top = []
         stat = path.parent / "op_statistic.csv"
@@ -116,9 +112,6 @@ def summarize(output):
                 "step_labels": steps,
                 "top_device_ops": top,
                 "kernel_detail_rows_per_device": dict(launches),
-                "candidate_kernel_rows": {
-                    name: dict(counts) for name, counts in candidates.items()
-                },
                 "timing": trace_timing(events),
             }
         )

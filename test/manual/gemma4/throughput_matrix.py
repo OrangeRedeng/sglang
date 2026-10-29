@@ -286,7 +286,6 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "ASCEND_USE_FIA",
                         "PYTORCH_NPU_ALLOC_CONF",
                         "SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM",
-                        "SGLANG_NPU_GEMMA4_QKV_NORM_ROWS",
                         "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },
@@ -518,10 +517,9 @@ def main():
     p.add_argument("--schedule", choices=list(SCHEDULES), default="base")
     p.add_argument(
         "--qkv",
-        choices=["native", "serial", "tile4", "tile8", "tile16"],
+        choices=["native", "serial"],
         default="serial",
     )
-    p.add_argument("--qkv-validation", type=Path)
     p.add_argument("--port", type=int, default=30014)
     p.add_argument("--requests", type=int, default=256)
     p.add_argument("--warmups", type=int, default=32)
@@ -575,46 +573,12 @@ def main():
         PYTORCH_NPU_ALLOC_CONF="expandable_segments:True",
         SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE="0",
         SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM="0" if args.qkv == "native" else "1",
-        SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=args.qkv[4:]
-        if args.qkv.startswith("tile")
-        else "0",
     )
     env["PYTHONPATH"] = (
         str(args.server_root / "python") + os.pathsep + env.get("PYTHONPATH", "")
     )
     if env.get("ASCEND_LAUNCH_BLOCKING") == "1":
         p.error("Unset ASCEND_LAUNCH_BLOCKING before performance measurements")
-    from candidate_validation import validate_report
-
-    if args.qkv.startswith("tile"):
-        device = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import torch, torch_npu; print(torch.npu.get_device_name())",
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        for required, kind, candidate, report in (
-            (args.qkv.startswith("tile"), "qkv", args.qkv, args.qkv_validation),
-        ):
-            if required:
-                if report is None:
-                    p.error(
-                        f"{candidate} requires matching NPU --{kind.replace('_kv', '')}-validation evidence"
-                    )
-                validate_report(
-                    report,
-                    kind,
-                    candidate,
-                    args.server_root,
-                    identity["versions"],
-                    device,
-                    cann_versions=identity["cann_version_files"],
-                )
     schedules = list(SCHEDULES) if args.phase == "scheduling" else [args.schedule]
     concurrencies = [24, 28, 29] if args.phase == "baseline" else [args.concurrency]
     repeats = 3 if args.phase == "acceptance" else 1

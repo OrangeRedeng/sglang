@@ -14,7 +14,6 @@
 
 import logging
 import re
-from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -436,12 +435,7 @@ class Gemma4Attention(nn.Module):
                 npu_gemma4_qkv_rmsnorm,
             )
 
-            rows = envs.SGLANG_NPU_GEMMA4_QKV_NORM_ROWS.get()
-            if rows not in (0, 4, 8, 16):
-                raise ValueError("Gemma4 QKV norm rows must be 0, 4, 8, or 16")
-            self._fused_qkv_norm = partial(
-                npu_gemma4_qkv_rmsnorm, rows_per_program=rows
-            )
+            self._fused_qkv_norm = npu_gemma4_qkv_rmsnorm
 
         if layer_type in config.rope_parameters:
             rope_parameters = dict(config.rope_parameters[layer_type])
