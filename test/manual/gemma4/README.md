@@ -4,8 +4,8 @@ Target: recommendation **21.75 completed requests/s**, RAG **8 completed request
 for all four cases each, with total concurrency below 30. Preserve checkpoint
 precision, datasets, output lengths and scenario latency SLOs. No draft model.
 
-This change implements batch-level FIA length-list reuse and hoists repeated
-BSND views. The existing opt-in serial QKV fusion remains available. Experimental
+Batch-level FIA length-list reuse and hoisted BSND views are independently
+opt-in; both default off for controlled regression comparisons. The existing opt-in serial QKV fusion remains available. Experimental
 tiled QKV and RoPE/KV fusion were removed after target-NPU launch crashes.
 
 ## Current experiment order
@@ -14,7 +14,7 @@ Use the [three-launch Docker plan](docker_ab.md):
 
 | Order | Profile | Comparison |
 | --- | --- | --- |
-| 1 | `metadata` | Serial QKV, existing graphs and delayer |
+| 1 | `metadata` | Reference, serial QKV, existing graphs and delayer |
 | 2 | `mtp-baseline` | Serial QKV, graphs/overlap/delayer off, memory0.82 |
 | 3 | `mtp` | Same as2 plus the matching assistant |
 
@@ -27,6 +27,56 @@ The supplied serial validation log passes108 cases. This does not establish
 serving performance or full scenario acceptance. Do not rerun removed tiled
 or RoPE/KV candidates. `run_plan.py` covers the original no-assistant matrix;
 MTP remains a separate comparison, requiring its own full scenario acceptance.
+
+## Isolate serial QKV normalization
+
+`SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM` is independent of both FIA switches. Set it
+explicitly before your direct launch or `serve_ab.sh metadata`:
+
+| Value | QKV normalization |
+| --- | --- |
+| `0` | Native separate Q/K/V normalization |
+| `1` | Existing serial fused normalization |
+
+The Python runtime defaults to0. The serving helper preserves its historical
+reference default of1, but now honors an explicit environment override. The
+`native` profile always selects0. Keep both FIA flags0 when isolating QKV.
+Do not change graph, scheduling, memory or workload settings between these runs.
+
+```bash
+SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=0 \
+SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=0 \
+SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=0 \
+bash test/manual/gemma4/serve_ab.sh metadata
+
+# Stop the preceding server first.
+SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=1 \
+SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=0 \
+SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=0 \
+bash test/manual/gemma4/serve_ab.sh metadata
+```
+
+## Isolate FIA preparation changes
+
+The following expert switches are disabled by default and read at backend
+initialization. Restart serving between tests. Keep the same source, runtime,
+launch command, workloads and warmup; run three unprofiled repetitions each.
+
+| Test | Serving command |
+| --- | --- |
+| Original preparation paths | `SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=0 SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=0 bash test/manual/gemma4/serve_ab.sh metadata` |
+| Metadata reuse only | `SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=1 SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=0 bash test/manual/gemma4/serve_ab.sh metadata` |
+| KV view reuse only | `SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=0 SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=1 bash test/manual/gemma4/serve_ab.sh metadata` |
+| Both changes | `SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=1 SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=1 bash test/manual/gemma4/serve_ab.sh metadata` |
+
+The metadata switch controls CPU query/KV length-list caching, reuse of replay
+length lists, and removal of the duplicate sequence-length reduction. The view
+switch hoists paged BSND KV views out of the per-request loop. With both off,
+these preparation paths follow the pre-optimization implementation; this does
+not assert that an unidentified earlier benchmark commit has been reproduced.
+Serial QKV, long-prefix masks, MTP SWA correctness and graph settings are retained.
+The `metadata` profile name remains for compatibility; it does not enable these
+new switches. The matrix records their inherited environment values.
 
 ## Prerequisites
 

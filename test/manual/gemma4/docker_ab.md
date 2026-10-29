@@ -18,6 +18,12 @@ export GEMMA_ASSISTANT_MODEL=/home/test1/models/gemma-4-26B-A4B-it-assistant
 | 2. Matched eager MTP control | `bash test/manual/gemma4/serve_ab.sh mtp-baseline` |
 | 3. Serial QKV + MTP | `bash test/manual/gemma4/serve_ab.sh mtp` |
 
+For the independent FIA A/B switches, see [README.md](README.md#isolate-fia-preparation-changes).
+Both default off; the `metadata` profile does not enable them.
+Set `SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=0` to disable serial QKV independently;
+the helper honors this override for `metadata`, `mtp-baseline` and `mtp`.
+Keep the same QKV/FIA switches for the matched MTP comparison.
+
 All three use serial QKV. Experimental tiled QKV and RoPE/KV paths were removed
 after target-NPU launch crashes. No tiled validation report or row flag is needed.
 

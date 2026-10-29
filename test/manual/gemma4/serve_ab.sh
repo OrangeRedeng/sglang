@@ -13,7 +13,7 @@ root=${GEMMA_ROOT:-$(cd -- "$script_dir/../../.." && pwd)}
 server_root=$root
 model=${GEMMA_MODEL:-/home/test1/models/gemma4-26B-A4B-w8a8}
 python=${GEMMA_PYTHON:-python3}
-norm=1
+norm=${SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM:-1}
 ratio=0.5
 delay=50
 cap=6
@@ -84,6 +84,8 @@ cmd+=("${extra[@]}")
 
 printf 'Profile=%s source=%q\n' "$profile" "$server_root"
 printf 'TASK_QUEUE_ENABLE=1 QKV_NORM=%s\n' "$norm"
+printf 'FIA_METADATA_REUSE=%s FIA_KV_VIEW_REUSE=%s\n' \
+    "${SGLANG_ENABLE_NPU_FIA_METADATA_REUSE:-0}" "${SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE:-0}"
 printf '%q ' "${cmd[@]}"
 printf '\n'
 if [[ "$print_only" == --print ]]; then

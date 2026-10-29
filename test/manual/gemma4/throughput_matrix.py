@@ -286,6 +286,8 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "ASCEND_USE_FIA",
                         "PYTORCH_NPU_ALLOC_CONF",
                         "SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM",
+                        "SGLANG_ENABLE_NPU_FIA_METADATA_REUSE",
+                        "SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE",
                         "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },
