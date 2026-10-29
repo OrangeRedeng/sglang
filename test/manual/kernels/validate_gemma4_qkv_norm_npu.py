@@ -3,14 +3,18 @@
 Run with PYTHONPATH=python python3 test/manual/kernels/validate_gemma4_qkv_norm_npu.py
 """
 
+import statistics
+import time
+
 import torch
 import torch_npu
-
 from sglang.srt.hardware_backend.npu.gemma4_ops import npu_gemma4_qkv_rmsnorm
 
 
-def validate(tokens, head_dim, dtype, shared_kv):
-    q_heads, kv_heads = 8, 2
+def validate(
+    tokens, head_dim, dtype, shared_kv, *, norm=npu_gemma4_qkv_rmsnorm, samples=0
+):
+    q_heads, kv_heads = (16, 8) if head_dim == 256 else (16, 2)
     widths = [q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim, 17]
     source = torch.randn(tokens, sum(widths), device="npu", dtype=dtype)
     work = source.clone()
@@ -21,9 +25,12 @@ def validate(tokens, head_dim, dtype, shared_kv):
 
     def reference():
         expected = []
-        for x, weight in zip(
-            source.split(widths, dim=-1)[:3], [q_weight, k_weight, ones]
+        for index, (x, weight) in enumerate(
+            zip(source.split(widths, dim=-1)[:3], [q_weight, k_weight, ones])
         ):
+            if shared_kv and index > 0:
+                expected.append(x)
+                continue
             shape = x.shape
             expected.append(
                 torch_npu.npu_rms_norm(x.reshape(tokens, -1, head_dim), weight, 1e-6)[
@@ -33,7 +40,7 @@ def validate(tokens, head_dim, dtype, shared_kv):
         return expected
 
     def run():
-        npu_gemma4_qkv_rmsnorm(
+        norm(
             q,
             None if shared_kv else k,
             None if shared_kv else v,
@@ -81,6 +88,30 @@ def validate(tokens, head_dim, dtype, shared_kv):
     print(
         f"PASS tokens={tokens} head_dim={head_dim} dtype={dtype} shared_kv={shared_kv}"
     )
+
+    def measure(step):
+        device_us, wall_us = [], []
+        for index in range(samples + 2):
+            work.copy_(source)
+            torch.npu.synchronize()
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            start.record()
+            begin = time.perf_counter_ns()
+            result = step()
+            end.record()
+            end.synchronize()
+            elapsed = (time.perf_counter_ns() - begin) / 1000.0
+            if index >= 2:
+                device_us.append(start.elapsed_time(end) * 1000.0)
+                wall_us.append(elapsed)
+            del result
+        return {
+            "device_median_us": statistics.median(device_us),
+            "wall_median_us": statistics.median(wall_us),
+        }
+
+    return {"candidate": measure(run), "native": measure(reference)} if samples else {}
 
 
 if __name__ == "__main__":

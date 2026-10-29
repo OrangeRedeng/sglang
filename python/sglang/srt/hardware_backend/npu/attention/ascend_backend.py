@@ -572,7 +572,6 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             if (
                 forward_batch.spec_algorithm is not None
@@ -640,7 +639,7 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
-            self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+            self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum.tolist()
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
@@ -653,6 +652,11 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
+        # FIA IntArray arguments must not iterate CPU tensors in every layer.
+        self.forward_metadata.seq_lens_cpu_list = (
+            self.forward_metadata.seq_lens_cpu_int.tolist()
+        )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -1136,7 +1140,7 @@ class AscendAttnBackend(AttentionBackend):
                 {"actual_seq_qlen": metadata.seq_lens_list_cumsum},
                 {"actual_seq_kvlen": metadata.seq_lens_cpu_int},
             ]
-            metadata.seq_lens_cpu_list = [int(v) for v in seq_lens_cpu[:bs]]
+            metadata.seq_lens_cpu_list = metadata.seq_lens_cpu_int
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -1820,7 +1824,7 @@ class AscendAttnBackend(AttentionBackend):
                             num_query_heads=layer.tp_q_head_num,
                             num_key_value_heads=layer.tp_k_head_num,
                             actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
-                            actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
+                            actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
                             softmax_scale=layer.scaling,
                             sparse_mode=4 if layer.sliding_window_size != -1 else 3,
                             learnable_sink=sinks,
@@ -1846,11 +1850,17 @@ class AscendAttnBackend(AttentionBackend):
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                         # FIA BSND with paged KV cache (reads prefix tokens from cache)
-                        seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+                        seq_lens_cpu = self.forward_metadata.seq_lens_cpu_list
                         attn_out = torch.empty(
                             (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                             device=q.device,
                             dtype=q.dtype,
+                        )
+                        k_cache_paged = k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        )
+                        v_cache_paged = v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
                         )
                         q_len_offset = 0
                         for seq_idx, q_len in enumerate(
@@ -1861,16 +1871,8 @@ class AscendAttnBackend(AttentionBackend):
                             total_kv_len = seq_lens_cpu[seq_idx]
                             result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
-                                key=k_cache.view(
-                                    -1,
-                                    self.page_size,
-                                    layer.tp_k_head_num * layer.qk_head_dim,
-                                ),
-                                value=v_cache.view(
-                                    -1,
-                                    self.page_size,
-                                    layer.tp_v_head_num * layer.v_head_dim,
-                                ),
+                                key=k_cache_paged,
+                                value=v_cache_paged,
                                 num_query_heads=layer.tp_q_head_num,
                                 num_key_value_heads=layer.tp_k_head_num,
                                 input_layout="BSND",
@@ -1945,7 +1947,7 @@ class AscendAttnBackend(AttentionBackend):
                         atten_mask=self.fia_mask,
                         input_layout="TND",
                         actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_list,
                         num_key_value_heads=layer.tp_k_head_num,
                         num_heads=layer.tp_q_head_num,
                         scale=layer.scaling,
@@ -1973,11 +1975,17 @@ class AscendAttnBackend(AttentionBackend):
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                     # FIA BSND with paged KV cache (reads prefix tokens from cache)
-                    seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+                    seq_lens_cpu = self.forward_metadata.seq_lens_cpu_list
                     attn_output = torch.empty(
                         (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                         device=q.device,
                         dtype=q.dtype,
+                    )
+                    k_cache_paged = k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                    )
+                    v_cache_paged = v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
                     )
                     q_len_offset = 0
                     for seq_idx, q_len in enumerate(forward_batch.extend_seq_lens_cpu):
@@ -1994,16 +2002,8 @@ class AscendAttnBackend(AttentionBackend):
                         )
                         result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                             query=q[None, q_len_offset : q_len_offset + q_len],
-                            key=k_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_k_head_num * layer.qk_head_dim,
-                            ),
-                            value=v_cache.view(
-                                -1,
-                                self.page_size,
-                                layer.tp_v_head_num * layer.v_head_dim,
-                            ),
+                            key=k_cache_paged,
+                            value=v_cache_paged,
                             num_query_heads=layer.tp_q_head_num,
                             num_key_value_heads=layer.tp_k_head_num,
                             input_layout="BSND",
