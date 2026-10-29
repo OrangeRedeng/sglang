@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,6 +35,30 @@ with patch.dict(
 
 
 class TestCandidateEvidence(CustomTestCase):
+    def test_distinct_validation_cases_do_not_exhaust_dynamo_cache(self):
+        """The dtype matrix shares a code object but needs independent compile caches."""
+
+        def make_case(dtype):
+            value = torch.ones(2, dtype=dtype)
+
+            def run():
+                return value + 1
+
+            return run
+
+        try:
+            with torch._dynamo.config.patch(recompile_limit=2):
+                for dtype in (
+                    torch.float16,
+                    torch.float32,
+                    torch.bfloat16,
+                    torch.float64,
+                ):
+                    actual = validation.compile_case(make_case(dtype))()
+                    torch.testing.assert_close(actual, torch.full((2,), 2, dtype=dtype))
+        finally:
+            torch.compiler.reset()
+
     def test_stale_runtime_and_partial_cases_cannot_select_a_kernel(self):
         """A correctness report must match the code, runtime and complete case matrix."""
         with tempfile.TemporaryDirectory() as temp:

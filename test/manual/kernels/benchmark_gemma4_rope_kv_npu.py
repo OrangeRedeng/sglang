@@ -20,7 +20,7 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import Gemma4RotaryEmbedding
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gemma4.candidate_validation import ROPE_TOKENS, new_report
+from gemma4.candidate_validation import ROPE_TOKENS, compile_case, new_report
 
 
 def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
@@ -149,10 +149,14 @@ def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
             vbuf[:, 0].index_copy_(0, slot, v_valid.reshape(-1, kh, dim))
         else:
             torch_npu.npu_scatter_nd_update_(
-                kbuf[:, 0], slot[:, None], kr_valid.contiguous().reshape(-1, kh, dim)
+                kbuf.view(capacity, kh, dim),
+                slot.contiguous().view(-1, 1),
+                kr_valid.contiguous().view(-1, kh, dim),
             )
             torch_npu.npu_scatter_nd_update_(
-                vbuf[:, 0], slot[:, None], v_valid.contiguous().reshape(-1, kh, dim)
+                vbuf.view(capacity, kh, dim),
+                slot.contiguous().view(-1, 1),
+                v_valid.contiguous().view(-1, kh, dim),
             )
         return qr, kr
 
@@ -160,15 +164,56 @@ def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
         work.copy_(source)
         kc.copy_(seed)
         vc.copy_(seed)
+        if not cpu:
+            # Flush queued Torch writes before the raw Triton launch/capture.
+            torch.npu.synchronize()
 
-    def check(actual):
+    def check(actual, stage):
         expected_k, expected_v = seed.clone(), seed.clone()
         expected = native(expected_k, expected_v)
+        if not cpu:
+            torch.npu.synchronize()
         tol = 2e-2 if dtype == torch.bfloat16 else 3e-3
-        for a, e in zip(actual, expected):
-            torch.testing.assert_close(a, e, atol=tol, rtol=tol)
-        torch.testing.assert_close(kc, expected_k, atol=tol, rtol=tol)
-        torch.testing.assert_close(vc, expected_v, atol=0, rtol=0)
+        label = f"stage={stage} tokens={tokens} dim={dim} dtype={dtype} mapped={mapped} cache_fp32={cache_fp32}"
+        label += f" cache_shape={tuple(kc.shape)} cache_stride={kc.stride()}"
+        if not cpu:
+            label += f" npu_format={torch_npu.get_npu_format(kc)}"
+        for name, a, e in zip(("q", "k"), actual, expected):
+            torch.testing.assert_close(
+                a,
+                e,
+                atol=tol,
+                rtol=tol,
+                msg=lambda detail, name=name: f"{label} component={name}\n{detail}",
+            )
+        # Cross-check the native scatter oracle without NPU views or queued writes.
+        slots = locations.cpu().long()
+        live = slots > 0
+        if mapped:
+            slots[live] = mapping.cpu()[slots[live]]
+        live &= (slots > 0) & (slots < capacity)
+        cpu_k, cpu_v = seed.cpu().clone(), seed.cpu().clone()
+        cpu_k[:, 0].index_copy_(
+            0, slots[live], expected[1].cpu().reshape(tokens, kh, dim)[live]
+        )
+        cpu_v[:, 0].index_copy_(0, slots[live], v.cpu().reshape(tokens, kh, dim)[live])
+        for name, a, e in (
+            ("native_k_scatter", expected_k.cpu(), cpu_k),
+            ("native_v_scatter", expected_v.cpu(), cpu_v),
+            ("candidate_k_cache", kc.cpu(), cpu_k),
+            ("candidate_v_cache", vc.cpu(), cpu_v),
+        ):
+            tolerance = 0 if "v_" in name else tol
+            changed = (a != e).reshape(capacity, -1).any(1).nonzero().flatten().tolist()
+            torch.testing.assert_close(
+                a,
+                e,
+                atol=tolerance,
+                rtol=tolerance,
+                msg=lambda detail, name=name, changed=changed: (
+                    f"{label} component={name} changed_rows={changed[:16]} locations={slots[:8].tolist()}\n{detail}"
+                ),
+            )
         torch.testing.assert_close(work, source, atol=0, rtol=0)
         torch.testing.assert_close(sentinel, source[:, -17:], atol=0, rtol=0)
 
@@ -176,13 +221,13 @@ def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
     actual = run()
     if not cpu:
         torch.npu.synchronize()
-    check(actual)
+    check(actual, "eager")
     if not cpu:
-        compiled = torch.compile(run, backend="eager", fullgraph=True)
+        compiled = compile_case(run)
         reset()
         actual = compiled()
         torch.npu.synchronize()
-        check(actual)
+        check(actual, "fullgraph")
         for mode in (0, 1):
             torch.npu.synchronize()
             torch_npu.npu.set_task_queue_enable(mode)
@@ -199,7 +244,7 @@ def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
                 reset()
                 graph.replay()
                 torch.npu.synchronize()
-                check(actual)
+                check(actual, f"replay_queue{mode}")
 
     def measure(fn):
         wall, device_times = [], []
@@ -240,13 +285,13 @@ def validate(tokens, dim, dtype, mapped, cache_fp32, samples, *, cpu=False):
                 vc[:, 0].index_copy_(0, native_slots, v.reshape(tokens, kh, dim))
             else:
                 torch_npu.npu_scatter_nd_update_(
-                    kc[:, 0],
-                    native_slots[:, None],
+                    kc.view(capacity, kh, dim),
+                    native_slots.contiguous().view(-1, 1),
                     kr.contiguous().reshape(tokens, kh, dim),
                 )
                 torch_npu.npu_scatter_nd_update_(
-                    vc[:, 0],
-                    native_slots[:, None],
+                    vc.view(capacity, kh, dim),
+                    native_slots.contiguous().view(-1, 1),
                     v.contiguous().reshape(tokens, kh, dim),
                 )
         return qr, kr
@@ -258,6 +303,21 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tokens", type=int, nargs="+", default=list(ROPE_TOKENS))
     p.add_argument("--samples", type=int, default=20)
+    p.add_argument(
+        "--head-dims",
+        type=int,
+        nargs="+",
+        choices=[128, 256, 512],
+        default=[128, 256, 512],
+    )
+    p.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=["float16", "bfloat16"],
+        default=["float16", "bfloat16"],
+    )
+    p.add_argument("--mapped", choices=["all", "yes", "no"], default="all")
+    p.add_argument("--cache-fp32", choices=["all", "yes", "no"], default="all")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
@@ -272,11 +332,28 @@ def main():
         report = new_report("rope_kv", torch, torch_npu)
     torch.manual_seed(48)
     try:
-        for dtype in (torch.float16, torch.bfloat16):
-            for dim in (128, 256, 512):
+        for dtype_name in args.dtypes:
+            dtype = getattr(torch, dtype_name)
+            for dim in args.head_dims:
                 for tokens in args.tokens:
-                    for mapped in (False, True):
-                        for cache_fp32 in (False, True):
+                    for mapped in (
+                        (False, True)
+                        if args.mapped == "all"
+                        else (args.mapped == "yes",)
+                    ):
+                        for cache_fp32 in (
+                            (False, True)
+                            if args.cache_fp32 == "all"
+                            else (args.cache_fp32 == "yes",)
+                        ):
+                            report["current_case"] = {
+                                "tokens": tokens,
+                                "head_dim": dim,
+                                "dtype": dtype_name,
+                                "mapped": mapped,
+                                "cache_fp32": cache_fp32,
+                            }
+                            print(f"BEGIN {report['current_case']}", flush=True)
                             timing = validate(
                                 tokens,
                                 dim,
@@ -301,6 +378,10 @@ def main():
                                 }
                             )
         report["complete"] = not args.cpu
+        report.pop("current_case", None)
+    except Exception as error:
+        report["failure"] = {"case": report.get("current_case"), "error": str(error)}
+        raise
     finally:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2))

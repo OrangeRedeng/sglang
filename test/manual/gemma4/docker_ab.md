@@ -121,3 +121,25 @@ not an invented per-run acceptance rate.
 
 This short-output C24 workload does not establish all eight recommendation/RAG
 case targets. The full acceptance matrix remains available in `run_plan.py`.
+
+## Diagnose a failed primitive validation
+
+The validator clears Dynamo's compile cache between cases; a large dtype/shape
+matrix must not exhaust the serving-oriented recompile budget. This reset is
+outside timed regions and changes no server compiler settings.
+
+For a RoPE/KV mismatch, isolate the first nonempty FP16/D128 case before rerunning
+the full matrix (use an unused output filename):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2 TASK_QUEUE_ENABLE=1 PYTHONPATH=python \
+python3 test/manual/kernels/benchmark_gemma4_rope_kv_npu.py \
+  --tokens 1 --head-dims 128 --dtypes float16 --samples 1 \
+  --output "$GEMMA_EVIDENCE_DIR/rope-smoke.json"
+```
+
+Failure output identifies eager/fullgraph/replay stage, mapped/full slots,
+rotary-cache dtype, cache layout, changed rows and whether native scatter or
+the fused candidate disagrees with the independent CPU indexing oracle.
+A smoke report cannot authorize serving: the evidence gate still requires the
+complete original shape/dtype/mapping/replay matrix. Keep the original tolerance.

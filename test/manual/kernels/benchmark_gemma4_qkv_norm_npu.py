@@ -45,6 +45,7 @@ def main():
     torch.manual_seed(0)
     try:
         for name in names:
+            print(f"BEGIN candidate={name}", flush=True)
             try:
                 kwargs = (
                     {}
@@ -59,6 +60,13 @@ def main():
                     for head_dim in (128, 256, 512):
                         for tokens in args.tokens:
                             for shared in (False, True):
+                                report["current_case"] = {
+                                    "candidate": name,
+                                    "tokens": tokens,
+                                    "head_dim": head_dim,
+                                    "dtype": str(dtype),
+                                    "shared_kv": shared,
+                                }
                                 timings = validate(
                                     tokens,
                                     head_dim,
@@ -85,6 +93,7 @@ def main():
                 report["candidate_results"][name] = {
                     "complete": False,
                     "error": str(error),
+                    "case": report.get("current_case"),
                 }
                 print(f"Rejected {name}: {error}", flush=True)
         report["complete"] = True

@@ -8,6 +8,38 @@ import triton.language as tl
 
 
 @triton.jit
+def _rotate_rows(
+    X,
+    CACHE,
+    POS,
+    token,
+    head,
+    valid_token,
+    SX: tl.constexpr,
+    SC: tl.constexpr,
+    SP: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    cols = tl.arange(0, BLOCK)
+    valid = valid_token[:, None] & (cols[None, :] < D)
+    base = token[:, None] * SX + head[:, None] * D
+    mate = tl.where(cols < R // 2, cols + R // 2, cols - R // 2)
+    mate = tl.where(cols < R, mate, cols)
+    x = tl.load(X + base + cols[None, :], valid, 0).to(tl.float32)
+    y = tl.load(X + base + mate[None, :], valid, 0).to(tl.float32)
+    pos = tl.load(POS + token * SP, valid_token, 0)
+    angle = cols % (R // 2)
+    cos = tl.load(CACHE + pos[:, None] * SC + angle[None, :], valid, 1).to(tl.float32)
+    sin = tl.load(CACHE + pos[:, None] * SC + angle[None, :] + R // 2, valid, 0).to(
+        tl.float32
+    )
+    rotated = x * cos + tl.where(cols[None, :] < R // 2, -y, y) * sin
+    return tl.where(cols[None, :] < R, rotated, x)
+
+
+@triton.jit
 def _rope_kv_kernel(
     Q,
     K,
@@ -37,64 +69,53 @@ def _rope_kv_kernel(
     MAPPED: tl.constexpr,
     MAP_SIZE: tl.constexpr,
 ):
-    heads = QH + KH
+    q_tiles = tl.cdiv(M * QH, ROWS)
+    k_tiles = tl.cdiv(M * KH, ROWS)
     cols = tl.arange(0, BLOCK)
-    for start in range(tl.program_id(0) * ROWS, M * heads, tl.num_programs(0) * ROWS):
-        rows = start + tl.arange(0, ROWS)
-        token = rows // heads
-        head = rows % heads
-        is_q = head < QH
-        h = tl.where(is_q, head, head - QH)
-        valid = (token[:, None] < M) & (cols[None, :] < D)
-        qoff = token[:, None] * SQ + h[:, None] * D
-        koff = token[:, None] * SK + h[:, None] * D
-        mate = tl.where(cols < R // 2, cols + R // 2, cols - R // 2)
-        mate = tl.where(cols < R, mate, cols)
-        xq = tl.load(Q + qoff + cols[None, :], valid & is_q[:, None], 0).to(tl.float32)
-        xk = tl.load(K + koff + cols[None, :], valid & ~is_q[:, None], 0).to(tl.float32)
-        yq = tl.load(Q + qoff + mate[None, :], valid & is_q[:, None], 0).to(tl.float32)
-        yk = tl.load(K + koff + mate[None, :], valid & ~is_q[:, None], 0).to(tl.float32)
-        x = tl.where(is_q[:, None], xq, xk)
-        y = tl.where(is_q[:, None], yq, yk)
-        pos = tl.load(POS + token * SP, token < M, 0)
-        angle = cols % (R // 2)
-        cos = tl.load(CACHE + pos[:, None] * SC + angle[None, :], valid, 1).to(
-            tl.float32
-        )
-        sin = tl.load(CACHE + pos[:, None] * SC + angle[None, :] + R // 2, valid, 0).to(
-            tl.float32
-        )
-        rotated = x * cos + tl.where(cols[None, :] < R // 2, -y, y) * sin
-        out = tl.where(cols[None, :] < R, rotated, x)
-        tl.store(
-            QO + (token[:, None] * QH + h[:, None]) * D + cols[None, :],
-            out,
-            valid & is_q[:, None],
-        )
-        tl.store(
-            KO + (token[:, None] * KH + h[:, None]) * D + cols[None, :],
-            out,
-            valid & ~is_q[:, None],
-        )
-        slot = tl.load(LOC + token * SL, token < M, 0)
-        live_slot = slot > 0
-        if MAPPED:
-            slot = tl.load(MAP + slot, (token < M) & (slot >= 0) & (slot < MAP_SIZE), 0)
-        # Slot zero is reserved for padded graph rows; concurrent dummy writes race.
-        write = (
-            valid
-            & ~is_q[:, None]
-            & (live_slot[:, None] & (slot[:, None] > 0))
-            & (slot[:, None] < CAPACITY)
-        )
-        dest = (slot[:, None].to(tl.int64) * KH + h[:, None]) * D + cols[None, :]
-        value = tl.load(
-            V + token[:, None] * SV + h[:, None] * D + cols[None, :],
-            valid & ~is_q[:, None],
-            0,
-        )
-        tl.store(KC + dest, out, write)
-        tl.store(VC + dest, value, write)
+    for tile in range(tl.program_id(0), q_tiles + k_tiles, tl.num_programs(0)):
+        # Keep Q-only programs out of the cache-scatter address space entirely.
+        if tile < q_tiles:
+            rows = tile * ROWS + tl.arange(0, ROWS)
+            token, head = rows // QH, rows % QH
+            valid = (token[:, None] < M) & (cols[None, :] < D)
+            out = _rotate_rows(
+                Q, CACHE, POS, token, head, token < M, SQ, SC, SP, D, R, BLOCK
+            )
+            tl.store(
+                QO + (token[:, None] * QH + head[:, None]) * D + cols[None, :],
+                out,
+                valid,
+            )
+        else:
+            rows = (tile - q_tiles) * ROWS + tl.arange(0, ROWS)
+            token, head = rows // KH, rows % KH
+            valid = (token[:, None] < M) & (cols[None, :] < D)
+            out = _rotate_rows(
+                K, CACHE, POS, token, head, token < M, SK, SC, SP, D, R, BLOCK
+            )
+            tl.store(
+                KO + (token[:, None] * KH + head[:, None]) * D + cols[None, :],
+                out,
+                valid,
+            )
+            slot = tl.load(LOC + token * SL, token < M, 0)
+            live_slot = slot > 0
+            if MAPPED:
+                slot = tl.load(
+                    MAP + slot, (token < M) & (slot >= 0) & (slot < MAP_SIZE), 0
+                )
+            write = (
+                valid
+                & live_slot[:, None]
+                & (slot[:, None] > 0)
+                & (slot[:, None] < CAPACITY)
+            )
+            dest = (slot[:, None].to(tl.int64) * KH + head[:, None]) * D + cols[None, :]
+            value = tl.load(
+                V + token[:, None] * SV + head[:, None] * D + cols[None, :], valid, 0
+            )
+            tl.store(KC + dest, out, write)
+            tl.store(VC + dest, value, write)
 
 
 def gemma4_rope_kv_npu(
@@ -230,7 +251,9 @@ def _launch(
     slot_mapping=None,
 ):
     rows = 4
-    programs = min(cores, triton.cdiv(q.shape[0] * (qh + kh), rows))
+    programs = min(
+        cores, triton.cdiv(q.shape[0] * qh, rows) + triton.cdiv(q.shape[0] * kh, rows)
+    )
     _rope_kv_kernel[(programs,)](
         q,
         k,

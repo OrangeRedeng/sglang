@@ -19,9 +19,18 @@ SOURCES = (
     "test/manual/kernels/validate_gemma4_qkv_norm_npu.py",
     "test/manual/kernels/benchmark_gemma4_qkv_norm_npu.py",
     "test/manual/kernels/benchmark_gemma4_rope_kv_npu.py",
+    "test/manual/gemma4/candidate_validation.py",
 )
 QKV_TOKENS = (1, 12, 14, 15, 24, 128, 1235, 4096, 8192)
 ROPE_TOKENS = (0, 1, 15, 1235, 8192)
+
+
+def compile_case(fn):
+    """Each diagnostic case owns its compile cache, outside measured timing."""
+    import torch
+
+    torch.compiler.reset()
+    return torch.compile(fn, backend="eager", fullgraph=True)
 
 
 def source_hashes(root):

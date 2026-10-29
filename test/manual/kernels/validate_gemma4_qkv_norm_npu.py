@@ -4,11 +4,16 @@ Run with PYTHONPATH=python python3 test/manual/kernels/validate_gemma4_qkv_norm_
 """
 
 import statistics
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch_npu
 from sglang.srt.hardware_backend.npu.gemma4_ops import npu_gemma4_qkv_rmsnorm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from gemma4.candidate_validation import compile_case
 
 
 def validate(
@@ -67,8 +72,9 @@ def validate(
     run()
     torch.npu.synchronize()
     check()
-    compiled = torch.compile(run, backend="eager", fullgraph=True)
+    compiled = compile_case(run)
     work.copy_(source)
+    torch.npu.synchronize()
     compiled()
     torch.npu.synchronize()
     check()
@@ -77,11 +83,13 @@ def validate(
         torch_npu.npu.set_task_queue_enable(mode)
         graph = torch.npu.NPUGraph()
         work.copy_(source)
+        torch.npu.synchronize()
         with torch.npu.graph(graph):
             run()
         for _ in range(2):
             source.normal_()
             work.copy_(source)
+            torch.npu.synchronize()
             graph.replay()
             torch.npu.synchronize()
             check()
