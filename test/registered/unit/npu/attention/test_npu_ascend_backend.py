@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.test.ci.ci_register import register_npu_ci
+from torch.utils._python_dispatch import TorchDispatchMode
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
 
@@ -33,6 +33,123 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+
+class TestFiaLengthMetadata(unittest.TestCase):
+    def test_refreshes_plain_lengths_once_per_batch(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.page_size = 128
+        backend.use_mla = False
+        backend.use_sliding_window_kv_pool = False
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(3 * 512).reshape(3, 512)
+        )
+        for hybrid in (False, True):
+            backend.is_hybrid_swa = hybrid
+            backend.full_to_swa_index_mapping = torch.arange(3 * 512)
+            for lengths, extends in (([3, 4, 5], [2, 0, 1]), ([9, 10, 11], [0, 3, 2])):
+                with self.subTest(hybrid=hybrid, lengths=lengths):
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        seq_lens=torch.tensor(lengths),
+                        seq_lens_cpu=torch.tensor(lengths),
+                        spec_info=None,
+                        req_pool_indices=torch.arange(3),
+                        extend_seq_lens=torch.tensor(extends),
+                        extend_seq_lens_cpu=extends,
+                    )
+                    with patch(
+                        "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=False),
+                    ):
+                        backend.init_forward_metadata(batch)
+                    self.assertEqual(
+                        backend.forward_metadata.seq_lens_cpu_list, lengths
+                    )
+                    expected = [sum(extends[: i + 1]) for i in range(len(extends))]
+                    self.assertEqual(
+                        backend.forward_metadata.seq_lens_list_cumsum, expected
+                    )
+                    self.assertTrue(
+                        all(
+                            type(v) is int
+                            for v in backend.forward_metadata.seq_lens_list_cumsum
+                        )
+                    )
+
+    def test_tnd_adapters_do_not_extract_scalars_per_layer(self):
+        class CountScalars(TorchDispatchMode):
+            count = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._local_scalar_dense.default:
+                    self.count += 1
+                return func(*args, **(kwargs or {}))
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.use_fia = True
+        backend.is_dllm_model = False
+        backend.attn_cp_size = 1
+        backend.page_size = 128
+        backend.fia_mask = torch.ones(8, 8, dtype=torch.bool).triu_(1)
+        cache = torch.zeros(2, 128, 256)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            global_num_token_non_padded_cpu=3,
+            attn_cp_metadata=None,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            sliding_window_size=2,
+            qk_head_dim=256,
+            v_head_dim=256,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            scaling=256**-0.5,
+        )
+        q = torch.randn(3, 256)
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_list_cumsum=[2, 2, 3],
+            seq_lens_cpu_list=[3, 4, 5],
+            seq_lens_cpu_int=torch.tensor([3, 4, 5]),
+            block_tables=torch.zeros(3, 1, dtype=torch.int32),
+            block_tables_swa=torch.zeros(3, 1, dtype=torch.int32),
+        )
+
+        def fia(**kwargs):
+            lengths = kwargs.get(
+                "actual_seq_kvlen", kwargs.get("actual_seq_lengths_kv")
+            )
+            self.assertEqual(list(map(int, lengths)), [3, 4, 5])
+            queries = kwargs.get("actual_seq_qlen", kwargs.get("actual_seq_lengths"))
+            self.assertEqual(list(map(int, queries)), [2, 2, 3])
+            return kwargs["query"].clone(), None
+
+        for hybrid in (False, True):
+            backend.is_hybrid_swa = hybrid
+            name = (
+                "npu_fused_infer_attention_score_v2"
+                if hybrid
+                else "npu_fused_infer_attention_score"
+            )
+            with patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend.torch_npu."
+                + name,
+                side_effect=fia,
+            ):
+                with CountScalars() as mode:
+                    for _ in range(2):
+                        result = backend.forward_extend(
+                            q, None, None, layer, batch, False
+                        )
+                self.assertEqual(mode.count, 0)
+                torch.testing.assert_close(result, q)
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -194,7 +311,8 @@ class TestPagedPrefillMask(unittest.TestCase):
         backend.ascend_attn_mask_builder = self.builder
         backend.fia_mask = self.builder.fia_mask
         backend.forward_metadata = SimpleNamespace(
-            block_tables=torch.arange(23, dtype=torch.int32).reshape(1, -1)
+            block_tables=torch.arange(23, dtype=torch.int32).reshape(1, -1),
+            seq_lens_cpu_list=[2929],
         )
         cache = torch.zeros(23, 128, 512)
         backend.token_to_kv_pool = SimpleNamespace(
