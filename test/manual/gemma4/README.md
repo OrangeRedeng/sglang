@@ -15,7 +15,7 @@ Use the [three-launch Docker plan](docker_ab.md):
 | Order | Profile | Comparison |
 | --- | --- | --- |
 | 1 | `metadata` | Serial QKV, existing graphs and delayer |
-| 2 | `mtp-baseline` | Serial QKV, graphs/overlap off, memory0.82 |
+| 2 | `mtp-baseline` | Serial QKV, graphs/overlap/delayer off, memory0.82 |
 | 3 | `mtp` | Same as2 plus the matching assistant |
 
 Run three unprofiled repetitions per launch with the same random C24/RPS87/1600

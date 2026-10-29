@@ -23,7 +23,8 @@ after target-NPU launch crashes. No tiled validation report or row flag is neede
 
 Test1 keeps NPUs2/3, TP1/DP2, queue1, FIA, context8192, max-running64, token
 budgets8192, memory0.92, supplied graph buckets, and delayer0.5/50ms/4/cap6.
-Tests2/3 both disable graphs and overlap and use memory0.82. Compare2 against3
+Tests2/3 both disable graphs, overlap and the prefill delayer and use memory0.82.
+The delayer requires overlap scheduling. Compare2 against3
 to isolate MTP. Test3 additionally uses the matching assistant with NEXTN,
 steps3, top-k1 and draft width4. Validate fixed-prompt greedy outputs/logprobs,
 long-prefix SWA and shared KV before accepting MTP performance.

@@ -39,6 +39,7 @@ case "$profile" in
     r025-ms50-cap5) ratio=0.25; cap=5 ;;
     r025-ms25-cap5) ratio=0.25; delay=25; cap=5 ;;
     mtp-baseline|mtp)
+        delayer=0
         memory=0.82
         prefill_backend=disabled
         extra+=(--disable-overlap-schedule)
