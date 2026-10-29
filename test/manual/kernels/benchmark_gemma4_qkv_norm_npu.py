@@ -1,41 +1,18 @@
-"""Validate serial and tiled QKV norm candidates; no serving kernel is selected."""
+"""Validate opt-in serial and tiled QKV norm through the serving op boundary."""
 
 import argparse
 import json
+import sys
 from functools import partial
 from pathlib import Path
 
 import torch
 import torch_npu
-from sglang.kernels.ops.layernorm.gemma4_fused_ops import _gemma_qkv_rmsnorm_npu_tiled
-from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.hardware_backend.npu.gemma4_ops import npu_gemma4_qkv_rmsnorm
 from validate_gemma4_qkv_norm_npu import validate
 
-
-@register_custom_op(op_name="gemma4_qkv_norm_validation", mutates_args=["q", "k", "v"])
-def candidate(
-    q: torch.Tensor,
-    k: torch.Tensor | None,
-    v: torch.Tensor | None,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor | None,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    *,
-    rows: int,
-) -> None:
-    _gemma_qkv_rmsnorm_npu_tiled(
-        q,
-        k,
-        v,
-        q_weight,
-        k_weight,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        rows_per_program=rows,
-    )
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from gemma4.candidate_validation import new_report
 
 
 def main():
@@ -63,54 +40,64 @@ def main():
         if args.candidate == "all"
         else [args.candidate]
     )
-    report = {
-        "complete": False,
-        "serving_selected": False,
-        "torch": torch.__version__,
-        "torch_npu": torch_npu.__version__,
-        "cases": [],
-    }
+    report = new_report("qkv", torch, torch_npu)
+    report["candidate_results"] = {}
     torch.manual_seed(0)
     try:
         for name in names:
-            kwargs = (
-                {}
-                if name == "serial"
-                else {"norm": partial(candidate, rows=int(name[4:]))}
-            )
-            for dtype in (torch.float16, torch.bfloat16):
-                for head_dim in (128, 256, 512):
-                    for tokens in args.tokens:
-                        for shared in (False, True):
-                            timings = validate(
-                                tokens,
-                                head_dim,
-                                dtype,
-                                shared,
-                                samples=args.samples,
-                                **kwargs,
-                            )
-                            report["cases"].append(
-                                {
-                                    "candidate": name,
-                                    "dtype": str(dtype),
-                                    "head_dim": head_dim,
-                                    "tokens": tokens,
-                                    "shared_kv": shared,
-                                    "eager_correct": True,
-                                    "fullgraph_trace_correct": True,
-                                    "graph_replay_modes": [0, 1],
-                                    "timing": timings,
-                                }
-                            )
+            try:
+                kwargs = (
+                    {}
+                    if name == "serial"
+                    else {
+                        "norm": partial(
+                            npu_gemma4_qkv_rmsnorm, rows_per_program=int(name[4:])
+                        )
+                    }
+                )
+                for dtype in (torch.float16, torch.bfloat16):
+                    for head_dim in (128, 256, 512):
+                        for tokens in args.tokens:
+                            for shared in (False, True):
+                                timings = validate(
+                                    tokens,
+                                    head_dim,
+                                    dtype,
+                                    shared,
+                                    samples=args.samples,
+                                    **kwargs,
+                                )
+                                report["cases"].append(
+                                    {
+                                        "candidate": name,
+                                        "dtype": str(dtype),
+                                        "head_dim": head_dim,
+                                        "tokens": tokens,
+                                        "shared_kv": shared,
+                                        "eager_correct": True,
+                                        "fullgraph_trace_correct": True,
+                                        "graph_replay_modes": [0, 1],
+                                        "timing": timings,
+                                    }
+                                )
+                report["candidate_results"][name] = {"complete": True}
+            except (RuntimeError, AssertionError, ValueError) as error:
+                report["candidate_results"][name] = {
+                    "complete": False,
+                    "error": str(error),
+                }
+                print(f"Rejected {name}: {error}", flush=True)
         report["complete"] = True
     finally:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2))
     print(
-        f"Validated candidates: {args.output}; serving selection still requires identical-workload measurements"
+        f"Validation attempts completed: {args.output}; serving selection still requires identical-workload measurements"
+    )
+    return (
+        0 if any(row["complete"] for row in report["candidate_results"].values()) else 1
     )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

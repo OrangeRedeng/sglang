@@ -184,19 +184,19 @@ def launch_command(args, schedule):
         json.dumps(graph),
         "--trust-remote-code",
     ]
+    ratio, delay, cap = schedule if schedule is not None else SCHEDULES["base"]
+    cmd += [
+        "--prefill-delayer-queue-min-ratio",
+        str(ratio),
+        "--prefill-delayer-max-delay-ms",
+        str(delay),
+        "--prefill-delayer-max-delay-passes",
+        "4",
+        "--prefill-max-requests",
+        str(cap),
+    ]
     if schedule is not None:
-        ratio, delay, cap = schedule
-        cmd += [
-            "--enable-prefill-delayer",
-            "--prefill-delayer-queue-min-ratio",
-            str(ratio),
-            "--prefill-delayer-max-delay-ms",
-            str(delay),
-            "--prefill-delayer-max-delay-passes",
-            "4",
-            "--prefill-max-requests",
-            str(cap),
-        ]
+        cmd += ["--enable-prefill-delayer"]
     return cmd
 
 
@@ -240,16 +240,11 @@ def runtime_identity(args):
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
-    cann_files = [
-        Path("/usr/local/Ascend/cann/version.cfg"),
-        Path("/usr/local/Ascend/ascend-toolkit/latest/version.cfg"),
-    ]
-    if os.environ.get("ASCEND_HOME_PATH"):
-        cann_files.append(Path(os.environ["ASCEND_HOME_PATH"]) / "version.cfg")
+    from candidate_validation import cann_versions, triton_version
+
+    versions["triton"] = triton_version()
     return {
-        "cann_version_files": {
-            str(path): path.read_text() for path in cann_files if path.is_file()
-        },
+        "cann_version_files": cann_versions(),
         "benchmark_sha256": hashlib.sha256(args.bench_script.read_bytes()).hexdigest(),
         "commit": command_output(["git", "rev-parse", "HEAD"], args.server_root),
         "dirty": command_output(
@@ -291,6 +286,8 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "ASCEND_USE_FIA",
                         "PYTORCH_NPU_ALLOC_CONF",
                         "SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM",
+                        "SGLANG_NPU_GEMMA4_QKV_NORM_ROWS",
+                        "SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV",
                         "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },
@@ -455,6 +452,7 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                                 repeat=repeat + 1,
                                 schedule=schedule_name,
                                 qkv=args.qkv,
+                                rope_kv=args.rope_kv,
                                 measurement_kind="profiled"
                                 if args.phase == "profile"
                                 else "unprofiled",
@@ -509,7 +507,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--phase",
-        choices=["baseline", "acceptance", "scheduling", "profile"],
+        choices=["baseline", "candidate", "acceptance", "scheduling", "profile"],
         default="baseline",
     )
     p.add_argument("--server-root", type=Path, required=True)
@@ -520,7 +518,14 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--concurrency", type=int, choices=[24, 28, 29], default=28)
     p.add_argument("--schedule", choices=list(SCHEDULES), default="base")
-    p.add_argument("--qkv", choices=["native", "serial"], default="serial")
+    p.add_argument(
+        "--qkv",
+        choices=["native", "serial", "tile4", "tile8", "tile16"],
+        default="serial",
+    )
+    p.add_argument("--rope-kv", choices=["off", "on"], default="off")
+    p.add_argument("--qkv-validation", type=Path)
+    p.add_argument("--rope-validation", type=Path)
     p.add_argument("--port", type=int, default=30014)
     p.add_argument("--requests", type=int, default=256)
     p.add_argument("--warmups", type=int, default=32)
@@ -573,13 +578,49 @@ def main():
         ASCEND_USE_FIA="1",
         PYTORCH_NPU_ALLOC_CONF="expandable_segments:True",
         SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE="0",
-        SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM="1" if args.qkv == "serial" else "0",
+        SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM="0" if args.qkv == "native" else "1",
+        SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=args.qkv[4:]
+        if args.qkv.startswith("tile")
+        else "0",
+        SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV="1" if args.rope_kv == "on" else "0",
     )
     env["PYTHONPATH"] = (
         str(args.server_root / "python") + os.pathsep + env.get("PYTHONPATH", "")
     )
     if env.get("ASCEND_LAUNCH_BLOCKING") == "1":
         p.error("Unset ASCEND_LAUNCH_BLOCKING before performance measurements")
+    from candidate_validation import validate_report
+
+    if args.qkv.startswith("tile") or args.rope_kv == "on":
+        device = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import torch, torch_npu; print(torch.npu.get_device_name())",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        for required, kind, candidate, report in (
+            (args.qkv.startswith("tile"), "qkv", args.qkv, args.qkv_validation),
+            (args.rope_kv == "on", "rope_kv", "rope_kv", args.rope_validation),
+        ):
+            if required:
+                if report is None:
+                    p.error(
+                        f"{candidate} requires matching NPU --{kind.replace('_kv', '')}-validation evidence"
+                    )
+                validate_report(
+                    report,
+                    kind,
+                    candidate,
+                    args.server_root,
+                    identity["versions"],
+                    device,
+                    cann_versions=identity["cann_version_files"],
+                )
     schedules = list(SCHEDULES) if args.phase == "scheduling" else [args.schedule]
     concurrencies = [24, 28, 29] if args.phase == "baseline" else [args.concurrency]
     repeats = 3 if args.phase == "acceptance" else 1

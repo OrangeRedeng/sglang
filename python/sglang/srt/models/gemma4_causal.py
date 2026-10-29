@@ -14,6 +14,7 @@
 
 import logging
 import re
+from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -435,7 +436,15 @@ class Gemma4Attention(nn.Module):
                 npu_gemma4_qkv_rmsnorm,
             )
 
-            self._fused_qkv_norm = npu_gemma4_qkv_rmsnorm
+            rows = envs.SGLANG_NPU_GEMMA4_QKV_NORM_ROWS.get()
+            if rows not in (0, 4, 8, 16):
+                raise ValueError("Gemma4 QKV norm rows must be 0, 4, 8, or 16")
+            self._fused_qkv_norm = partial(
+                npu_gemma4_qkv_rmsnorm, rows_per_program=rows
+            )
+        self._use_npu_rope_kv = (
+            _is_npu and envs.SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV.get()
+        )
 
         if layer_type in config.rope_parameters:
             rope_parameters = dict(config.rope_parameters[layer_type])
@@ -564,6 +573,15 @@ class Gemma4Attention(nn.Module):
         use_fused_kv = False
         if k is not None:
             k = k.flatten(-2, -1)
+            fused_result = None
+            if self._use_npu_rope_kv:
+                from sglang.srt.hardware_backend.npu.gemma4_ops import (
+                    try_npu_gemma4_rope_kv,
+                )
+
+                fused_result = try_npu_gemma4_rope_kv(
+                    self.rotary_emb, positions, q, k, v, self.attn, forward_batch
+                )
             # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
             # DISABLED: causes accuracy regression in launch_server path
             can_fuse = False
@@ -576,7 +594,11 @@ class Gemma4Attention(nn.Module):
                 use_fused_kv = True
             else:
                 fused_arg = None
-            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
+            if fused_result is None:
+                q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
+            else:
+                q, k = fused_result
+                use_fused_kv = True
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer

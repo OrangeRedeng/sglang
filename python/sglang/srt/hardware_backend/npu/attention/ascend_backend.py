@@ -427,16 +427,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
-        self.is_hybrid_swa = model_runner.is_hybrid_swa
-        if self.is_hybrid_swa:
-            self.full_to_swa_index_mapping = (
-                model_runner.token_to_kv_pool.full_to_swa_index_mapping
-            )
-            self.sliding_window_size = model_runner.sliding_window_size
-        self.use_sliding_window_kv_pool = (
-            isinstance(self.token_to_kv_pool, SWAKVPool)
-            and self.token_to_kv_pool.swa_layer_nums > 0
-        )
+        self._init_swa_metadata(model_runner)
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -459,6 +450,25 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
+
+    def _init_swa_metadata(self, model_runner: ModelRunner) -> None:
+        pool = self.token_to_kv_pool
+        frozen_draft = (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
+        if frozen_draft:
+            # The assistant's dummy pool does not describe the target KV it reads.
+            pool = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        self.use_sliding_window_kv_pool = (
+            isinstance(pool, SWAKVPool) and pool.swa_layer_nums > 0
+        )
+        self.is_hybrid_swa = model_runner.is_hybrid_swa or (
+            frozen_draft and self.use_sliding_window_kv_pool
+        )
+        if self.is_hybrid_swa:
+            self.full_to_swa_index_mapping = pool.full_to_swa_index_mapping
+            self.sliding_window_size = model_runner.sliding_window_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (

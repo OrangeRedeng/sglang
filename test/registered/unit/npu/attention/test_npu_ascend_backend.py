@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 from torch.utils._python_dispatch import TorchDispatchMode
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
@@ -33,7 +34,68 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+
+class TestFrozenKvSwaMetadata(CustomTestCase):
+    def test_assistant_reads_target_swa_pages_instead_of_full_pages(self):
+        """A dummy assistant pool must not hide the target's SWA page mapping."""
+        target_pool = MagicMock(spec=SWAKVPool)
+        target_pool.swa_layer_nums = 3
+        target_pool.full_to_swa_index_mapping = torch.arange(16) + 16
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen):
+                backend = object.__new__(AscendAttnBackend)
+                backend.token_to_kv_pool = object()
+                backend.page_size = 4
+                backend.use_mla = False
+                backend.device = "cpu"
+                backend.req_to_token_pool = SimpleNamespace(
+                    req_to_token=torch.arange(16).reshape(2, 8)
+                )
+                runner = SimpleNamespace(
+                    is_draft_worker=True,
+                    is_hybrid_swa=False,
+                    sliding_window_size=3,
+                    spec_algorithm=SimpleNamespace(
+                        is_frozen_kv_mtp=MagicMock(return_value=frozen)
+                    ),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        get_kvcache=lambda: target_pool
+                    ),
+                )
+                backend._init_swa_metadata(runner)
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    seq_lens=torch.tensor([7, 8]),
+                    seq_lens_cpu=torch.tensor([7, 8]),
+                    spec_info=None,
+                    req_pool_indices=torch.arange(2),
+                    extend_seq_lens=None,
+                    extend_seq_lens_cpu=None,
+                    out_cache_loc=None,
+                )
+                with patch(
+                    "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ):
+                    backend.init_forward_metadata(batch)
+                self.assertEqual(backend.is_hybrid_swa, frozen)
+                self.assertEqual(
+                    backend._is_swa_layer(SimpleNamespace(sliding_window_size=3)),
+                    frozen,
+                )
+                self.assertEqual(
+                    backend.forward_metadata.block_tables.tolist(), [[0, 1], [2, 3]]
+                )
+                if frozen:
+                    self.assertEqual(
+                        backend.forward_metadata.block_tables_swa.tolist(),
+                        [[4, 5], [6, 7]],
+                    )
+                else:
+                    self.assertIsNone(backend.forward_metadata.block_tables_swa)
 
 
 class TestFiaLengthMetadata(unittest.TestCase):

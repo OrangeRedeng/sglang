@@ -23,6 +23,56 @@ def rpc(url, body=None):
     return result
 
 
+def interval_union(intervals):
+    total, end = 0.0, None
+    for start, stop in sorted(intervals):
+        if end is None or start > end:
+            total += stop - start
+        elif stop > end:
+            total += stop - end
+        end = max(end, stop) if end is not None else stop
+    return total
+
+
+def trace_timing(events):
+    groups = {
+        name: [] for name in ("device", "synchronization", "graph", "profiler_export")
+    }
+    calls = Counter()
+    for event in events:
+        name = event.get("name", "")
+        if event.get("cat") == "cpu_op":
+            for op in ("npu_gemma4_rope_kv", "npu_gemma4_qkv_rmsnorm"):
+                if op in name:
+                    calls[op] += 1
+        if event.get("ph") != "X" or not isinstance(event.get("dur"), (int, float)):
+            continue
+        span = (event["ts"], event["ts"] + event["dur"])
+        lower = name.lower()
+        if event.get("cat", "").lower() in ("kernel", "aicore", "ai_core"):
+            groups["device"].append(span)
+        if "synchroniz" in lower:
+            groups["synchronization"].append(span)
+        if "graph" in lower and ("npu" in lower or "acl" in lower):
+            groups["graph"].append(span)
+        if "profiler" in lower or "export_chrome_trace" in lower:
+            groups["profiler_export"].append(span)
+    device = groups["device"]
+    window = (
+        max(stop for _, stop in device) - min(start for start, _ in device)
+        if device
+        else None
+    )
+    return {
+        "union_us": {name: interval_union(spans) for name, spans in groups.items()},
+        "gaps_between_device_events_us": window - interval_union(device)
+        if device
+        else None,
+        "candidate_host_calls": dict(calls),
+        "note": "Per-trace unions, not sums of nested CPU durations. Gaps are unassigned, not recoverable dispatch time; categories can overlap.",
+    }
+
+
 def summarize(output):
     reports = []
     for path in sorted(output.glob("**/ASCEND_PROFILER_OUTPUT/trace_view.json")):
@@ -40,9 +90,18 @@ def summarize(output):
         )
         details = path.parent / "kernel_details.csv"
         devices = []
+        launches = Counter()
+        candidates = {"rope_kv": Counter(), "qkv_tiled": Counter()}
         if details.is_file():
             with details.open() as f:
-                devices = sorted({row["Device_id"] for row in csv.DictReader(f)})
+                for row in csv.DictReader(f):
+                    launches[row["Device_id"]] += 1
+                    name = row.get("Name", "")
+                    if "rope_kv_kernel" in name:
+                        candidates["rope_kv"][row["Device_id"]] += 1
+                    if "qkv_rmsnorm_npu_tiled_kernel" in name:
+                        candidates["qkv_tiled"][row["Device_id"]] += 1
+            devices = sorted(launches)
         top = []
         stat = path.parent / "op_statistic.csv"
         if stat.is_file():
@@ -58,6 +117,11 @@ def summarize(output):
                 "observed_steps": dict(stages),
                 "step_labels": steps,
                 "top_device_ops": top,
+                "kernel_detail_rows_per_device": dict(launches),
+                "candidate_kernel_rows": {
+                    name: dict(counts) for name, counts in candidates.items()
+                },
+                "timing": trace_timing(events),
             }
         )
     return reports

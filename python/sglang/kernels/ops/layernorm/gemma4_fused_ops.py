@@ -370,7 +370,7 @@ def _gemma_qkv_rmsnorm_npu_tiled(
     *,
     rows_per_program,
 ):
-    """Validation-only candidate; serving keeps the measured baseline kernel."""
+    """Opt-in tiled candidate; the serial kernel remains the default."""
     assert q.device.type in ("npu", "privateuseone")
     assert rows_per_program in (4, 8, 16)
     assert q.ndim == 2 and q.shape[1] == num_q_heads * head_dim

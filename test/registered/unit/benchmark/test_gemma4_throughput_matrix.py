@@ -2,11 +2,14 @@
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -23,6 +26,99 @@ def load(name):
 matrix = load("throughput_matrix")
 profiles = load("collect_profile")
 quality = load("quality_check")
+validation = load("candidate_validation")
+with patch.dict(
+    sys.modules, {"candidate_validation": validation, "throughput_matrix": matrix}
+):
+    plan = load("run_plan")
+
+
+class TestCandidateEvidence(CustomTestCase):
+    def test_stale_runtime_and_partial_cases_cannot_select_a_kernel(self):
+        """A correctness report must match the code, runtime and complete case matrix."""
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            for name in validation.SOURCES:
+                path = directory / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("original")
+            versions = {"torch": "2.10", "torch_npu": "2.10.post7"}
+            report = {
+                "kind": "qkv",
+                "complete": True,
+                "source_sha256": validation.source_hashes(directory),
+                **versions,
+                "device_name": "test-npu",
+                "cases": [],
+            }
+            for dtype in ("torch.float16", "torch.bfloat16"):
+                for dim in (128, 256, 512):
+                    for tokens in validation.QKV_TOKENS:
+                        for shared in (False, True):
+                            report["cases"].append(
+                                {
+                                    "candidate": "tile8",
+                                    "dtype": dtype,
+                                    "head_dim": dim,
+                                    "tokens": tokens,
+                                    "shared_kv": shared,
+                                    "eager_correct": True,
+                                    "fullgraph_trace_correct": True,
+                                    "graph_replay_modes": [0, 1],
+                                }
+                            )
+            path = directory / "report.json"
+
+            def check(data):
+                path.write_text(json.dumps(data))
+                return validation.validate_report(
+                    path, "qkv", "tile8", directory, versions, "test-npu"
+                )
+
+            check(report)
+            for changed in (
+                {**report, "complete": False},
+                {**report, "kind": "cpu_diagnostic"},
+                {**report, "torch_npu": "older"},
+                {**report, "device_name": "other"},
+                {**report, "cases": report["cases"][:-1]},
+            ):
+                with self.assertRaises(ValueError):
+                    check(changed)
+            (directory / validation.SOURCES[0]).write_text("modified")
+            with self.assertRaises(ValueError):
+                check(report)
+
+    def test_exploratory_ranking_cannot_hide_missing_or_profiled_cases(self):
+        rows = [
+            {
+                "scenario": scenario,
+                "case": case,
+                "completed_rps": rate,
+                "metrics_ms": matrix.TARGETS[scenario][1],
+                "checks": {"completed": True, "failed": True, "output_tokens": True},
+                "measurement_kind": "unprofiled",
+            }
+            for scenario, (rate, _) in matrix.TARGETS.items()
+            for case in matrix.CASES
+        ]
+        self.assertAlmostEqual(plan.exploratory_score(rows), 1.0)
+        self.assertIsNone(plan.exploratory_score(rows[:-1]))
+        self.assertIsNone(plan.exploratory_score(rows[:-1] + [rows[0]]))
+        rows[0]["measurement_kind"] = "profiled"
+        self.assertIsNone(plan.exploratory_score(rows))
+
+    def test_overlapping_cpu_intervals_are_not_summed_as_wall_time(self):
+        events = [
+            {"name": "aclSynchronize", "ts": 0, "dur": 10, "ph": "X"},
+            {"name": "aclSynchronizeStream", "ts": 2, "dur": 5, "ph": "X"},
+            {"name": "op1", "cat": "kernel", "ts": 0, "dur": 4, "ph": "X"},
+            {"name": "op2", "cat": "kernel", "ts": 8, "dur": 2, "ph": "X"},
+        ]
+        timing = profiles.trace_timing(events)
+        self.assertEqual(timing["union_us"]["synchronization"], 10)
+        self.assertEqual(timing["union_us"]["device"], 6)
+        self.assertEqual(timing["gaps_between_device_events_us"], 4)
 
 
 class TestAcceptance(unittest.TestCase):
