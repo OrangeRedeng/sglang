@@ -399,19 +399,6 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="attention.gemma4_rope_kv_npu",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.gemma4_rope_kv_npu:gemma4_rope_kv_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-        format_signature=FormatSignature(
-            supported_dtypes=("float16", "bfloat16"),
-            in_place=True,
-            description="Experimental Gemma NeoX RoPE and ND KV write with optional SWA slot mapping.",
-        ),
-    )
-)
-register_kernel(
-    KernelSpec(
         op="attention.gemma_qkv_norm_rope",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",

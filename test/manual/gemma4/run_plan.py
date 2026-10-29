@@ -160,7 +160,6 @@ def main():
         phase,
         *,
         qkv="serial",
-        rope="off",
         concurrency=28,
         schedule="base",
         quality=None,
@@ -192,8 +191,6 @@ def main():
             str(destination),
             "--qkv",
             qkv,
-            "--rope-kv",
-            rope,
             "--concurrency",
             str(concurrency),
             "--schedule",
@@ -203,8 +200,6 @@ def main():
             cmd += ["--quality-baseline", str(quality)]
         if qkv.startswith("tile"):
             cmd += ["--qkv-validation", str(args.output / "qkv-validation.json")]
-        if rope == "on":
-            cmd += ["--rope-validation", str(args.output / "rope-validation.json")]
         ok = run(name, cmd)
         environment_path = destination / "environment.json"
         if environment_path.exists():
@@ -251,7 +246,7 @@ def main():
     if not valid:
         raise RuntimeError("No complete metadata concurrency result")
     _, concurrency = max(valid)
-    best = {"qkv": "serial", "rope": "off", "schedule": "base"}
+    best = {"qkv": "serial", "schedule": "base"}
     best_rows = [r for r in metadata["results"] if r["concurrency"] == concurrency]
     score = exploratory_score(best_rows)
 
@@ -302,26 +297,6 @@ def main():
                 quality=quality,
             )
             consider(f"02-{tile}", report, {**best, "qkv": tile})
-    rope_ok = run(
-        "03-rope-correctness",
-        [
-            sys.executable,
-            str(kernels / "benchmark_gemma4_rope_kv_npu.py"),
-            "--output",
-            str(args.output / "rope-validation.json"),
-        ],
-    )
-    if rope_ok:
-        report = matrix(
-            "03-rope-serving",
-            args.server_root,
-            "candidate",
-            qkv=best["qkv"],
-            rope="on",
-            concurrency=concurrency,
-            quality=quality,
-        )
-        consider("03-rope-serving", report, {**best, "rope": "on"})
     record(
         round="04-glm-audit",
         decision="no-additional-port",
@@ -333,7 +308,6 @@ def main():
         args.server_root,
         "baseline",
         qkv=best["qkv"],
-        rope=best["rope"],
         quality=quality,
     )
     if retuned is None:
@@ -372,7 +346,6 @@ def main():
             args.server_root,
             "candidate",
             qkv=fixed["qkv"],
-            rope=fixed["rope"],
             concurrency=concurrency,
             schedule=schedule,
             quality=quality,
@@ -399,7 +372,6 @@ def main():
         args.server_root,
         "profile",
         qkv=best["qkv"],
-        rope=best["rope"],
         concurrency=concurrency,
         schedule=best["schedule"],
         quality=quality,
@@ -419,13 +391,12 @@ def main():
         args.server_root,
         "acceptance",
         qkv=best["qkv"],
-        rope=best["rope"],
         concurrency=concurrency,
         schedule=best["schedule"],
         quality=quality,
     )
     rows = accepted["results"] if accepted else []
-    executed = {"rope_kv": set(), "qkv_tiled": set()}
+    executed = {"qkv_tiled": set()}
     for path in (args.output / "06-profile-timing").rglob("coverage.json"):
         for report in json.loads(path.read_text()).get("reports", []):
             for name, devices in report.get("candidate_kernel_rows", {}).items():
@@ -433,9 +404,9 @@ def main():
                     executed[name].update(
                         device for device, count in devices.items() if count > 0
                     )
-    execution_verified = (
-        best["rope"] == "off" or executed["rope_kv"] == {"2", "3"}
-    ) and (not best["qkv"].startswith("tile") or executed["qkv_tiled"] == {"2", "3"})
+    execution_verified = not best["qkv"].startswith("tile") or executed[
+        "qkv_tiled"
+    ] == {"2", "3"}
     baseline_rows = [r for r in baseline["results"] if r["concurrency"] == concurrency]
     baseline_score = exploratory_score(baseline_rows)
     passed = bool(

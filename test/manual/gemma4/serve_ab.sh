@@ -16,7 +16,6 @@ python=${GEMMA_PYTHON:-python3}
 evidence=${GEMMA_EVIDENCE_DIR:-$root/.codex-artifacts/gemma4-ab}
 rows=0
 norm=1
-rope=0
 ratio=0.5
 delay=50
 cap=6
@@ -30,11 +29,9 @@ case "$profile" in
     metadata) ;;
     native) norm=0 ;;
     tile4|tile8|tile16) rows=${profile#tile} ;;
-    rope-kv) rope=1 ;;
     combined|combined-mtp|combined-mtp-baseline)
         rows=${GEMMA_QKV_ROWS:?Set GEMMA_QKV_ROWS to the chosen tile (4, 8 or 16)}
         case "$rows" in 4|8|16) ;; *) echo 'Invalid GEMMA_QKV_ROWS' >&2; exit 2 ;; esac
-        rope=1
         ;;
     eager-prefill) prefill_backend=disabled ;;
     delayer-off) delayer=0 ;;
@@ -79,7 +76,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE=0
 export SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=$norm
 export SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=$rows
-export SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV=$rope
 export PYTHONPATH="$server_root/python${PYTHONPATH:+:$PYTHONPATH}"
 
 decode='{"backend":"full","bs":[1,2,4,8,12,15,16,24,28,32,48,64]}'
@@ -105,7 +101,7 @@ fi
 cmd+=("${extra[@]}")
 
 printf 'Profile=%s source=%q\n' "$profile" "$server_root"
-printf 'TASK_QUEUE_ENABLE=1 QKV_NORM=%s QKV_ROWS=%s ROPE_KV=%s\n' "$norm" "$rows" "$rope"
+printf 'TASK_QUEUE_ENABLE=1 QKV_NORM=%s QKV_ROWS=%s\n' "$norm" "$rows"
 printf '%q ' "${cmd[@]}"
 printf '\n'
 if [[ "$print_only" == --print ]]; then
@@ -124,8 +120,8 @@ fi
 if [[ "$profile" == mtp || "$profile" == combined-mtp ]]; then
     [[ -f "$assistant/config.json" ]] || { echo 'Missing matching assistant checkpoint' >&2; exit 2; }
 fi
-if (( rows > 0 || rope > 0 )); then
-    "$python" - "$root" "$evidence" "$rows" "$rope" <<'PY'
+if (( rows > 0 )); then
+    "$python" - "$root" "$evidence" "$rows" <<'PY'
 import importlib.metadata
 import sys
 from pathlib import Path
@@ -141,7 +137,6 @@ versions = {"torch": torch.__version__, "torch_npu": torch_npu.__version__,
             "sgl_kernel_npu": importlib.metadata.version("sgl_kernel_npu"), "triton": triton_version()}
 for required, kind, candidate, filename in (
     (int(sys.argv[3]) > 0, "qkv", "tile" + sys.argv[3], "qkv-validation.json"),
-    (int(sys.argv[4]) > 0, "rope_kv", "rope_kv", "rope-validation.json"),
 ):
     if required:
         validate_report(evidence / filename, kind, candidate, root, versions,

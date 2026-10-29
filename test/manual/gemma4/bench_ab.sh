@@ -5,7 +5,7 @@ set -euo pipefail
 profile=${1:?Usage: bench_ab.sh PROFILE RUN [--print]}
 run=${2:?Usage: bench_ab.sh PROFILE RUN [--print]}
 case "$profile" in
-    baseline|metadata-only|metadata|native|tile4|tile8|tile16|rope-kv|combined|combined-mtp|combined-mtp-baseline|eager-prefill|delayer-off|ratio025|delay25|cap5|mtp-baseline|mtp|r025-ms50-cap6|r025-ms25-cap6|r05-ms25-cap6|r05-ms25-cap5|r05-ms50-cap5|r025-ms50-cap5|r025-ms25-cap5) ;;
+    baseline|metadata-only|metadata|native|tile4|tile8|tile16|combined|combined-mtp|combined-mtp-baseline|eager-prefill|delayer-off|ratio025|delay25|cap5|mtp-baseline|mtp|r025-ms50-cap6|r025-ms25-cap6|r05-ms25-cap6|r05-ms25-cap5|r05-ms50-cap5|r025-ms50-cap5|r025-ms25-cap5) ;;
     *) echo 'Unknown benchmark profile' >&2; exit 2 ;;
 esac
 [[ "$run" =~ ^[1-9][0-9]*$ ]] || { echo 'RUN must be a positive integer' >&2; exit 2; }

@@ -287,7 +287,6 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "PYTORCH_NPU_ALLOC_CONF",
                         "SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM",
                         "SGLANG_NPU_GEMMA4_QKV_NORM_ROWS",
-                        "SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV",
                         "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },
@@ -452,7 +451,6 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                                 repeat=repeat + 1,
                                 schedule=schedule_name,
                                 qkv=args.qkv,
-                                rope_kv=args.rope_kv,
                                 measurement_kind="profiled"
                                 if args.phase == "profile"
                                 else "unprofiled",
@@ -523,9 +521,7 @@ def main():
         choices=["native", "serial", "tile4", "tile8", "tile16"],
         default="serial",
     )
-    p.add_argument("--rope-kv", choices=["off", "on"], default="off")
     p.add_argument("--qkv-validation", type=Path)
-    p.add_argument("--rope-validation", type=Path)
     p.add_argument("--port", type=int, default=30014)
     p.add_argument("--requests", type=int, default=256)
     p.add_argument("--warmups", type=int, default=32)
@@ -582,7 +578,6 @@ def main():
         SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=args.qkv[4:]
         if args.qkv.startswith("tile")
         else "0",
-        SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV="1" if args.rope_kv == "on" else "0",
     )
     env["PYTHONPATH"] = (
         str(args.server_root / "python") + os.pathsep + env.get("PYTHONPATH", "")
@@ -591,7 +586,7 @@ def main():
         p.error("Unset ASCEND_LAUNCH_BLOCKING before performance measurements")
     from candidate_validation import validate_report
 
-    if args.qkv.startswith("tile") or args.rope_kv == "on":
+    if args.qkv.startswith("tile"):
         device = subprocess.run(
             [
                 sys.executable,
@@ -605,7 +600,6 @@ def main():
         ).stdout.strip()
         for required, kind, candidate, report in (
             (args.qkv.startswith("tile"), "qkv", args.qkv, args.qkv_validation),
-            (args.rope_kv == "on", "rope_kv", "rope_kv", args.rope_validation),
         ):
             if required:
                 if report is None:

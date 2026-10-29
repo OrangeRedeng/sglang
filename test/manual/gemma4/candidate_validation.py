@@ -8,7 +8,6 @@ from pathlib import Path
 
 SOURCES = (
     "python/sglang/kernels/ops/layernorm/gemma4_fused_ops.py",
-    "python/sglang/kernels/ops/attention/gemma4_rope_kv_npu.py",
     "python/sglang/srt/hardware_backend/npu/gemma4_ops.py",
     "python/sglang/srt/models/gemma4_causal.py",
     "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py",
@@ -18,11 +17,9 @@ SOURCES = (
     "python/sglang/srt/layers/rotary_embedding/rope_variant.py",
     "test/manual/kernels/validate_gemma4_qkv_norm_npu.py",
     "test/manual/kernels/benchmark_gemma4_qkv_norm_npu.py",
-    "test/manual/kernels/benchmark_gemma4_rope_kv_npu.py",
     "test/manual/gemma4/candidate_validation.py",
 )
 QKV_TOKENS = (1, 12, 14, 15, 24, 128, 1235, 4096, 8192)
-ROPE_TOKENS = (0, 1, 15, 1235, 8192)
 
 
 def compile_case(fn):
@@ -89,6 +86,8 @@ def new_report(kind, torch, torch_npu):
 def validate_report(
     path, kind, candidate, root, versions, device_name, *, cann_versions=None
 ):
+    if kind != "qkv":
+        raise ValueError("Only QKV candidates are supported")
     report = json.loads(Path(path).read_text())
     if cann_versions is not None and not cann_versions:
         raise ValueError(
@@ -122,10 +121,9 @@ def validate_report(
     required = set()
     for dtype in ("torch.float16", "torch.bfloat16"):
         for dim in (128, 256, 512):
-            for tokens in QKV_TOKENS if kind == "qkv" else ROPE_TOKENS:
+            for tokens in QKV_TOKENS:
                 for variant in (False, True):
-                    for cache_fp32 in (False, True) if kind == "rope_kv" else (None,):
-                        required.add((dtype, dim, tokens, variant, cache_fp32))
+                    required.add((dtype, dim, tokens, variant, None))
     observed = set()
     for row in report.get("cases", []):
         if row.get("candidate") != candidate:
@@ -141,8 +139,8 @@ def validate_report(
                 row["dtype"],
                 row["head_dim"],
                 row["tokens"],
-                row["shared_kv"] if kind == "qkv" else row["mapped"],
-                None if kind == "qkv" else row["cache_fp32"],
+                row["shared_kv"],
+                None,
             )
         )
     if not required.issubset(observed):

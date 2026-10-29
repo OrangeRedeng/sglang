@@ -42,7 +42,7 @@ def trace_timing(events):
     for event in events:
         name = event.get("name", "")
         if event.get("cat") == "cpu_op":
-            for op in ("npu_gemma4_rope_kv", "npu_gemma4_qkv_rmsnorm"):
+            for op in ("npu_gemma4_qkv_rmsnorm",):
                 if op in name:
                     calls[op] += 1
         if event.get("ph") != "X" or not isinstance(event.get("dur"), (int, float)):
@@ -91,14 +91,12 @@ def summarize(output):
         details = path.parent / "kernel_details.csv"
         devices = []
         launches = Counter()
-        candidates = {"rope_kv": Counter(), "qkv_tiled": Counter()}
+        candidates = {"qkv_tiled": Counter()}
         if details.is_file():
             with details.open() as f:
                 for row in csv.DictReader(f):
                     launches[row["Device_id"]] += 1
                     name = row.get("Name", "")
-                    if "rope_kv_kernel" in name:
-                        candidates["rope_kv"][row["Device_id"]] += 1
                     if "qkv_rmsnorm_npu_tiled_kernel" in name:
                         candidates["qkv_tiled"][row["Device_id"]] += 1
             devices = sorted(launches)

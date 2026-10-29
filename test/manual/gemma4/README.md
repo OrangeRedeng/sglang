@@ -5,7 +5,7 @@ for all four cases each, with total concurrency below 30. Preserve checkpoint
 precision, datasets, output lengths and scenario latency SLOs. No draft model.
 
 This change implements host length-list reuse and hoists repeated BSND cache
-views. Tiled QKV and RoPE/KV-write candidates are **opt-in**, with baseline defaults
+views. Tiled QKV candidates are **opt-in**, with baseline defaults
 unchanged. The matrix runner requires complete, matching NPU correctness and
 graph-replay reports before it launches a candidate. Source hashes, CANN,
 torch/torch_npu, sgl-kernel-npu, Triton and NPU model must match. CPU diagnostics
@@ -105,40 +105,8 @@ The direct expert toggle is `SGLANG_NPU_GEMMA4_QKV_NORM_ROWS=4|8|16`, with the
 existing fusion flag enabled; zero retains the serial implementation. Do not
 set the toggle outside controlled validation before correctness has passed.
 
-## Round 3: RoPE and KV-write fusion
-
-With serving stopped:
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=2 PYTHONPATH="$GEMMA_ROOT/python" \
-python3 "$GEMMA_ROOT/test/manual/kernels/benchmark_gemma4_rope_kv_npu.py" \
-  --output "$GEMMA_RUNS/rope-validation.json"
-```
-
-The candidate combines NeoX rotation and two KV scatters into one vector kernel.
-It preserves the Gemma angle cache, including the identity columns for
-proportional rotation, and writes the already-normalized V unchanged. Live SWA
-mapping is read by the kernel so changing slot mappings are observed on replay.
-Shared-KV layers retain the Q-only baseline. Unsupported cache layouts, scaled
-KV, DCP and nonstandard rotary subclasses retain the unfused path.
-
-Validation covers FP16/BF16, full/SWA slots, strided QKV, long-prefix positions,
-zero-token inputs, padding, untouched cache rows, changing positions/mappings,
-fullgraph tracing and NPUGraph replay in queue modes0/1. Run a serving candidate
-with `--rope-kv on --rope-validation "$GEMMA_RUNS/rope-validation.json"` and a new
-output directory. The expert toggle `SGLANG_ENABLE_NPU_GEMMA4_ROPE_KV` defaults
-false and affects ordinary prefill only. Full/decode attention semantics and
-prefix masks are unchanged.
-
-For CPU indexing diagnostics only:
-
-```bash
-SGLANG_USE_CPU_ENGINE=1 TRITON_INTERPRET=1 PYTHONPATH=python \
-python3 test/manual/kernels/benchmark_gemma4_rope_kv_npu.py \
-  --cpu --tokens 0 1 15 --samples 1 --output /tmp/gemma-rope-cpu.json
-```
-
-This emits a `cpu_diagnostic` report rejected by the serving evidence gate.
+The experimental RoPE/KV-write candidate was removed after a target-NPU crash.
+Standard rotary embedding and KV writes remain in use.
 
 ## Bounded profiles
 
@@ -230,7 +198,6 @@ Use a clean source checkout and a new output directory. The runner executes:
 
 1. Pinned TP1/DP2 baseline, then metadata candidate at C24/C28/C29.
 2. Native versus serial QKV, full operator validation, and serving trials of tiles4/8/16.
-3. RoPE/KV correctness/replay validation, then a serving trial if validation passes.
 4. The pinned GLM compatibility audit, retaining existing precision/INT8/GeGLU contracts.
 5. Disabled delaying and the one-knob scheduling grid, with kernel settings fixed.
 6. Separate timing and shape diagnostic profiles, followed by all eight cases in three unprofiled repetitions.
