@@ -281,3 +281,5 @@ candidate default is changed automatically. Hardware execution and acceptance
 remain pending until this command has actually completed on the NPU server.
 
 For separately managed Docker containers and the fixed vLLM random C24 benchmark, see [docker_ab.md](docker_ab.md). It includes isolated kernel, scheduling and matched MTP/non-MTP commands.
+
+For the matched eager/piecewise MTP prefill trial, see [mtp.md](mtp.md#piecewise-prefill-trial).

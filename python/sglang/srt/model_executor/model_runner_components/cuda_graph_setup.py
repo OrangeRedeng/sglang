@@ -481,6 +481,18 @@ def capture_prefill_graph(
             return result(eager_runner)
         return result(None)
 
+    is_npu_frozen_kv = (
+        getattr(model_runner, "device", None) == "npu"
+        and model_runner.spec_algorithm.is_frozen_kv_mtp()
+    )
+    if (
+        is_npu_frozen_kv
+        and model_runner.is_draft_worker
+        and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+    ):
+        # Frozen assistants only select a target-prefill seed; they do not prefill.
+        return result(None)
+
     # Draft models skip here during __init__; the eagle worker calls
     # this method explicitly (force_for_draft_worker=True) after
     # init_lm_head so graphs capture the final embedding weights.
@@ -492,10 +504,12 @@ def capture_prefill_graph(
     # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
     # state and corrupt decode replay (see #28386 and #28870). BCG and FullCG
     # capture FULL for EAGLE targets in PrefillCudaGraphRunner.__init__, so
-    # they do not need this skip.
+    # they do not need this skip. Frozen-KV NPU targets also capture FULL and
+    # keep attention eager between pieces, so permit their prefill path.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
+        and not is_npu_frozen_kv
         and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
     ):

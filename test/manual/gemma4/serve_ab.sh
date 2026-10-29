@@ -41,12 +41,16 @@ case "$profile" in
     r05-ms50-cap5) cap=5 ;;
     r025-ms50-cap5) ratio=0.25; cap=5 ;;
     r025-ms25-cap5) ratio=0.25; delay=25; cap=5 ;;
-    mtp-baseline|mtp|mtp-graph-baseline|mtp-graph)
+    mtp-baseline|mtp|mtp-graph-baseline|mtp-graph|mtp-prefill-graph)
         delayer=0
         memory=0.82
         prefill_backend=disabled
         extra+=(--disable-overlap-schedule)
-        if [[ "$profile" == mtp || "$profile" == mtp-graph ]]; then
+        if [[ "$profile" == mtp-prefill-graph ]]; then
+            prefill_backend=tc_piecewise
+            export SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH=${SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH:-1}
+        fi
+        if [[ "$profile" == mtp || "$profile" == mtp-graph || "$profile" == mtp-prefill-graph ]]; then
             assistant=${GEMMA_ASSISTANT_MODEL:-/home/test1/models/gemma-4-26B-A4B-it-assistant}
             extra+=(--speculative-algorithm NEXTN --speculative-draft-model-path "$assistant"
                 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
@@ -112,7 +116,7 @@ if [[ "$profile" == metadata-only ]]; then
     metadata_sha=$(git -C "$server_root" rev-parse HEAD)
     [[ "$metadata_sha" == 420e720def* ]] || { echo 'Metadata-only checkout must be pinned to 420e720def' >&2; exit 2; }
 fi
-if [[ "$profile" == mtp || "$profile" == mtp-graph ]]; then
+if [[ "$profile" == mtp || "$profile" == mtp-graph || "$profile" == mtp-prefill-graph ]]; then
     [[ -f "$assistant/config.json" ]] || { echo 'Missing matching assistant checkpoint' >&2; exit 2; }
 fi
 printf 'Commit: '

@@ -430,11 +430,11 @@ def validate_cuda_graph_config(server_args: Any):
             or cfg.attn_cp_size > 1
             or cfg.enable_dp_attention
             or cfg.enable_lora
-            or cfg.speculative_algorithm is not None
+            or cfg.speculative_algorithm not in (None, "FROZEN_KV_MTP")
         ):
             raise ValueError(
                 "tc_piecewise NPU prefill does not support PP, CP, DP attention, "
-                "LoRA, or speculative decoding"
+                "LoRA, or speculative decoding other than FROZEN_KV_MTP"
             )
         logger.warning(
             "Ascend tc_piecewise prefill is experimental; attention runs eagerly "

@@ -151,3 +151,37 @@ Report the last `synchronize begin` without a matching `synchronize complete`,
 the complete startup log, and a Python thread dump while frozen. A completed
 HTTP header or successful graph capture does not establish decode completion.
 Turn diagnostic sync off before unprofiled benchmarks after the stall is fixed.
+
+## Piecewise prefill trial
+
+`mtp-prefill-graph` enables experimental NPU `tc_piecewise` target prefill.
+Compute pieces are graphed; attention runs eagerly between pieces. The target
+captures all hidden rows needed to seed the frozen assistant. The assistant
+has no prefill forward to capture.
+
+Restart the server between these matched trials:
+
+```bash
+# Control: eager prefill, eager draft, graphed target verification.
+GEMMA_DEVICES=2 SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH=1 \
+SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH=0 SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=0 \
+bash test/manual/gemma4/serve_ab.sh mtp-graph
+
+# Candidate: change only target prefill to piecewise graphs.
+GEMMA_DEVICES=2 SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH=1 \
+SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH=0 SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=0 \
+bash test/manual/gemma4/serve_ab.sh mtp-prefill-graph
+```
+
+Both profiles retain memory fraction0.82, overlap/delayer off, identical decode
+buckets and assistant settings. Keep the same benchmark command and warmup for
+both. No public return-hidden-states flag is required. Draft graphs default off
+in the new profile because the combined draft/verify graph stall remains unresolved.
+
+CPU regression checks cover the configuration gate, target capture, assistant
+skip and padded hidden-state handoff. NPU capture/replay, numerical parity and
+performance remain unvalidated. Before timing, use the quality commands above
+with fresh output files for these two profiles. Exercise mixed request lengths,
+cached prefixes beyond the SWA window, partial buckets and chunked prefills.
+Successful startup capture alone is insufficient; verify actual replay, complete
+requests and compare greedy outputs/logprobs before three unprofiled repetitions.
