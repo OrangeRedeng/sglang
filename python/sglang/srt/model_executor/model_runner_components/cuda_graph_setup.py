@@ -674,6 +674,15 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         capture_time=0,
     )
 
+    if (
+        model_runner.device == "npu"
+        and not model_runner.is_draft_worker
+        and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        and envs.SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH.get()
+    ):
+        logger.info("Frozen-KV NPU target verify graph disabled for isolation.")
+        return no_capture
+
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.
     if (

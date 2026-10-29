@@ -221,3 +221,49 @@ def test_verify_capture_only_inspects_records_without_signaling_graph_events(
         runner.capture_one_shape(2, Mock())
     assert runner._frozen_graph_updates_available is has_records
     graph.update.assert_not_called()
+
+
+def test_npu_draft_graph_can_be_disabled_without_disabling_verify_configuration():
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
+
+    worker = SimpleNamespace(
+        target_worker=SimpleNamespace(device="npu"),
+        speculative_num_steps=3,
+        cuda_graph_runner=None,
+    )
+    with (
+        envs.SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH.override(True),
+        patch(
+            "sglang.srt.speculative.frozen_kv_mtp_worker_v2.cuda_graph_fully_disabled",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.hardware_backend.npu.graph_runner."
+            "frozen_kv_mtp_npu_graph_runner.FrozenKVMTPNpuGraphRunner"
+        ) as factory,
+    ):
+        FrozenKVMTPDraftWorker._capture_cuda_graphs(worker)
+    assert worker.cuda_graph_runner is None
+    factory.assert_not_called()
+
+
+def test_npu_verify_graph_can_be_disabled_before_capture():
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+        capture_decode_graph,
+    )
+
+    runner = SimpleNamespace(
+        device="npu",
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(
+            is_speculative=lambda: True,
+            is_frozen_kv_mtp=lambda: True,
+        ),
+    )
+    with envs.SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH.override(True):
+        result = capture_decode_graph(model_runner=runner)
+    assert result.runner is None
+    assert result.memory_phase == "target_verify"
+    assert result.memory_usage_gb == 0

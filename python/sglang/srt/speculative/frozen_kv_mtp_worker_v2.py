@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -390,6 +391,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         graph_runner_cls = FrozenKVMTPCudaGraphRunner
         if self.target_worker.device == "npu":
+            if envs.SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH.get():
+                logger.info("Frozen-KV NPU draft graph disabled for isolation.")
+                return
             from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_runner import (
                 FrozenKVMTPNpuGraphRunner,
             )
@@ -727,6 +731,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.gpu_id = gpu_id
         self.device = get_device().device
+        self.debug_npu_mtp_graph_sync = (
+            self.device == "npu" and envs.SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC.get()
+        )
         self._target_worker = target_worker
         self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -765,6 +772,13 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
+    def _debug_graph_stage(self, stage):
+        if not getattr(self, "debug_npu_mtp_graph_sync", False):
+            return
+        logger.info("Frozen-KV NPU %s: synchronize begin", stage)
+        torch.npu.synchronize()
+        logger.info("Frozen-KV NPU %s: synchronize complete", stage)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -782,6 +796,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
+
+            self._debug_graph_stage("prefill")
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             batch_output.new_seq_lens = batch.seq_lens
@@ -817,6 +833,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 spec_stage_span("draft"),
             ):
                 verify_input = self.draft_worker.draft(batch)
+            self._debug_graph_stage("draft")
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(
@@ -824,6 +841,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 pp_proxy_tensors=pp_proxy_tensors,
                 grammar_barrier=grammar_barrier,
             )
+            self._debug_graph_stage("verify")
             # Publish before draft-extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -834,5 +852,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            self._debug_graph_stage("draft-seed")
 
             return batch_output
