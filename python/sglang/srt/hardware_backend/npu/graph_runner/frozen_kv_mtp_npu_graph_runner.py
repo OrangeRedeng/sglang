@@ -26,30 +26,20 @@ class FrozenKVMTPNpuGraphRunner(FrozenKVMTPCudaGraphRunner):
         if not worker.draft_attn_backend.use_fia:
             raise ValueError("Frozen-KV NPU graphs require ASCEND_USE_FIA=1")
         super().__init__(worker)
-        self._probe_graph_updates()
+        self._check_graph_update_records()
 
-    def _probe_graph_updates(self):
+    def _check_graph_update_records(self):
         self._updatable_graphs = set()
         for key, graph in self.backend._graphs.items():
             dispatch = getattr(graph, "graph_dispatch_mode", None)
             records = getattr(dispatch, "graph_dispatch_records", None)
-            if isinstance(records, list) and not records:
+            if not isinstance(records, (list, tuple)) or not records:
                 logger.warning(
                     "Frozen-KV draft bucket %s has no FIA update records; using eager.",
                     key.size,
                 )
                 continue
-            try:
-                graph.update(cpu_update_input=self._length_updates([0] * key.size))
-            except RuntimeError as error:
-                if "0 operators" not in str(error):
-                    raise
-                logger.warning(
-                    "Frozen-KV draft bucket %s has no FIA update records; using eager.",
-                    key.size,
-                )
-            else:
-                self._updatable_graphs.add(key)
+            self._updatable_graphs.add(key)
 
     def _length_updates(self, lengths):
         # One entry broadcasts to every recorded operator, including all layers

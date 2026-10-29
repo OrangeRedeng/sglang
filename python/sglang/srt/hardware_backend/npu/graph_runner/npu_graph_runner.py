@@ -143,21 +143,22 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         if not self.model_runner.spec_algorithm.is_frozen_kv_mtp():
             return
         graph = self.backend._graphs[self._make_graph_key(size)]
-        try:
-            graph.update(
-                cpu_update_input=[
-                    {"actual_seq_kvlen": [self.captured_req_width] * size}
-                ]
-            )
-        except RuntimeError as error:
-            if "0 operators" not in str(error):
-                raise
+        # Inspect records without updating: updates enqueue external-event
+        # signals and belong to the normal update/replay lifecycle.
+        dispatch = getattr(graph, "graph_dispatch_mode", None)
+        records = getattr(dispatch, "graph_dispatch_records", None)
+        if not isinstance(records, (list, tuple)) or not records:
             self._frozen_graph_updates_available = False
             logger.warning(
                 "Frozen-KV verify graph has no FIA update records; using eager."
             )
 
     def can_run_graph(self, forward_batch):
+        if (
+            getattr(self, "use_frozen_kv_mtp", False)
+            and forward_batch.seq_lens_cpu is None
+        ):
+            return False
         return getattr(
             self, "_frozen_graph_updates_available", True
         ) and super().can_run_graph(forward_batch)
@@ -417,6 +418,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     # already includes the draft block for DFlash); do not
                     # recompute and double-add here.
                     seq_lens = list(_meta_list)
+                elif (
+                    getattr(self, "use_frozen_kv_mtp", False)
+                    and forward_batch.seq_lens_cpu is not None
+                ):
+                    # Avoid synchronizing the NPU stream before the verify graph
+                    # update is submitted; committed lengths already exist on CPU.
+                    seq_lens = (
+                        forward_batch.seq_lens_cpu[: self.raw_bs]
+                        + self.captured_req_width
+                    ).tolist() + [0] * (self.bs - self.raw_bs)
                 else:
                     # Wrapper backends (e.g. hybrid linear attention) keep
                     # forward_metadata only on their children, so it stays

@@ -42,7 +42,9 @@ def test_draft_rebinds_unchanged_prefix_for_seed_and_each_recurrent_step():
 
 
 @pytest.mark.parametrize("operator_count", [4, 12, 24])
-def test_probe_and_replay_update_every_captured_operator(operator_count):
+def test_inspection_is_side_effect_free_and_replay_updates_every_operator(
+    operator_count,
+):
     runner = draft_runner()
     key = ShapeKey(size=4)
     records = [None] * operator_count
@@ -58,7 +60,10 @@ def test_probe_and_replay_update_every_captured_operator(operator_count):
         )
         records[:] = [list(entry["actual_seq_kvlen"]) for entry in entries]
 
-    graph = SimpleNamespace(update=update)
+    graph = SimpleNamespace(
+        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=records),
+        update=Mock(side_effect=update),
+    )
 
     def replay(shape_key, *, seq_lens, cpu_update_input):
         assert shape_key == key
@@ -69,9 +74,10 @@ def test_probe_and_replay_update_every_captured_operator(operator_count):
     runner.backend = SimpleNamespace(
         _graphs={key: graph}, replay_with_input_update=replay
     )
-    runner._probe_graph_updates()
+    runner._check_graph_update_records()
     assert key in runner._updatable_graphs
-    assert records == [[0, 0, 0, 0]] * operator_count
+    assert records == [None] * operator_count
+    graph.update.assert_not_called()
     for lengths in ([7, 1030], [2929, 19]):
         batch = SimpleNamespace(seq_lens_cpu=torch.tensor(lengths + [0, 0]))
         assert runner._replay_graph(key, batch) == "replayed"
@@ -82,10 +88,16 @@ def test_recordless_draft_bucket_falls_back_to_eager():
     runner = draft_runner()
     missing, supported = ShapeKey(size=2), ShapeKey(size=4)
     runner.backend._graphs = {
-        missing: Mock(update=Mock(side_effect=RuntimeError("0 operators"))),
-        supported: Mock(),
+        missing: SimpleNamespace(
+            graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]),
+            update=Mock(),
+        ),
+        supported: SimpleNamespace(
+            graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[object()]),
+            update=Mock(),
+        ),
     }
-    runner._probe_graph_updates()
+    runner._check_graph_update_records()
     assert runner._updatable_graphs == {supported}
     with patch.object(FrozenKVMTPCudaGraphRunner, "can_run_graph", return_value=True):
         assert not runner.can_run_graph(
@@ -103,18 +115,18 @@ def test_empty_dispatch_records_are_rejected_even_when_broadcast_update_is_a_noo
         graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]), update=Mock()
     )
     runner.backend._graphs = {ShapeKey(size=2): graph}
-    runner._probe_graph_updates()
+    runner._check_graph_update_records()
     assert not runner._updatable_graphs
     graph.update.assert_not_called()
 
 
-def test_unexpected_update_failure_is_not_hidden():
+def test_unexpected_replay_update_failure_is_not_hidden():
     runner = draft_runner()
-    runner.backend._graphs = {
-        ShapeKey(size=2): Mock(update=Mock(side_effect=RuntimeError("bad shape")))
-    }
+    runner.backend.replay_with_input_update.side_effect = RuntimeError("bad shape")
     with pytest.raises(RuntimeError, match="bad shape"):
-        runner._probe_graph_updates()
+        runner._replay_graph(
+            ShapeKey(size=4), SimpleNamespace(seq_lens_cpu=torch.tensor([8, 9, 0, 0]))
+        )
 
 
 def test_verify_selects_v2_host_attribute_for_frozen_mtp():
@@ -139,14 +151,14 @@ def test_recordless_verify_capture_prevents_replay():
     )
     runner.captured_req_width = 4
     runner._make_graph_key = lambda size: ShapeKey(size=size)
-    graph = Mock(update=Mock(side_effect=RuntimeError("0 operators")))
+    graph = SimpleNamespace(
+        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]), update=Mock()
+    )
     runner.backend = SimpleNamespace(_graphs={ShapeKey(size=2): graph})
     with patch.object(DecodeCudaGraphRunner, "capture_one_shape"):
         runner.capture_one_shape(2, Mock())
     assert not runner.can_run_graph(Mock())
-    graph.update.assert_called_once_with(
-        cpu_update_input=[{"actual_seq_kvlen": [4, 4]}]
-    )
+    graph.update.assert_not_called()
 
 
 def test_worker_selects_npu_draft_graph_runner():
@@ -186,3 +198,26 @@ def test_worker_selects_npu_draft_graph_runner():
     factory.assert_called_once_with(worker)
     assert worker.cuda_graph_runner is factory.return_value
     assert worker._specialized_graph_memory_usage["draft_decode"] == 1
+
+
+@pytest.mark.parametrize("has_records", [False, True])
+def test_verify_capture_only_inspects_records_without_signaling_graph_events(
+    has_records,
+):
+    runner = object.__new__(NPUGraphRunner)
+    runner._frozen_graph_updates_available = True
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_frozen_kv_mtp=lambda: True)
+    )
+    runner._make_graph_key = lambda size: ShapeKey(size=size)
+    graph = SimpleNamespace(
+        graph_dispatch_mode=SimpleNamespace(
+            graph_dispatch_records=[object()] if has_records else []
+        ),
+        update=Mock(),
+    )
+    runner.backend = SimpleNamespace(_graphs={ShapeKey(size=2): graph})
+    with patch.object(DecodeCudaGraphRunner, "capture_one_shape"):
+        runner.capture_one_shape(2, Mock())
+    assert runner._frozen_graph_updates_available is has_records
+    graph.update.assert_not_called()
