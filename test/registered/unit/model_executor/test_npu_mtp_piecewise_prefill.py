@@ -55,6 +55,29 @@ def test_frozen_mtp_piecewise_prefill_is_allowed():
     validate(config())
 
 
+@pytest.mark.parametrize("algorithm", ["NEXTN", "EAGLE"])
+@pytest.mark.parametrize("assistant", [True, False])
+def test_graph_gate_resolves_assistant_alias_before_speculative_hook(
+    algorithm, assistant
+):
+    architecture = (
+        "Gemma4AssistantForCausalLM" if assistant else "OtherDraftForCausalLM"
+    )
+    with patch(
+        "sglang.srt.utils.hf_transformers_utils.get_config",
+        return_value=SimpleNamespace(architectures=[architecture]),
+    ):
+        cfg = config(
+            speculative_algorithm=algorithm,
+            speculative_draft_model_path="/models/assistant",
+        )
+        if assistant:
+            validate(cfg)
+        else:
+            with pytest.raises(ValueError, match="other than FROZEN_KV_MTP"):
+                validate(cfg)
+
+
 @pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "DFLASH", "NGRAM", "NEXTN"])
 def test_other_speculative_piecewise_paths_remain_rejected(algorithm):
     with pytest.raises(ValueError, match="other than FROZEN_KV_MTP"):

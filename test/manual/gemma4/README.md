@@ -19,7 +19,7 @@ retains its two-NPU target and configuration.
 | Order | Profile | Comparison |
 | --- | --- | --- |
 | 1 | `metadata` | Reference, serial QKV, existing graphs and delayer |
-| 2 | `mtp-baseline` | Serial QKV, graphs/overlap/delayer off, memory0.82 |
+| 2 | `mtp-baseline` | Serial QKV, graphs/overlap off, delayer0.5/50ms/4/cap6, memory0.82 |
 | 3 | `mtp` | Same as2 plus the matching assistant |
 
 Run three unprofiled repetitions per launch with the same random C24/RPS87/1600

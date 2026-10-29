@@ -65,7 +65,7 @@ Reference: [Google Gemma MTP documentation](https://ai.google.dev/gemma/docs/mtp
 After eager MTP correctness passes, stop the server and compare these profiles
 on the same source/runtime. The helpers default to one NPU2, TP1, without DP; set `GEMMA_DEVICES=3`
 to select NPU3, or `GEMMA_DEVICES=2,3` to restore the two-replica test.
-Both use memory0.82, disable overlap and delaying,
+Both use memory0.82, disable overlap, enable delaying0.5/50ms/4/cap6,
 and keep prefill eager. They retain the supplied full-decode buckets. The MTP
 profile captures target verification and the assistant's recurrent draft loop.
 The non-MTP graph control captures ordinary decode. This does not enable or
@@ -173,7 +173,7 @@ SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH=0 SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=0 \
 bash test/manual/gemma4/serve_ab.sh mtp-prefill-graph
 ```
 
-Both profiles retain memory fraction0.82, overlap/delayer off, identical decode
+Both profiles retain memory fraction0.82, overlap off, delayer0.5/50ms/4/cap6, identical decode
 buckets and assistant settings. Keep the same benchmark command and warmup for
 both. No public return-hidden-states flag is required. Draft graphs default off
 in the new profile because the combined draft/verify graph stall remains unresolved.
@@ -185,3 +185,13 @@ with fresh output files for these two profiles. Exercise mixed request lengths,
 cached prefixes beyond the SWA window, partial buckets and chunked prefills.
 Successful startup capture alone is insufficient; verify actual replay, complete
 requests and compare greedy outputs/logprobs before three unprofiled repetitions.
+
+## Prefill batching with synchronous MTP
+
+TP1 replicas can use the prefill delayer without overlap scheduling. All MTP
+profiles and matched controls enable ratio0.5, maximum50ms/four passes, and cap6.
+Queue negotiation stays on CPU without a device collective. TP above one still
+requires overlap scheduling. The request cap is a maximum, not a minimum;
+small prefills can still occur when a timeout expires or no decode is running.
+Rebenchmark against the previous run: fewer prefills may increase TTFT, and a
+throughput improvement is not guaranteed.

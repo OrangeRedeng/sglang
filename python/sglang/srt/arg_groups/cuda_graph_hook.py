@@ -424,13 +424,31 @@ def validate_cuda_graph_config(server_args: Any):
         prefill_backend, _ = attention_backends_of(resolved_view(server_args))
         if prefill_backend != "ascend":
             raise ValueError("tc_piecewise NPU prefill requires ascend attention")
+        speculative_algorithm = cfg.speculative_algorithm
+        if speculative_algorithm in ("NEXTN", "EAGLE"):
+            from sglang.srt.arg_groups.speculative_hook import (
+                _resolve_speculative_algorithm_alias,
+            )
+
+            # Graph validation precedes speculative alias resolution.
+            override_config = getattr(cfg, "decrypted_draft_config_file", None)
+            speculative_algorithm = _resolve_speculative_algorithm_alias(
+                speculative_algorithm,
+                getattr(cfg, "speculative_draft_model_path", None),
+                trust_remote_code=getattr(cfg, "trust_remote_code", False),
+                kwargs=(
+                    {"_configuration_file": override_config.strip()}
+                    if override_config and override_config.strip()
+                    else {}
+                ),
+            )
         if (
             cfg.pp_size > 1
             or cfg.dcp_size > 1
             or cfg.attn_cp_size > 1
             or cfg.enable_dp_attention
             or cfg.enable_lora
-            or cfg.speculative_algorithm not in (None, "FROZEN_KV_MTP")
+            or speculative_algorithm not in (None, "FROZEN_KV_MTP")
         ):
             raise ValueError(
                 "tc_piecewise NPU prefill does not support PP, CP, DP attention, "
