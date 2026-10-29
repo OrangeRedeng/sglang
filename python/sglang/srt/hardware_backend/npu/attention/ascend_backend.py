@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
 
+def _is_prefill_graph_mode(forward_mode: ForwardMode) -> bool:
+    # is_extend() also includes target verification, which owns decode graph state.
+    return forward_mode.is_extend() and not forward_mode.is_target_verify()
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -892,7 +897,14 @@ class AscendAttnBackend(AttentionBackend):
                 length + self.speculative_num_draft_tokens
                 for length in metadata.seq_lens_cpu_list
             ]
-        metadata.seq_lens = seq_lens
+        # Verify attention lengths include draft tokens; keep them separate from
+        # the committed-prefix input buffer used by positions and graph replay.
+        metadata.seq_lens = (
+            seq_lens.clone()
+            if forward_mode.is_target_verify()
+            and getattr(self, "is_frozen_kv_mtp", False)
+            else seq_lens
+        )
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -967,7 +979,7 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            if forward_mode.is_extend():
+            if _is_prefill_graph_mode(forward_mode):
                 # Prefill owns a separate stable token buffer (allocated at
                 # first _apply, i.e. the largest bucket during reversed-order
                 # capture); decode's cuda_graph_swa_out_cache_loc does not
