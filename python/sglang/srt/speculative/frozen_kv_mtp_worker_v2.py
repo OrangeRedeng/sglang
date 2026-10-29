@@ -492,7 +492,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        # The scheduler has already published committed lengths on CPU.
+        batch.seq_lens_sum = (
+            batch.seq_lens_cpu.sum().item()
+            if batch.seq_lens_cpu is not None
+            else torch.sum(batch.seq_lens).item()
+        )
         batch.return_hidden_states = False
 
         forward_batch = ForwardBatch.init_new(
