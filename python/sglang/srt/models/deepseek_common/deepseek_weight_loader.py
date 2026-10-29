@@ -55,6 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_sail,
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
@@ -636,7 +637,14 @@ class DeepseekV2WeightLoaderMixin:
                         "AWQ dequantize function is not supported for the current device"
                     )
             else:
-                w = self_attn.kv_b_proj.weight
+                logical_weight = getattr(
+                    self_attn.kv_b_proj.quant_method, "logical_weight", None
+                )
+                w = (
+                    logical_weight(self_attn.kv_b_proj)
+                    if logical_weight is not None
+                    else self_attn.kv_b_proj.weight
+                )
 
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
             # This may affect the accuracy of fp8 model.
@@ -726,8 +734,12 @@ class DeepseekV2WeightLoaderMixin:
                         if weight_scale.dim() == 1:
                             weight_scale = weight_scale.view(-1, 1)
 
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    if _is_sail:
+                        # dequant channel-wise fp8 to bf16
+                        w = w.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+                    else:
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
                 weight_block_size = (

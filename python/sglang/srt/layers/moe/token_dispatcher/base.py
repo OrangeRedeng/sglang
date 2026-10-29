@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         AscendTPCombineInput,
         AscendTPDispatchOutput,
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -119,6 +121,12 @@ class _PostCombineHooks(DispatcherBaseHooks):
 
 class DispatchOutputChecker:
     @staticmethod
+    def format_is_ascend_tp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[AscendTPDispatchOutput]:
+        return dispatch_output.format.is_ascend_tp()
+
+    @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[StandardDispatchOutput]:
@@ -131,10 +139,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_ascend_tp()
+    ) -> TypeGuard[AscendOpsDispatchOutput]:
+        return dispatch_output.format.is_ascend_ops()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -174,12 +182,16 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
     def is_ascend_tp(self) -> bool:
         return self == DispatchOutputFormat.ASCEND_TP
+
+    def is_ascend_ops(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_OPS
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -215,6 +227,12 @@ class DispatchOutput(Protocol):
 
 class CombineInputChecker:
     @staticmethod
+    def format_is_ascend_tp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[AscendTPCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_TP
+
+    @staticmethod
     def needs_model_route_finalization(
         combine_input: CombineInput,
     ) -> TypeGuard[RoutewiseCombineInput]:
@@ -231,10 +249,10 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         combine_input: CombineInput,
-    ) -> TypeGuard[AscendTPCombineInput]:
-        return combine_input.format == CombineInputFormat.ASCEND_TP
+    ) -> TypeGuard[AscendOpsCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_OPS
 
     @staticmethod
     def format_is_deepep_normal(
@@ -277,6 +295,7 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
 
 class RoutewiseLayout(Enum):

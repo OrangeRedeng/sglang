@@ -193,31 +193,21 @@ cookbook's backend selection, TP8/16 replaces its TP layouts, and the INT
 online-quantization modes (`w8a8_int`/`w4a4_int`) are this branch's Ascend
 load-time conversion, not the cookbook's FP8 checkpoints.
 
-## Deferred follow-ups (need A3 hardware validation)
+## Refresh status
 
-1. **D1v3 `prepare_mlp` port**: the token-sharded all-reduce-skip hook in
-   `layers/communicator.py` became unreachable after main's `layer_boundary`
-   refactor; D1v3 degrades to the safe default (full all-reduce). Port the
-   hook onto the declared-boundary API to restore the optimization, then
-   re-measure DCP runs.
-2. **DCP packed-read precedence**: in
-   `deepseek_v2_attention_mla_npu.py`, ours' `dcp_packed_read_plan` and
-   main's `remap_dcp_sparse_indices` were made mutually exclusive
-   (if/elif). When `SGLANG_NPU_DCP_SHARED_PACKED_*` is on, the sparse remap
-   is skipped — confirm on device that the packed path matches the ascend
-   backend operator contract.
-3. **Indexer-K pool sizing**: `memory_pool_npu.py` merged the bde
-   `index_buf_size` capacity override with main's paged
-   `index_page_size`/`index_page_padding` layout by construction; validate
-   pool construction at DCP > 1.
-4. **Prefill graph vs DCP**: `can_run_prefill_cuda_graph` excludes DCP runs,
-   so the CAPTURE=1 win applies to the non-DCP 1M configuration only.
+See [REFRESH_REPORT.md](REFRESH_REPORT.md) for the source preservation matrix,
+main integration provenance, checks and remaining device requirements.
+Packed reads, same-layer overlap and next-layer gather prefetch have been
+rewired to page-based ownership and remain opt-in pending A3 validation.
+Legacy residual token sharding, full-width Q/preissue and streamed `o_proj`
+fail early; reviewed query sharding is tested separately and does not establish
+equivalent memory use or performance.
 
 ## Integrated PR validation
 
 The matrix now follows #42977/#42978 indexer/token sharding, #44320/#44321
 DCP KV gather composition, #43141 nesting validation and #42224 INT8 indexer.
-Legacy D1v3 and asynchronous gather experiments are not selected by this matrix.
+Legacy D1v3 cases report coverage blockers. Packed reads and asynchronous gather paths have independent activation/parity scenarios.
 Scoped routed-MoE/INT4 conversion is unsupported; use `w8a8_int`/`w4a4_int`
 load-time modes. The dense/router/shared INT8 case uses explicit targets and
 never requests unsupported `moe:W8A8_DYNAMIC`.

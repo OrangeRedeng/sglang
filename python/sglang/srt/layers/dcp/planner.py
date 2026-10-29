@@ -131,7 +131,7 @@ def prepare_decode_context_parallel_metadata(
     else:
         # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
         # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-        translator = get_attn_backend().kv_index_translator
+        translator = get_attn_backend().runner_ids
         dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
             dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         )
@@ -166,7 +166,7 @@ def plan_dcp_decode_metadata(
     `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
     rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
     `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
-    prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
+    prefix the caller hands to `RunnerIds.translate_dcp_read_ids`.
     """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()

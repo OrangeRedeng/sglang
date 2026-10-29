@@ -382,9 +382,15 @@ class TestOnlineSharedFallback(unittest.TestCase):
         mlp = SimpleNamespace(
             gate_up_proj=linear, down_proj=linear, act_fn=SiluAndMul()
         )
+        with patch("sglang.srt.hardware_backend.npu.moe.tp_fusion.envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get", return_value=False):
+            self.assertEqual(shared_gmm1_mode(mlp), "baseline")
         for available, expected in ((False, "baseline"), (True, "activation_quant")):
             with (
                 self.subTest(available=available),
+                patch(
+                    "sglang.srt.hardware_backend.npu.moe.tp_fusion.envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get",
+                    return_value=True,
+                ),
                 patch(
                     "sglang.srt.hardware_backend.npu.moe.tp_fusion.supports_npu_op",
                     return_value=available,

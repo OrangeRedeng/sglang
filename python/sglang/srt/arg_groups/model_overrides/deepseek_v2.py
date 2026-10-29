@@ -24,12 +24,20 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    # The DCP paths: trtllm on CUDA, triton on ROCm.
+    backend = (
+        None
+        if getattr(cfg, "device", None) == "npu"
+        else ("triton" if get_platform().is_hip else "trtllm")
+    )
     overrides = {
-        name: "trtllm"
+        name: backend
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
-        if getattr(cfg, name) is None
+        if backend is not None and getattr(cfg, name) is None
     }
-    if cfg.device == "npu":
+    if getattr(cfg, "device", None) == "npu":
+        if cfg.attention_backend in (None, "dsa"):
+            overrides["attention_backend"] = "ascend"
         from sglang.srt.environ import envs
 
         if envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get():

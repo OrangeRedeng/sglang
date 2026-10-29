@@ -126,40 +126,12 @@ export SGLANG_NPU_INDEXER_INT8=True
 #    SGLANG_NPU_SFA_KV_8BIT=0 for the paired bf16 baseline.
 export SGLANG_NPU_SFA_KV_8BIT=${SGLANG_NPU_SFA_KV_8BIT:-1}
 
-#D1
-export SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP=1
-
-#D1v3  (overridable for the A/B parity: TOKEN_SHARDED=0 reference vs =1 rebuild)
-export SGLANG_NPU_DSA_CP_TOKEN_SHARDED=${SGLANG_NPU_DSA_CP_TOKEN_SHARDED:-1}
-export SGLANG_NPU_ENABLE_DSA_CP=True
-
-#D1v2_3b / DCP hot-path gates. DEFAULT-ON in the tree -- they were missing
-#    from the earlier "everything off" A/B list, which is why that run still
-#    carried version-B full-width Q + local top-k. For the branch-E parity
-#    baseline set ALL of these to 0:
-#      SGLANG_NPU_DSA_CP_Q_FULL_WIDTH=0
-#      SGLANG_NPU_DSA_CP_LOCAL_TOPK=0
-#      SGLANG_NPU_DCP_DECODE_Q_PREISSUE=0
-#      SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP=0
-#    (gate off = exact base path: the qrep weights are not even prepared at
-#    init, verified in model_runner._prepare_dsa_cp_full_q_weights)
-export SGLANG_NPU_DSA_CP_Q_FULL_WIDTH=${SGLANG_NPU_DSA_CP_Q_FULL_WIDTH:-1}
-export SGLANG_NPU_DSA_CP_LOCAL_TOPK=${SGLANG_NPU_DSA_CP_LOCAL_TOPK:-1}
-export SGLANG_NPU_DCP_DECODE_Q_PREISSUE=${SGLANG_NPU_DCP_DECODE_Q_PREISSUE:-1}
-
-#D2  (context-KV gather re-placed off the indexer: packed read, layer-early
-#     prefetch, first-layer prime. All on; to debug, flip the one you want off
-#     to False. Prefetch without packed is a module-load error, by design.)
-export SGLANG_NPU_ENABLE_DCP_PACKED_READ=True
-export SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH=True
-
-#D2v3 (stream the o_proj full matrix on the DCP gather side stream; drop the
-#     standing per-rank o_proj replica). Needs D1v3's TOKEN_SHARDED (the rebuild
-#     that makes the full matrix necessary) and rides the D2 prefetch side
-#     stream. Default ON (config under test); set SGLANG_NPU_STREAM_O_PROJ=0 for
-#     the D1v3 static o_proj_qrep_weight baseline (paired A/B).
-export SGLANG_NPU_STREAM_O_PROJ=${SGLANG_NPU_STREAM_O_PROJ:-1}
-
+# Use the reviewed query-sharding path. Legacy residual sharding and
+# streamed o_proj are rejected until they have a compatible attention consumer.
+export SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD=${SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD:-1}
+export SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP=${SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP:-0}
+export SGLANG_NPU_ENABLE_DCP_PACKED_READ=${SGLANG_NPU_ENABLE_DCP_PACKED_READ:-0}
+export SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH=${SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH:-0}
 
 #E1 (branch E, clean): off-loop render+encode pool in the TokenizerManager.
 export SGLANG_ENABLE_CHAT_ENCODE_POOL=True

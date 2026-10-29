@@ -8,8 +8,13 @@ import re
 def evidence(log):
     events = []
     for line in log.splitlines():
-        if "NPU_FEATURE_EVIDENCE " in line:
-            events.append(json.loads(line.split("NPU_FEATURE_EVIDENCE ", 1)[1]))
+        match = re.search(r"(?:^|\s)NPU_FEATURE_EVIDENCE (.*)$", line)
+        if match is None:
+            continue
+        event = json.loads(match.group(1))
+        if not isinstance(event, dict) or not isinstance(event.get("feature"), str):
+            raise ValueError("malformed NPU feature evidence event")
+        events.append(event)
     return events
 
 
@@ -107,6 +112,19 @@ def self_check_workloads():
     from unittest.mock import patch
 
     from feature_benchmarks import long_matrix, percentile, small_commands
+
+    # Regression: environment logging used to abort every serving reference.
+    assert evidence("[TP0] get env SGLANG_NPU_FEATURE_EVIDENCE = True") == []
+    assert evidence('[TP0] NPU_FEATURE_EVIDENCE {"feature": "model-loaded"}') == [
+        {"feature": "model-loaded"}
+    ]
+    for broken in ("NPU_FEATURE_EVIDENCE {", 'NPU_FEATURE_EVIDENCE {"pid": 1}'):
+        try:
+            evidence(broken)
+        except (ValueError, json.JSONDecodeError):
+            pass
+        else:
+            raise AssertionError("malformed genuine evidence was accepted")
 
     args = SimpleNamespace(
         port=31000,

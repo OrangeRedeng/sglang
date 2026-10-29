@@ -188,6 +188,11 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         logical_width = (
             hidden_states.shape[1] if source_shape is None else source_shape[1]
         )
+        if num_tokens == 0:
+            return (
+                hidden_states, topk_ids.new_empty((0,)),
+                topk_ids.new_zeros((num_experts,), dtype=torch.int64), input_scale,
+            )
         quant_mode = self.quant_mode if input_scale is None else -1
         scale_kwargs = {}
         if input_scale is not None:

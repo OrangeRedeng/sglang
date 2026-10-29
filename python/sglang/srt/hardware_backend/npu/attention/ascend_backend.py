@@ -1461,7 +1461,11 @@ class AscendAttnBackend(AttentionBackend):
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
         seq_lengths_kv = forward_batch.attn_dcp_metadata.dcp_kv_indptr[1:]
         sparse_mode = 3
-        if dsa_token_shard_plan is not None:
+        packed = getattr(forward_batch, "npu_dcp_prefix_layout", None)
+        if packed is not None:
+            seq_lengths_kv = torch.tensor([packed.rows], device=q_nope.device, dtype=torch.int32)
+            sparse_mode = 0
+        elif dsa_token_shard_plan is not None:
             if dcp_crop_free_extend(
                 forward_batch,
                 topk_indices.shape[-1] if topk_indices is not None else None,

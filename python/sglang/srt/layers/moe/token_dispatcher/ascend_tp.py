@@ -55,6 +55,7 @@ class AscendTPCombineInput(NamedTuple):
 class AscendTPDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
+        self.moe_runner_config = moe_runner_config
         self.num_experts = moe_runner_config.num_experts
         self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
@@ -224,6 +225,24 @@ class AscendTPDispatcher(BaseDispatcher):
             topk_ids=dispatch_out.topk_ids,
             **shared_kwargs,
         )
+
+        from sglang.srt.hardware_backend.npu.moe.standard_dispatch import (
+            needs_finalize_all_gather,
+        )
+
+        layer = getattr(getattr(self, "moe_runner_config", None), "layer", None)
+        if (
+            needs_finalize_all_gather(layer)
+            and not isinstance(self.finalize, AllGatherFinalizeRoutingWrapper)
+            and get_parallel().tp_size > 1
+        ):
+            from sglang.srt.distributed.communication_op import (
+                tensor_model_parallel_all_gather,
+            )
+
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states, dim=-1
+            )
 
         if combine_input.shared_output is not None:
             from sglang.srt.hardware_backend.npu.feature_evidence import record

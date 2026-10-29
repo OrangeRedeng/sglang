@@ -141,6 +141,15 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer._npu_online_dense_loader.finish_post_load()
 
+    def logical_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Dequantize one local projection in checkpoint [out, in] order."""
+        if self.spec.weight_dtype != torch.int8:
+            raise ValueError("MLA decomposition requires an INT8 online projection")
+        dtype = layer._npu_online_dense_loader.params_dtype
+        return layer.weight.transpose(-2, -1).to(dtype) * layer.weight_scale.to(
+            dtype
+        ).reshape(-1, 1)
+
     def apply(
         self,
         layer: torch.nn.Module,

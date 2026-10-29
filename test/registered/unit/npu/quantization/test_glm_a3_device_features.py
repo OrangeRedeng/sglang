@@ -110,12 +110,30 @@ class TestIntegerFeatureParity(CustomTestCase):
                     device="npu",
                 ).reshape(rows, 2)
                 if not rows:
-                    continue
-                baseline = op._init_routing(x, ids, 4, 2)
-                q, scale = torch.ops.npu.npu_dynamic_quant(x)
+                    # No operator launch is needed for an empty routing payload.
+                    q = torch.empty_like(x, dtype=torch.int8)
+                    scale = torch.empty(0, device="npu", dtype=torch.float32)
+                else:
+                    q, scale = torch.ops.npu.npu_dynamic_quant(x)
                 actual = op._init_routing(q, ids, 4, 2, input_scale=scale)
-                for a, b in zip(actual, baseline):
+                baseline = NPUMoEInitRouting_v2(-1)._init_routing(
+                    q.to(torch.bfloat16), ids, 4, 2
+                )
+                torch.testing.assert_close(
+                    actual[0], baseline[0].to(torch.int8), rtol=0, atol=0
+                )
+                for a, b in zip(actual[1:3], baseline[1:3]):
                     torch.testing.assert_close(a, b, rtol=0, atol=0)
+                # Match routed payloads to their source row, independently of
+                # the operator's tie order, and verify each traveling scale.
+                for payload, routed_scale in zip(
+                    actual[0].cpu(), actual[3].flatten().cpu()
+                ):
+                    matches = torch.all(q.cpu() == payload, dim=1).nonzero().flatten()
+                    self.assertEqual(matches.numel(), 1)
+                    torch.testing.assert_close(
+                        routed_scale, scale.cpu()[matches[0]], rtol=0, atol=0
+                    )
 
     def test_routed_scale_and_shared_finalize(self):
         from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
@@ -182,13 +200,14 @@ class TestIntegerFeatureParity(CustomTestCase):
             * 0.01
         )
         w, ws = torch.ops.npu.npu_dynamic_quant(weight)
+        ws = ws.to(torch.bfloat16)
         import torch_npu
 
         w = torch_npu.npu_format_cast(w.transpose(1, 2).contiguous(), 29)
         grouped = torch.ops.npu.npu_grouped_matmul(
             x=[q],
             weight=[w],
-            scale=[ws],
+            scale=[ws.to(torch.bfloat16)],
             per_token_scale=[scale],
             split_item=2,
             group_list_type=1,

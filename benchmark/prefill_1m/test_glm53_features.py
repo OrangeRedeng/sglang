@@ -50,6 +50,9 @@ UNIT_SUITES = {
         "dcp/test_dsa_cp_shard_plan.py",
     ],
     "dcp-gather": [
+        "unit/npu/attention/test_dcp_prefix_gather.py",
+        "dcp/test_dcp_sfa_gather_overlap.py",
+        "dcp/test_dcp_extend_gather_prefetch.py",
         "dcp/test_dcp_extend_gather_plan.py",
         "dcp/test_dcp_sparse_attention_parity.py",
     ],
@@ -146,6 +149,33 @@ SCENARIOS = {
         }
     },
     "dcp-kv-gather": {"dcp": True},
+    "dcp-packed-read": {
+        "dcp": True,
+        "env": {"SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True"},
+        "expected": ["dcp-packed-read"],
+    },
+    "dcp-gather-prefetch": {
+        "dcp": True,
+        "env": {"SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True"},
+        "expected": ["dcp-gather-prefetch"],
+    },
+    "dcp-sfa-overlap": {
+        "dcp": True,
+        "env": {"SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP": "True"},
+        "expected": ["dcp-sfa-overlap"],
+    },
+    "dcp-legacy-token-shard": {
+        "dcp": True,
+        "unsupported": "Legacy residual token sharding lacks a compatible attention consumer; reviewed query sharding has separate cases and does not prove equivalence.",
+    },
+    "dcp-stream-o-proj": {
+        "dcp": True,
+        "unsupported": "Streamed versus resident o_proj requires the disconnected legacy residual token-sharded path.",
+    },
+    "dcp-legacy-q-variants": {
+        "dcp": True,
+        "unsupported": "Legacy full-width Q, Q preissue and local top-k have no compatible consumer; distributed replacement equivalence is unproven.",
+    },
 }
 
 
@@ -584,6 +614,24 @@ def serve(args, case, directory, env):
                 if not chat.get("choices", [{}])[0].get("message", {}).get("content"):
                     raise RuntimeError(f"empty chat response: {chat}")
                 responses.append(chat)
+            if scenario.get("dcp"):
+                prefix = [1] * 4096
+                for ids in (prefix, prefix + [2] * 256):
+                    responses.append(
+                        request(
+                            base + "/generate",
+                            {
+                                "input_ids": ids,
+                                "sampling_params": {
+                                    "temperature": 0,
+                                    "max_new_tokens": 1,
+                                },
+                                "return_logprob": True,
+                                "logprob_start_len": 0,
+                            },
+                            args.request_timeout,
+                        )
+                    )
             from concurrent.futures import ThreadPoolExecutor
 
             prompts = ["Explain addition briefly. " * size for size in (8, 64, 256)]
@@ -695,12 +743,15 @@ def serve(args, case, directory, env):
 
 
 _REFERENCE_RESPONSES = {}
+_REFERENCE_FAILURES = {}
 
 
 def validate_serving(args, case, directory, case_env, base_env):
     from feature_checks import compare_responses
 
     scenario = case["scenario"]
+    if scenario.get("unsupported"):
+        return dict(status="coverage_blocked", reason=scenario["unsupported"])
     if scenario.get("graph") and scenario.get("dcp"):
         return dict(status="blocked", reason="prefill graphs do not support DCP")
     if scenario.get("probe"):
@@ -722,6 +773,8 @@ def validate_serving(args, case, directory, case_env, base_env):
         if key in ("quant", "dcp", "separate_shared")
     }
     reference_key = json.dumps(reference, sort_keys=True)
+    if reference_key in _REFERENCE_FAILURES:
+        return dict(status="blocked", reason=_REFERENCE_FAILURES[reference_key])
     if reference_key not in _REFERENCE_RESPONSES:
         reference_case = dict(
             case,
@@ -731,7 +784,13 @@ def validate_serving(args, case, directory, case_env, base_env):
         )
         reference_directory = directory / "reference"
         reference_directory.mkdir()
-        serve(args, reference_case, reference_directory, base_env)
+        try:
+            serve(args, reference_case, reference_directory, base_env)
+        except Exception as exc:
+            _REFERENCE_FAILURES[reference_key] = (
+                f"reference {reference_key} failed: {exc} (first occurrence: {case['id']})"
+            )
+            raise
         _REFERENCE_RESPONSES[reference_key] = json.loads(
             (reference_directory / "responses.json").read_text()
         )
@@ -788,6 +847,41 @@ def append_result(path, result, directory):
                 from feature_checks import bounded_log
 
                 text = artifact.read_text(errors="replace")
+                if artifact.name.endswith("responses.json"):
+                    values = json.loads(text)
+                    text = json.dumps(
+                        [
+                            {
+                                "id": item.get("meta_info", {}).get("id"),
+                                "prompt_tokens": item.get("meta_info", {}).get(
+                                    "prompt_tokens"
+                                ),
+                                "cached_tokens": item.get("meta_info", {}).get(
+                                    "cached_tokens"
+                                ),
+                                "logprob_count": len(
+                                    item.get("meta_info", {}).get(
+                                        "input_token_logprobs"
+                                    )
+                                    or []
+                                ),
+                            }
+                            for item in values
+                        ],
+                        indent=2,
+                    )
+                elif artifact.suffix == ".xml":
+                    tree = ET.fromstring(text)
+                    text = (
+                        json.dumps(
+                            [dict(node.attrib) for node in tree.iter("testsuite")],
+                            indent=2,
+                        )
+                        + "\n"
+                        + bounded_log(
+                            "\n".join(node.text or "" for node in tree.iter("failure"))
+                        )
+                    )
                 output.write(
                     markdown_block(
                         bounded_log(text) if artifact.suffix == ".log" else text
@@ -957,13 +1051,48 @@ def plan(args):
             ],
         }
     )
+    cases.append(
+        {
+            "id": "npu-dcp-prefix-hccl",
+            "stage": "npu",
+            "command": [
+                PYTHON,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node",
+                str(args.tp),
+                str(
+                    ROOT
+                    / "test/registered/unit/npu/attention/test_dcp_prefix_gather_distributed.py"
+                ),
+            ],
+        }
+    )
+    benchmark_stage = args.stage if args.stage in ("small", "long") else None
+    selected_names = {
+        name
+        for name in SCENARIOS
+        if (
+            name in getattr(args, "benchmark_variants", "baseline").split(",")
+            if args.cases == "*"
+            else any(
+                fnmatch.fnmatchcase(f"{benchmark_stage}-{name}", pattern)
+                for pattern in args.cases.split(",")
+            )
+        )
+    }
+    common_dcp = benchmark_stage == "long" or any(
+        SCENARIOS[name].get("dcp") for name in selected_names
+    )
     for name, scenario in SCENARIOS.items():
         scenario = dict(scenario)
         stage = args.stage if args.stage in ("small", "long") else "serve"
-        if stage == "long":
+        if stage in ("small", "long") and args.cases == "*":
             if name not in getattr(args, "benchmark_variants", "baseline").split(","):
                 continue
-            scenario["dcp"] = args.dcp > 1
+        if stage in ("small", "long") and common_dcp:
+            scenario["dcp"] = args.dcp > 1 or bool(scenario.get("dcp"))
         model_path, checkpoint_format = case_checkpoint(args, scenario)
         cases.append(
             {
@@ -1002,6 +1131,20 @@ def suite_command_self_check():
         chunk=4096,
         mem_fraction=0.85,
     )
+    selected = SimpleNamespace(
+        **dict(vars(args), stage="small", benchmark_variants="baseline,dcp-packed-read")
+    )
+    assert {case["id"] for case in plan(selected) if case["stage"] == "small"} == {
+        "small-baseline",
+        "small-dcp-packed-read",
+    }
+    assert all(
+        case["scenario"].get("dcp")
+        for case in plan(selected)
+        if case["stage"] == "small"
+    )
+    selected.cases = "small-tp-finalize"
+    assert [case["id"] for case in plan(selected)] == ["small-tp-finalize"]
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         sentinel = directory / "collected"
@@ -1266,8 +1409,16 @@ def main():
         # These are boolean opt-ins; remove typed thresholds/modes instead of writing False into them.
         for name in ("ASCEND_USE_FIA",):
             env[name] = "0"
+        for name in (
+            "SGLANG_NPU_ENABLE_DCP_PACKED_READ",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH",
+            "SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP",
+        ):
+            env[name] = "False"
         env["SGLANG_NPU_FEATURE_EVIDENCE"] = "True"
         env.pop("HCCL_BUFFSIZE", None)
+        env.pop("SGLANG_NPU_STREAM_O_PROJ", None)
+        env.pop("SGLANG_NPU_DCP_DECODE_Q_PREISSUE", None)
         env["SGLANG_NPU_TUNING_CACHE_DIR"] = str(Path(workspace) / "tuning-cache")
         env["SGLANG_NPU_TP_MOE_REUSE_MXFP8"] = "False"
         env["SGLANG_NPU_TP_MOE_NORM_MXFP8"] = "False"
@@ -1420,6 +1571,7 @@ def main():
             & {
                 "blocked",
                 "partial",
+                "coverage_blocked",
                 "inactive",
                 "dependency_blocked",
                 "capacity_blocked",

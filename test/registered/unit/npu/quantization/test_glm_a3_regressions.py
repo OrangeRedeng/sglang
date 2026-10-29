@@ -432,5 +432,106 @@ class TestReportedStartupFailures(CustomTestCase):
         self.assertEqual(len(result.experiment_signature), 64)
 
 
+class TestOnlineMlaWeightContract(CustomTestCase):
+    def test_decomposition_reads_output_first_not_matmul_storage(self):
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUOnlineW8A8Int8LinearMethod,
+        )
+
+        method = NPUOnlineW8A8Int8LinearMethod()
+        source = (
+            torch.arange(896 * 512, dtype=torch.int64)
+            .reshape(896, 512)
+            .remainder(127)
+            .to(torch.int8)
+        )
+        scale = torch.linspace(0.01, 0.1, 896)
+        layer = SimpleNamespace(
+            weight=source.t().contiguous(),
+            weight_scale=scale,
+            _npu_online_dense_loader=SimpleNamespace(params_dtype=torch.bfloat16),
+        )
+        logical = method.logical_weight(layer)
+        expected = source.to(torch.bfloat16) * scale.to(torch.bfloat16)[:, None]
+        torch.testing.assert_close(logical, expected, rtol=0, atol=0)
+        key, value = logical.unflatten(0, (-1, 448)).split([192, 256], dim=1)
+        self.assertEqual(key.shape, (2, 192, 512))
+        self.assertEqual(value.shape, (2, 256, 512))
+
+    def test_unquantized_shared_expert_accepts_null_config(self):
+        tree = ast.parse((ROOT / "python/sglang/srt/models/deepseek_v2.py").read_text())
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepseekV2MoE"
+        )
+        assignment = next(
+            node
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "is_packed_weight"
+                for target in node.targets
+            )
+        )
+        for config, expected in (
+            (None, False),
+            (SimpleNamespace(get_name=lambda: "awq"), True),
+        ):
+            mlp = SimpleNamespace(
+                gate_up_proj=SimpleNamespace(
+                    quant_method=SimpleNamespace(quant_config=config)
+                )
+            )
+            namespace = dict(self=SimpleNamespace(shared_experts=mlp))
+            exec(
+                compile(
+                    ast.Module(body=[assignment], type_ignores=[]),
+                    "<shared-expert>",
+                    "exec",
+                ),
+                namespace,
+            )
+            self.assertEqual(namespace["is_packed_weight"], expected)
+
+
+class TestDispatcherRefresh(CustomTestCase):
+    def test_native_combine_honors_upstream_final_gather_state(self):
+        from sglang.srt.hardware_backend.npu.moe.standard_dispatch import (
+            set_finalize_all_gather,
+        )
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+            AscendTPCombineInput,
+            AscendTPDispatcher,
+        )
+
+        layer = torch.nn.Module()
+        set_finalize_all_gather(layer)
+        config = MoeRunnerConfig(num_experts=2, top_k=1, layer=layer)
+        dispatcher = AscendTPDispatcher(config)
+        dispatcher._dispatch_output = SimpleNamespace(
+            topk_weights=torch.ones(2, 1),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+            expanded_row_idx=torch.arange(2),
+        )
+        dispatcher.finalize = SimpleNamespace(
+            _finalize_routing=lambda value, **kwargs: value + 1
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_tp.get_parallel",
+                return_value=SimpleNamespace(tp_size=2),
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.tensor_model_parallel_all_gather",
+                side_effect=lambda value, dim: torch.cat((value, value), dim),
+            ),
+        ):
+            result = dispatcher.combine(AscendTPCombineInput(torch.ones(2, 4)))
+        torch.testing.assert_close(result, torch.full((2, 8), 2.0), rtol=0, atol=0)
+        self.assertIsNone(dispatcher._dispatch_output)
+
+
 if __name__ == "__main__":
     unittest.main()

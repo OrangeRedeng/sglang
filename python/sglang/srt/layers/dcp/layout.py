@@ -19,8 +19,8 @@ import logging
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
-
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import print_info_once
 
@@ -640,6 +640,8 @@ class DcpPackedReadPlan(NamedTuple):
         [ rank 0's send rows | rank 1's | ... | rank C-1's ][ this chunk's KV ]
           <--- send_rows ---> each                            <-- extend_len -->
 
+    ``interleave`` selects the page-owned layout used by the current NPU pool.
+    The formulas below describe its interleave=1 special case.
     Under the owner rule ``pos % C == rank`` a request's position ``p`` sits in
     rank ``p % C``'s send at local row ``p // C``, so::
 
@@ -663,13 +665,17 @@ class DcpPackedReadPlan(NamedTuple):
     send_rows: int
     gathered_rows: int
     rows: int
+    interleave: int = 1
 
 
 def plan_dcp_packed_read(
-    prefix_len: int, extend_len: int, dcp_size: int
+    prefix_len: int, extend_len: int, dcp_size: int, interleave: int = 1
 ) -> DcpPackedReadPlan:
     """Sizes of the packed rank-major buffer for a one-request extend."""
-    send_rows = -(-int(prefix_len) // dcp_size)
+    if min(dcp_size, interleave) < 1 or min(prefix_len, extend_len) < 0:
+        raise ValueError("invalid DCP packed dimensions")
+    cycles, tail = divmod(int(prefix_len), dcp_size * interleave)
+    send_rows = cycles * interleave + min(tail, interleave)
     gathered_rows = send_rows * dcp_size
     return DcpPackedReadPlan(
         prefix_len=int(prefix_len),
@@ -678,6 +684,7 @@ def plan_dcp_packed_read(
         send_rows=send_rows,
         gathered_rows=gathered_rows,
         rows=gathered_rows + int(extend_len),
+        interleave=interleave,
     )
 
 
@@ -692,7 +699,12 @@ def packed_row_of(pos: int, plan: DcpPackedReadPlan) -> int:
     if pos < 0:
         return pos
     if pos < plan.prefix_len:
-        return (pos % plan.dcp_size) * plan.send_rows + pos // plan.dcp_size
+        block, offset = divmod(pos, plan.interleave)
+        return (
+            (block % plan.dcp_size) * plan.send_rows
+            + (block // plan.dcp_size) * plan.interleave
+            + offset
+        )
     return plan.gathered_rows + (pos - plan.prefix_len)
 
 
@@ -710,8 +722,12 @@ def remap_topk_to_packed(
     c = plan.dcp_size
     # floor division, not trunc: torch's // on a signed tensor rounds toward
     # zero for negatives, and the -1 sentinels must come through untouched.
-    local_row = torch.div(topk_indices, c, rounding_mode="floor")
-    prefix_row = (topk_indices % c) * plan.send_rows + local_row
+    block = torch.div(topk_indices, plan.interleave, rounding_mode="floor")
+    local_row = (
+        torch.div(block, c, rounding_mode="floor") * plan.interleave
+        + topk_indices % plan.interleave
+    )
+    prefix_row = (block % c) * plan.send_rows + local_row
     extend_row = plan.gathered_rows + (topk_indices - plan.prefix_len)
     packed = torch.where(topk_indices < plan.prefix_len, prefix_row, extend_row)
     return torch.where(topk_indices < 0, topk_indices, packed)
@@ -824,7 +840,10 @@ def dcp_packed_read_plan(
         )
     else:
         plan = plan_dcp_packed_read(
-            prefix_lens[0], extend_lens[0], get_parallel().dcp_size
+            prefix_lens[0],
+            extend_lens[0],
+            get_parallel().dcp_size,
+            get_attn_backend().page_size,
         )
         print_info_once(
             "DCP packed read is ON: the sparse operator reads the all-gather's "
