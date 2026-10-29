@@ -304,6 +304,93 @@ class TestMTPAttentionLayout(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         torch.testing.assert_close(result, query)
 
+    def test_verify_graph_mask_tracks_device_prefix_and_keeps_bsnd_batch(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.graph_mode = True
+        backend.page_size = 128
+        backend.speculative_num_draft_tokens = 4
+        layer = SimpleNamespace(
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            qk_head_dim=512,
+            v_head_dim=512,
+            sliding_window_size=-1,
+            scaling=512**-0.5,
+        )
+        prefix = torch.tensor([2929, 5])
+        batch = SimpleNamespace(seq_lens=prefix)
+        query = torch.randn(8, 1, 512)
+        cache = torch.zeros(46, 128, 512)
+        blocks = torch.arange(46, dtype=torch.int32).reshape(2, 23)
+        kv_lens = [2933, 9]
+
+        def fia(q, key, value, **kwargs):
+            self.assertEqual(tuple(q.shape), (2, 4, 1, 512))
+            self.assertEqual(kwargs["input_layout"], "BSND")
+            self.assertIs(kwargs["actual_seq_kvlen"], kv_lens)
+            self.assertEqual(kwargs["actual_seq_qlen"], [4, 4])
+            mask = kwargs["atten_mask"]
+            for seq in range(2):
+                for row in range(4):
+                    position = int(prefix[seq]) + row
+                    self.assertFalse(mask[seq, row, position].item())
+                    self.assertTrue(mask[seq, row, position + 1].item())
+            return q.clone(), None
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "torch_npu.npu_fused_infer_attention_score_v2",
+            side_effect=fia,
+        ):
+            for lengths in ([2929, 5], [1030, 27]):
+                prefix.copy_(torch.tensor(lengths))
+                kv_lens[:] = [length + 4 for length in lengths]
+                result = backend._forward_mtp_bsnd(
+                    query, cache, cache, blocks, [4, 8], kv_lens, layer, None, batch
+                )
+                torch.testing.assert_close(result, query)
+
+    def test_frozen_draft_full_graph_reads_prefix_with_v2_bsnd(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.is_frozen_kv_draft = True
+        backend.use_fia = True
+        backend.use_mla = False
+        backend.is_hybrid_swa = True
+        backend.page_size = 128
+        lengths = [2929, 5]
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_cpu_list=lengths,
+            block_tables=torch.zeros(2, 23, dtype=torch.int32),
+        )
+        cache = torch.zeros(23, 128, 512)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache,
+            get_value_buffer=lambda _: cache,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            sliding_window_size=-1,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=512,
+            v_head_dim=512,
+            scaling=512**-0.5,
+        )
+        query = torch.randn(2, 512)
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "torch_npu.npu_fused_infer_attention_score_v2",
+            return_value=(query.reshape(2, 1, 1, 512), None),
+        ) as fia:
+            result = backend.forward_decode_graph(
+                query, None, None, layer, SimpleNamespace(), False
+            )
+        self.assertEqual(fia.call_args.kwargs["input_layout"], "BSND")
+        self.assertIs(fia.call_args.kwargs["actual_seq_kvlen"], lengths)
+        self.assertEqual(fia.call_args.kwargs["actual_seq_qlen"], [1, 1])
+        torch.testing.assert_close(result, query)
+
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
     def test_2d_input_adds_unsqueeze(self):

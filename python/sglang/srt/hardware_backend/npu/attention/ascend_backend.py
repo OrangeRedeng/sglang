@@ -456,10 +456,9 @@ class AscendAttnBackend(AttentionBackend):
 
     def _init_swa_metadata(self, model_runner: ModelRunner) -> None:
         pool = self.token_to_kv_pool
-        frozen_draft = (
-            model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_frozen_kv_mtp()
-        )
+        self.is_frozen_kv_mtp = model_runner.spec_algorithm.is_frozen_kv_mtp()
+        frozen_draft = model_runner.is_draft_worker and self.is_frozen_kv_mtp
+        self.is_frozen_kv_draft = frozen_draft
         if frozen_draft:
             # The assistant's dummy pool does not describe the target KV it reads.
             pool = model_runner.token_to_kv_pool_allocator.get_kvcache()
@@ -970,6 +969,11 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        if forward_mode.is_target_verify() and getattr(self, "is_frozen_kv_mtp", False):
+            metadata.seq_lens_cpu_list = [
+                length + self.speculative_num_draft_tokens
+                for length in metadata.seq_lens_cpu_list
+            ]
         metadata.seq_lens = seq_lens
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
@@ -2582,8 +2586,55 @@ class AscendAttnBackend(AttentionBackend):
         return attn_output
 
     def _forward_mtp_bsnd(
-        self, query, k_cache, v_cache, block_table, query_ends, kv_lens, layer, sinks
+        self,
+        query,
+        k_cache,
+        v_cache,
+        block_table,
+        query_ends,
+        kv_lens,
+        layer,
+        sinks,
+        forward_batch=None,
     ):
+        if self.graph_mode:
+            width = self.speculative_num_draft_tokens
+            bs = query.shape[0] // width
+            # Recompute the causal mask from replayed device lengths, not the
+            # capture-time host list. Query positions start at the committed prefix.
+            positions = (
+                forward_batch.seq_lens[:bs, None]
+                + torch.arange(width, device=query.device)[None, :]
+            )
+            keys = torch.arange(
+                block_table.shape[1] * self.page_size, device=query.device
+            )
+            mask = keys[None, None, :] > positions[:, :, None]
+            if layer.sliding_window_size != -1:
+                mask = mask | (
+                    keys[None, None, :]
+                    < positions[:, :, None] - layer.sliding_window_size
+                )
+            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query.reshape(bs, width, layer.tp_q_head_num, layer.qk_head_dim),
+                k_cache,
+                v_cache,
+                block_table=block_table,
+                block_size=self.page_size,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=mask,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=[width] * bs,
+                actual_seq_kvlen=kv_lens,
+                sparse_mode=0,
+                pre_tokens=FULL_ATTENTION_WINDOW,
+                next_tokens=0,
+                learnable_sink=sinks,
+            )
+            return result.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+
         output = query.new_empty(
             (query.shape[0], layer.tp_q_head_num, layer.v_head_dim)
         )
@@ -2747,6 +2798,7 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_lengths_kv,
                         layer,
                         sinks,
+                        forward_batch,
                     )
                 else:
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
@@ -3120,6 +3172,36 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_k_head_num,
                 )
                 return attn_out
+
+        if (
+            getattr(self, "is_frozen_kv_draft", False)
+            and self.use_fia
+            and not self.use_mla
+            and not self._is_swa_layer(layer)
+        ):
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
+            bs = q.shape[0]
+            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                q.reshape(bs, 1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_cache,
+                v_cache,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=[1] * bs,
+                actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
+                sparse_mode=0,
+                learnable_sink=sinks,
+            )
+            return result.reshape(bs, layer.tp_q_head_num * layer.v_head_dim)
 
         if not self.use_mla:
             seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int

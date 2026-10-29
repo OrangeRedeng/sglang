@@ -105,6 +105,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
+        self._frozen_graph_updates_available = True
         # NPU patch_model override: monkey-patch torch_compile_decoration's
         # patch_model with the NPU-specific version.
         from sglang.srt.compilation import torch_compile_decoration
@@ -126,6 +127,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # valid when per-rank batch sizes diverge.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_frozen_kv_mtp = model_runner.spec_algorithm.is_frozen_kv_mtp()
         self.if_use_v2 = any(
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
@@ -135,6 +137,30 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
         )
+
+    def capture_one_shape(self, size, *args, **kwargs):
+        super().capture_one_shape(size, *args, **kwargs)
+        if not self.model_runner.spec_algorithm.is_frozen_kv_mtp():
+            return
+        graph = self.backend._graphs[self._make_graph_key(size)]
+        try:
+            graph.update(
+                cpu_update_input=[
+                    {"actual_seq_kvlen": [self.captured_req_width] * size}
+                ]
+            )
+        except RuntimeError as error:
+            if "0 operators" not in str(error):
+                raise
+            self._frozen_graph_updates_available = False
+            logger.warning(
+                "Frozen-KV verify graph has no FIA update records; using eager."
+            )
+
+    def can_run_graph(self, forward_batch):
+        return getattr(
+            self, "_frozen_graph_updates_available", True
+        ) and super().can_run_graph(forward_batch)
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -165,7 +191,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # Select the handler from the captured graph, not the runtime mode;
         # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
         return self.if_use_v2 or (
-            self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
+            (self.use_fias_v2_bsnd or getattr(self, "use_frozen_kv_mtp", False))
+            and self.capture_forward_mode.is_target_verify()
         )
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):

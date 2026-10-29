@@ -51,12 +51,58 @@ sliding window, multiple requests with different lengths, and multiple decoding
 rounds. Check `avg_spec_accept_length` in `/server_info` after generation.
 
 Ascend top-k > 1 is not implemented in the frozen draft backend selector.
-The frozen draft graph runner explicitly supports CUDA only and falls back to
-eager on NPU. Target verify graphs and overlap require separate NPU validation;
-the command above deliberately starts with neither. After correctness passes,
+The command above deliberately starts with eager execution. The NPU graph
+implementation below supports top-k1 with FIA; overlap remains disabled. After correctness passes,
 compare unprofiled completed RPS and TTFT/TPOT/E2E against the non-speculative
 baseline with identical datasets, output lengths and client concurrency below
 30. MTP is a separate experiment from the original no-assistant throughput plan;
 no speedup is established here.
 
 Reference: [Google Gemma MTP documentation](https://ai.google.dev/gemma/docs/mtp/mtp).
+
+## NPU graph trial
+
+After eager MTP correctness passes, stop the server and compare these profiles
+on the same source/runtime. Both use memory0.82, disable overlap and delaying,
+and keep prefill eager. They retain the supplied full-decode buckets. The MTP
+profile captures target verification and the assistant's recurrent draft loop.
+The non-MTP graph control captures ordinary decode. This does not enable or
+validate prefill graphs or overlap with speculative execution.
+
+| Trial | Server | Benchmark in separate vLLM container |
+| --- | --- | --- |
+| Graph control without assistant | `bash test/manual/gemma4/serve_ab.sh mtp-graph-baseline` | `bash test/manual/gemma4/bench_ab.sh mtp-graph-baseline 1` |
+| MTP with target/draft graphs | `bash test/manual/gemma4/serve_ab.sh mtp-graph` | `bash test/manual/gemma4/bench_ab.sh mtp-graph 1` |
+| Eager MTP control | `bash test/manual/gemma4/serve_ab.sh mtp` | `bash test/manual/gemma4/bench_ab.sh mtp 1` |
+
+Append `--print` to inspect serving commands. Keep QKV and both FIA preparation
+switches identical between runs. Capture complete logs, including graph capture
+and fallback warnings. A captured bucket without FIA host-update records falls
+back to eager. Buckets outside the capture range and missing CPU lengths also
+keep the assistant eager. Target verification rebinds prefix+draft lengths;
+every assistant step rebinds the unchanged committed prefix. Wide-head verify
+masks are computed from replayed device lengths rather than capture-time values.
+These paths have CPU orchestration coverage, not target-NPU acceptance.
+
+With the fixed recommendation/RAG datasets available, capture greedy completions
+and logprobs from eager MTP, then repeat against graph MTP:
+
+```bash
+# While the eager mtp server is running:
+python3 test/manual/gemma4/quality_check.py capture \
+  --datasets "$GEMMA_DATA" --output /tmp/mtp-eager-quality.json
+
+# After restarting with mtp-graph:
+python3 test/manual/gemma4/quality_check.py capture \
+  --datasets "$GEMMA_DATA" --output /tmp/mtp-graph-quality.json
+python3 test/manual/gemma4/quality_check.py compare \
+  --baseline /tmp/mtp-eager-quality.json --candidate /tmp/mtp-graph-quality.json
+```
+
+Use fresh filenames. Also exercise concurrent mixed lengths, cached prefixes
+beyond the SWA window, changing request-slot assignments, and partial graph
+buckets. Verify both replicas and inspect a bounded trace for actual target
+verify and draft-loop graph replay; startup capture alone does not establish
+that serving uses graphs. Only then run three unprofiled benchmark repetitions.
+If capture fails, retain the full traceback and return to `mtp`; do not assume
+that a CPU pass proves NPU graph numerics or a throughput improvement.

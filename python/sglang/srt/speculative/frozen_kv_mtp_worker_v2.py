@@ -376,9 +376,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def _capture_cuda_graphs(self) -> None:
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
-        if self.target_worker.device != "cuda":
+        if self.target_worker.device not in ("cuda", "npu"):
             logger.info(
-                "Frozen-KV MTP draft CUDA graph is only supported on CUDA; "
+                "Frozen-KV MTP draft graphs support CUDA and NPU; "
                 "running the draft loop eagerly on %s.",
                 self.target_worker.device,
             )
@@ -388,10 +388,27 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             FrozenKVMTPCudaGraphRunner,
         )
 
-        logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        graph_runner_cls = FrozenKVMTPCudaGraphRunner
+        if self.target_worker.device == "npu":
+            from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_runner import (
+                FrozenKVMTPNpuGraphRunner,
+            )
+            from sglang.srt.runtime_context import get_exec
+
+            if (
+                self.topk != 1
+                or get_exec().graph.cuda_graph_config.decode.backend != "full"
+            ):
+                logger.info(
+                    "NPU frozen-KV draft graphs require top-k 1 and full decode graphs."
+                )
+                return
+            graph_runner_cls = FrozenKVMTPNpuGraphRunner
+
+        logger.info("Capture Frozen-KV MTP draft graph begin on %s.", self.device)
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        self.cuda_graph_runner = graph_runner_cls(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_decode"] = (
             self._specialized_graph_memory_usage.get("draft_decode", 0.0)
@@ -403,7 +420,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             + time.perf_counter()
             - tic
         )
-        logger.info("Capture Frozen-KV MTP draft cuda graph end.")
+        logger.info("Capture Frozen-KV MTP draft graph end on %s.", self.device)
 
     def _select_last_extend_hidden(
         self, batch: ScheduleBatch, hidden_states: torch.Tensor

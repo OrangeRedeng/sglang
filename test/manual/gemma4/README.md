@@ -28,6 +28,9 @@ serving performance or full scenario acceptance. Do not rerun removed tiled
 or RoPE/KV candidates. `run_plan.py` covers the original no-assistant matrix;
 MTP remains a separate comparison, requiring its own full scenario acceptance.
 
+For opt-in NPU target-verify and frozen-draft graphs, see the
+[MTP graph trial](mtp.md#npu-graph-trial). Eager profiles remain available.
+
 ## Isolate serial QKV normalization
 
 `SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM` is independent of both FIA switches. Set it

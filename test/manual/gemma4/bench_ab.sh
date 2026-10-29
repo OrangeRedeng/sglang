@@ -5,7 +5,7 @@ set -euo pipefail
 profile=${1:?Usage: bench_ab.sh PROFILE RUN [--print]}
 run=${2:?Usage: bench_ab.sh PROFILE RUN [--print]}
 case "$profile" in
-    baseline|metadata-only|metadata|native|eager-prefill|delayer-off|ratio025|delay25|cap5|mtp-baseline|mtp|r025-ms50-cap6|r025-ms25-cap6|r05-ms25-cap6|r05-ms25-cap5|r05-ms50-cap5|r025-ms50-cap5|r025-ms25-cap5) ;;
+    baseline|metadata-only|metadata|native|eager-prefill|delayer-off|ratio025|delay25|cap5|mtp-baseline|mtp|mtp-graph-baseline|mtp-graph|r025-ms50-cap6|r025-ms25-cap6|r05-ms25-cap6|r05-ms25-cap5|r05-ms50-cap5|r025-ms50-cap5|r025-ms25-cap5) ;;
     *) echo 'Unknown benchmark profile' >&2; exit 2 ;;
 esac
 [[ "$run" =~ ^[1-9][0-9]*$ ]] || { echo 'RUN must be a positive integer' >&2; exit 2; }
@@ -40,9 +40,9 @@ Path(sys.argv[2]).write_text(json.dumps(info, indent=2))
 args = info.get("server_args", {})
 algorithm = args.get("speculative_algorithm", info.get("speculative_algorithm"))
 if sys.argv[4] == "before":
-    if sys.argv[3] in ("mtp", "combined-mtp") and algorithm not in ("FROZEN_KV_MTP", "NEXTN"):
+    if sys.argv[3] in ("mtp", "mtp-graph") and algorithm not in ("FROZEN_KV_MTP", "NEXTN"):
         raise SystemExit(f"Expected Gemma MTP server, got algorithm={algorithm!r}")
-    if sys.argv[3] in ("mtp-baseline", "combined-mtp-baseline") and algorithm not in (None, "", "NONE"):
+    if sys.argv[3] in ("mtp-baseline", "mtp-graph-baseline") and algorithm not in (None, "", "NONE"):
         raise SystemExit(f"Expected non-speculative baseline, got algorithm={algorithm!r}")
 for rank, state in enumerate(info.get("internal_states", [])):
     if "avg_spec_accept_length" in state:

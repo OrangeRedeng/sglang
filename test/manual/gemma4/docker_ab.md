@@ -52,3 +52,11 @@ Change the final argument to2/3 for repetitions without restarting serving.
 It saves raw results and before/after server snapshots. MTP acceptance statistics
 are cumulative where exposed. This screen does not establish the eight
 recommendation/RAG targets; retain the full acceptance requirements in README.md.
+
+## Optional graph MTP comparison
+
+After the eager correctness check, use `mtp-graph-baseline` and `mtp-graph` for
+matched full-decode graph trials. Target verification and the assistant draft
+loop use NPU graphs; prefill, overlap and delaying remain disabled in these
+profiles. See [mtp.md](mtp.md#npu-graph-trial) for quality checks and limitations.
+Use the matching profile name with `bench_ab.sh`.
