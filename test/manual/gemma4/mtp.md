@@ -195,3 +195,14 @@ requires overlap scheduling. The request cap is a maximum, not a minimum;
 small prefills can still occur when a timeout expires or no decode is running.
 Rebenchmark against the previous run: fewer prefills may increase TTFT, and a
 throughput improvement is not guaranteed.
+
+## Draft metadata reuse
+
+`SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=1` also reuses query/KV length lists in
+MTP attention across layers. Lists refresh for each batch; graph replay retains
+its existing host-length rebinding. Draft setup uses the scheduler's CPU length
+mirror when available, retaining device reduction as a fallback. Verification
+must preserve the committed CPU lengths, including int32 inputs.
+
+These changes do not enable draft graphs or change draft sampling probabilities.
+NPU replay, output parity and end-to-end performance still require validation.

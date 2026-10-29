@@ -237,8 +237,117 @@ class TestFiaLengthMetadata(unittest.TestCase):
 
 
 class TestMTPAttentionLayout(unittest.TestCase):
+    def test_mtp_reuses_lengths_across_layers_and_refreshes_each_batch(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.speculative_num_draft_tokens = 1
+        backend.reuse_fia_metadata = True
+        backend.reuse_fia_kv_views = False
+        backend.use_mla = False
+        backend.graph_mode = False
+        backend.is_hybrid_swa = True
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = 128
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(3 * 512).reshape(3, 512)
+        )
+        backend.full_to_swa_index_mapping = torch.arange(3 * 512)
+        backend.mtp_mask = None
+        backend._can_use_tnd = lambda _: True
+        cache = torch.zeros(12, 128, 256)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=AttentionType.DECODER,
+            sliding_window_size=-1,
+            qk_head_dim=256,
+            v_head_dim=256,
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            scaling=256**-0.5,
+        )
+        for lengths in ([7, 0, 11], [9, 0, 17]):
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+                seq_lens=torch.tensor(lengths),
+                seq_lens_cpu=torch.tensor(lengths),
+                spec_info=None,
+                req_pool_indices=torch.arange(3),
+                extend_seq_lens=torch.tensor([1, 0, 1]),
+                extend_seq_lens_cpu=[1, 0, 1],
+                global_num_token_non_padded_cpu=2,
+                _original_batch_size=3,
+            )
+            with patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ):
+                backend.init_forward_metadata(batch)
+            cached_lengths = backend.forward_metadata.seq_lens_cpu_list
+            self.assertEqual(cached_lengths, lengths)
+            query = torch.randn(3, 256)
+
+            def fia(q, *args, cached_lengths=cached_lengths, **kwargs):
+                self.assertIs(kwargs["actual_seq_kvlen"], cached_lengths)
+                self.assertEqual(kwargs["actual_seq_qlen"], [1, 1, 2])
+                return q.clone(), None
+
+            with (
+                patch.object(
+                    torch.Tensor,
+                    "tolist",
+                    side_effect=AssertionError("per-layer conversion"),
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                    "torch_npu.npu_fused_infer_attention_score_v2",
+                    side_effect=fia,
+                ) as attention,
+            ):
+                for layer_id in (0, 1):
+                    layer.layer_id = layer_id
+                    result = backend.forward_mtp(query, None, None, layer, batch, False)
+                    torch.testing.assert_close(result[:2], query[:2])
+                    torch.testing.assert_close(result[2:], torch.zeros_like(query[2:]))
+            self.assertEqual(attention.call_count, 2)
+
+    def test_verify_cpu_int32_lengths_are_not_modified(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.speculative_num_draft_tokens = 1
+        backend.reuse_fia_metadata = True
+        backend.use_mla = False
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = 128
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(2 * 512).reshape(2, 512)
+        )
+        for dtype in (torch.int32, torch.int64):
+            lengths = torch.tensor([7, 11], dtype=dtype)
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                seq_lens=lengths.clone(),
+                seq_lens_cpu=lengths,
+                spec_algorithm=None,
+                spec_info=SimpleNamespace(draft_token_num=4),
+                req_pool_indices=torch.arange(2),
+                extend_seq_lens=None,
+            )
+            with patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ):
+                backend.init_forward_metadata(batch)
+            torch.testing.assert_close(lengths, torch.tensor([7, 11], dtype=dtype))
+            self.assertEqual(backend.forward_metadata.seq_lens_cpu_list, [11, 15])
+
     def test_verify_512_uses_bsnd_with_per_request_prefix_masks(self):
         backend = object.__new__(AscendAttnBackend)
+        backend.reuse_fia_metadata = False
         backend.use_mla = False
         backend.graph_mode = False
         backend.is_hybrid_swa = True

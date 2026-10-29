@@ -5,6 +5,7 @@ from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -12,7 +13,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPWorkerV2
+from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+    FrozenKVMTPDraftWorker,
+    FrozenKVMTPWorkerV2,
+)
 
 
 class TestFrozenKVMTPForward(CustomTestCase):
@@ -31,6 +36,31 @@ class TestFrozenKVMTPForward(CustomTestCase):
                 )
             )
         return stack
+
+    def test_draft_uses_cpu_lengths_and_retains_device_fallback(self):
+        for use_cpu in (True, False):
+            with self.subTest(use_cpu=use_cpu):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=object.__new__(FrozenKVMTPDraftInput),
+                    seq_lens_cpu=torch.tensor([7, 10]) if use_cpu else None,
+                    seq_lens=object() if use_cpu else torch.tensor([7, 10]),
+                )
+                worker = SimpleNamespace(
+                    topk=1,
+                    _position_for_batch=Mock(),
+                    draft_model_runner=object(),
+                )
+                with (
+                    patch(
+                        "sglang.srt.speculative.frozen_kv_mtp_worker_v2.ForwardBatch.init_new",
+                        side_effect=RuntimeError("stop before device forward"),
+                    ) as init,
+                    self.assertRaisesRegex(RuntimeError, "stop before device"),
+                ):
+                    FrozenKVMTPDraftWorker.draft(worker, batch)
+                init.assert_called_once()
+                self.assertEqual(batch.seq_lens_sum, 17)
 
     def test_prefill_accepts_scheduler_proxy_argument(self):
         for proxy in (None, object()):

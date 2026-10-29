@@ -654,9 +654,9 @@ class AscendAttnBackend(AttentionBackend):
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
         # only rebind the Host-side IntArray when captured as a Python list.
 
-        if (
-            not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_target_verify()
+        if not forward_batch.forward_mode.is_target_verify() and (
+            self.reuse_fia_metadata
+            or not forward_batch.forward_mode.is_draft_extend_v2()
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = (
@@ -668,14 +668,18 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if spec_algorithm is None or not spec_algorithm.is_dflash_family():
-                self.forward_metadata.seq_lens_cpu_int += int(
-                    forward_batch.spec_info.draft_token_num
+                # int() may alias an int32 CPU input; preserve committed lengths.
+                self.forward_metadata.seq_lens_cpu_int = (
+                    self.forward_metadata.seq_lens_cpu_int
+                    + int(forward_batch.spec_info.draft_token_num)
                 )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            self.forward_metadata.seq_lens_cpu_int = (
+                self.forward_metadata.seq_lens_cpu_int + self.speculative_step_id + 1
+            )
 
         if self.reuse_fia_metadata:
             # Avoid extracting scalar lengths in every attention layer.
@@ -2741,7 +2745,10 @@ class AscendAttnBackend(AttentionBackend):
                 if forward_batch.forward_mode.is_target_verify():
                     real_bs = query.shape[0] // self.speculative_num_draft_tokens
 
-            if self.forward_metadata.seq_lens_cpu_int is None:
+            if (
+                self.forward_metadata.seq_lens_cpu_int is None
+                or self.reuse_fia_metadata
+            ):
                 # Graph mode: bind the Python list, which graph.update can
                 # rebind (a captured CPU tensor would be baked as constant).
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
@@ -2762,7 +2769,14 @@ class AscendAttnBackend(AttentionBackend):
                     extend_seq_lens_cpu = extend_seq_lens_cpu[
                         : forward_batch._original_batch_size
                     ]
-                actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
+                if self.reuse_fia_metadata and not self.graph_mode:
+                    actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
+                    if len(actual_seq_lengths) > len(extend_seq_lens_cpu):
+                        actual_seq_lengths = actual_seq_lengths[
+                            : len(extend_seq_lens_cpu)
+                        ]
+                else:
+                    actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
             else:
                 # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
@@ -2773,7 +2787,8 @@ class AscendAttnBackend(AttentionBackend):
 
             if not self.graph_mode:
                 actual_bs = len(actual_seq_lengths)
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+                if len(actual_seq_lengths_kv) > actual_bs:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
 
             is_swa_layer = layer.sliding_window_size != -1
             if (
