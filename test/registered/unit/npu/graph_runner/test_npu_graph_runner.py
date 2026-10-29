@@ -91,3 +91,64 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_frozen_verify_rebinds_from_cpu_prefix_without_device_to_host_sync():
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.use_frozen_kv_mtp = True
+    runner.use_fias_v2_bsnd = False
+    runner.if_use_v2 = False
+    runner.is_dllm = False
+    runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: True)
+    runner.captured_req_width = 4
+    runner.raw_bs = 2
+    runner.bs = 4
+    runner.raw_num_token = 8
+    runner.require_mlp_tp_gather = False
+    runner.load_batch = mock.Mock()
+    runner.deepep_adapter = SimpleNamespace(replay=mock.Mock())
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+        model_config=SimpleNamespace(hf_config=object()),
+    )
+    runner._make_graph_key = lambda bs: ("graph", bs)
+    runner._init_arch_map()
+    runner.backend = SimpleNamespace(
+        replay_with_input_update=mock.Mock(
+            return_value=LogitsProcessorOutput(
+                next_token_logits=torch.arange(16).view(16, 1),
+                hidden_states=torch.arange(16).view(16, 1),
+            )
+        )
+    )
+    device_copy = mock.Mock(
+        side_effect=AssertionError("unexpected D2H synchronization")
+    )
+    cpu_prefix = torch.tensor([100, 2900], dtype=torch.int32)
+    batch = SimpleNamespace(
+        needs_forward_metadata_init=lambda: True,
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        seq_lens=SimpleNamespace(cpu=device_copy),
+        seq_lens_cpu=cpu_prefix,
+    )
+    with (
+        mock.patch.object(mod, "is_deepseek_dsa", return_value=False),
+        mock.patch.object(mod, "is_deepseek_v4", return_value=False),
+    ):
+        output = runner.execute(batch)
+    device_copy.assert_not_called()
+    runner.backend.replay_with_input_update.assert_called_once_with(
+        ("graph", 4),
+        seq_lens=[104, 2904, 0, 0],
+        attr_name="actual_seq_kvlen",
+        attr_type=[],
+    )
+    assert cpu_prefix.tolist() == [100, 2900]
+    assert output.next_token_logits.shape[0] == 8
+    assert output.hidden_states.shape[0] == 8
+
+
+def test_frozen_verify_without_cpu_prefix_uses_eager_fallback():
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.use_frozen_kv_mtp = True
+    assert not runner.can_run_graph(SimpleNamespace(seq_lens_cpu=None))
