@@ -461,14 +461,14 @@ class TestDsaTokenResidual(CustomTestCase):
             tp=None, dcp=None, model_path=None, real_weights=False, context_length=None
         )
 
-    def test_archive_recipe_env_stack_at_tp8_dcp8(self):
+    def test_archive_recipe_env_stack_at_tp16_dcp16(self):
         # Pin the archived recipe so launcher drift cannot invalidate A/B runs.
         launch = self._load_launch_module()
         command, env, selected = launch.launch_config(
-            self._launch_args(), {"TP": "8", "DCP": "8"}
+            self._launch_args(), {"TP": "16", "DCP": "16"}
         )
-        self.assertEqual(command[command.index("--tp-size") + 1], "8")
-        self.assertEqual(command[command.index("--dcp-size") + 1], "8")
+        self.assertEqual(command[command.index("--tp-size") + 1], "16")
+        self.assertEqual(command[command.index("--dcp-size") + 1], "16")
         expected = {
             "SGLANG_NPU_INDEXER_INT8": "True",
             "SGLANG_NPU_ENABLE_DSA_CP": "True",
@@ -498,7 +498,7 @@ class TestDsaTokenResidual(CustomTestCase):
         }
         self.assertEqual(selected, expected)
         # The exact Phase A recipe combo must pass the restored-tree gate.
-        validate_legacy_dcp_flags(selected, tp_size=8, dcp_size=8)
+        validate_legacy_dcp_flags(selected, tp_size=16, dcp_size=16)
 
     def test_recipe_env_overrides_win(self):
         # Attribution runs must be able to disable one optimization at a time.

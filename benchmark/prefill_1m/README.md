@@ -19,7 +19,7 @@ switches.
 
 ## Run
 
-After the TP8/DCP8 dummy smoke passes, follow the [eight-NPU next steps](repro_bde_v2/NEXT_STEPS_TP8.md) for real-weight validation and staged benchmarks.
+Use the [sixteen-NPU next steps](repro_bde_v2/NEXT_STEPS_TP16.md) for full-weight validation and staged benchmarks; eight NPUs cannot hold the full weights plus KV cache.
 
 Use SGLang's serving benchmark against an already running server for a
 single cold long-context point:
@@ -94,12 +94,12 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage all --dry-run
 
 # Full A3 run: existing unit suites, NPU operator tests, sequential server variants.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
-    --model-path /path/to/GLM-5.3-BF16 --tp 16 --dcp 8
+    --model-path /path/to/GLM-5.3-BF16 --tp 16 --dcp 16
 
 # Optional 1M-token cold-prefill benchmark on the baseline server.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage serve \
     --cases serve-baseline --model-path /path/to/GLM-5.3-BF16 \
-    --tp 16 --dcp 8 --context-length 1048608 --long-context 1048576
+    --tp 16 --dcp 16 --context-length 1048608 --long-context 1048576
 
 # Rerun a subset; case globs are comma-separated.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage unit \
@@ -124,7 +124,7 @@ For the offline INT checkpoint at `/home/weights/GLM5.2-w4a8-int/`:
 ```bash
 python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
     --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
-    --tp 16 --dcp 8 --output report.md
+    --tp 16 --dcp 16 --output report.md
 ```
 
 This passes `--quantization modelslim` to each server. The three online
@@ -139,7 +139,7 @@ To cover online conversion in the same run, add the BF16 checkpoint:
 python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
     --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
     --bf16-model-path /actual/path/to/GLM-5.3-BF16 \
-    --tp 16 --dcp 8 --output report.md
+    --tp 16 --dcp 16 --output report.md
 ```
 
 Only the three online-conversion cases use `--bf16-model-path`; the other
@@ -234,7 +234,7 @@ for outstanding loading groups; this is separate from NPU peak memory.
 # Host + device regressions, independent feature activation and numerical parity.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage all \
   --model-path /home/weights/GLM5.2-w4a8-int/ --checkpoint-format modelslim \
-  --bf16-model-path /home/weights/GLM-5.2 --tp 16 --dcp 8 --output validation.md
+  --bf16-model-path /home/weights/GLM-5.2 --tp 16 --dcp 16 --output validation.md
 
 # Small SGLang serving benchmarks: baseline and selected qualified variants.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage small \
@@ -242,7 +242,7 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage small \
 
 # Cold and 99% shared-prefix TTFT, 32K/128K/256K/512K/1M, concurrency 1/16.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage long \
-  --benchmark-variants baseline,megamoe --tp 16 --dcp 8 --output long.md
+  --benchmark-variants baseline,megamoe --tp 16 --dcp 16 --output long.md
 
 # Inspect commands before allocating devices or loading weights.
 python3 benchmark/prefill_1m/test_glm53_features.py --stage long --dry-run \

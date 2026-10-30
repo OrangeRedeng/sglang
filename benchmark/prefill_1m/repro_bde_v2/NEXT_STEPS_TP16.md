@@ -1,8 +1,9 @@
-# After the TP8/DCP8 half-depth dummy-weight smoke
+# TP16/DCP16 full-weight validation
 
-The smoke passed on A3. Full-model checkpoint loading, numerical parity, and
-performance remain to be checked. Run the stages below in order, from the
-repository root, with no other server holding the eight selected NPUs.
+The half-depth dummy-weight smoke passed on A3. Full weights plus KV cache
+require sixteen NPUs. Full-model loading, numerical parity, and performance
+remain to be checked. Run the stages below in order from the repository root,
+with no other server holding the sixteen selected NPUs.
 
 ## 1. Full-model INT serving and short-request correctness
 
@@ -10,16 +11,16 @@ Use the full ModelSlim W4A8/W8A8 checkpoint, not a cropped model. These commands
 use real weights and preserve its layer count. Both graph backends stay disabled.
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 CHECKPOINT=/path/to/full/GLM-5.3-ModelSlim-INT
-RESULTS="$PWD/.codex-artifacts/tp8-validation-$(date +%Y%m%d-%H%M%S)"
+RESULTS="$PWD/.codex-artifacts/tp16-validation-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS"
 git rev-parse HEAD > "$RESULTS/commit.txt"
 npu-smi info > "$RESULTS/npu-before.txt"
 
 COMMON=(--model-path "$CHECKPOINT" --checkpoint-format modelslim
-        --tp 8 --dcp 8 --mem-fraction 0.70 --startup-timeout 1800)
+        --tp 16 --dcp 16 --mem-fraction 0.70 --startup-timeout 1800)
 
 python3 benchmark/prefill_1m/test_glm53_features.py --stage serve \
   --cases serve-dcp-kv-gather "${COMMON[@]}" \
@@ -29,8 +30,16 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage serve \
 The runner starts and stops the servers itself. Continue only when the report
 shows successful real-weight loading, generation, and parity checks. A blocked,
 dependency-blocked, failed, or coverage-blocked case is not a pass. If this full
-checkpoint cannot fit on eight NPUs, stop and report the memory failure; a
+checkpoint cannot fit on sixteen NPUs, stop and report the memory failure; a
 cropped or dummy model cannot qualify the full-model configuration.
+
+For the registered TP16/DCP16 launch/generation smoke alone, after exporting the
+variables above:
+
+```bash
+GLM_5_2_W4A8_MODEL_PATH_OVERRIDE="$CHECKPOINT" \
+  python3 test/registered/e2e/attention/test_npu_bde_v2_launch_tp16_dcp16.py
+```
 
 ## 2. Qualify the DCP features and combined recipe
 
@@ -43,8 +52,8 @@ python3 benchmark/prefill_1m/test_glm53_features.py --stage serve \
 
 Require numerical parity and the expected activation evidence for each feature.
 The streamed output projection and combined BDE recipe require TP == DCP; keep
-both at eight. The first INT indexer-only case uses TP8 without DCP; the DCP
-cases use TP8/DCP8. All cases still use only the eight visible NPUs.
+both at sixteen. The first INT indexer-only case uses TP16 without DCP; the DCP
+cases use TP16/DCP16. All cases still use only the sixteen visible NPUs.
 
 ## 3. Measure short serving, then 32K/128K prefixes
 
@@ -96,12 +105,12 @@ its location:
 ```bash
 CAPTURE=0 CHUNK=32768 MEMFRAC=0.70 MAXREQ=4 PORT=30000 \
   EXTRA_ARGS='--quantization modelslim --watchdog-timeout 7200' \
-  python3 benchmark/prefill_1m/launch_bde_v2.py 8 --tp 8 \
+  python3 benchmark/prefill_1m/launch_bde_v2.py 16 --tp 16 \
   --model-path "$CHECKPOINT" --real-weights --context-length 131104 \
   2>&1 | tee "$RESULTS/aisbench-server-128k.log"
 ```
 
-In a second terminal, save `/server_info` and verify TP8/DCP8, real weights,
+In a second terminal, save `/server_info` and verify TP16/DCP16, real weights,
 disabled prefill/decode graphs, and the intended checkpoint. Run the existing
 AISBench at 128K with concurrency one first; record its exact command, seed,
 request count, output length, and repeat rate. Match those settings for the
@@ -110,4 +119,4 @@ the server context for 1M only after the capacity gate above passes.
 
 Return the Markdown reports, AISBench command/output, server logs, resolved
 server configuration, and device/environment versions. Keep BF16 online
-conversion, MXFP, graph capture, and TP16 outside this validation sequence.
+conversion, MXFP, and graph capture outside this validation sequence.

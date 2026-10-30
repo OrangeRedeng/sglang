@@ -1285,7 +1285,7 @@ def main():
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=16)
-    parser.add_argument("--dcp", type=int, default=8)
+    parser.add_argument("--dcp", type=int, default=16)
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument("--chunk", type=int, default=4096)
