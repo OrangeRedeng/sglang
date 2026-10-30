@@ -371,6 +371,7 @@ class Envs:
     # ===================================================================
     # Logging
     # ===================================================================
+    SGLANG_DEBUG_STAGE_LATENCY = EnvBool(False)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)

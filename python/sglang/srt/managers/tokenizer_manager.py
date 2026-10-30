@@ -981,13 +981,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         }
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
-        _ts_t = time.perf_counter()
-        _ts_rids = (
-            ",".join(sorted(request_rids))
-            if len(request_rids) <= 4
-            else f"{len(request_rids)} rids"
-        )
-        print(f"[SGL-TS] RECV-TM t={_ts_t:.6f} rid={_ts_rids}", flush=True)
+        if envs.SGLANG_DEBUG_STAGE_LATENCY.get():
+            _ts_t = time.perf_counter()
+            _ts_rids = (
+                ",".join(sorted(request_rids))
+                if len(request_rids) <= 4
+                else f"{len(request_rids)} rids"
+            )
+            print(f"[SGL-TS] RECV-TM t={_ts_t:.6f} rid={_ts_rids}", flush=True)
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)

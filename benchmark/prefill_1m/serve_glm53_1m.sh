@@ -61,9 +61,8 @@ export SGLANG_ENABLE_CHAT_ENCODE_POOL=${SGLANG_ENABLE_CHAT_ENCODE_POOL:-True}
 export SGLANG_CHAT_ENCODE_MEMO=${SGLANG_CHAT_ENCODE_MEMO:-True}
 
 # --- stage-latency probes ---------------------------------------------------
-# The [SGL-TS] print probes are enabled by default in this branch's import
-# commit. For a clean throughput number disable them; leave them on to get
-# the RECV-HTTP -> RECV-TM -> BATCH -> MODEL-FWD -> SENDBACK breakdown.
+# Set SGLANG_DEBUG_STAGE_LATENCY=1 for the [SGL-TS] stage breakdown.
+# Probes are off by default for clean throughput measurements.
 
 QUANT_ARGS=()
 if [ -n "$ONLINE_QUANT" ]; then

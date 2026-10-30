@@ -4716,13 +4716,14 @@ class Scheduler(
             if is_split_prefill:
                 batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
         self._sched_idled = False
-        _ts_t0 = time.perf_counter()
-        print(
-            f"[SGL-TS] BATCH-START t={_ts_t0:.6f} rank={get_parallel().tp_rank} "
-            f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
-            f"mode={batch.forward_mode}",
-            flush=True,
-        )
+        if envs.SGLANG_DEBUG_STAGE_LATENCY.get():
+            _ts_t0 = time.perf_counter()
+            print(
+                f"[SGL-TS] BATCH-START t={_ts_t0:.6f} rank={get_parallel().tp_rank} "
+                f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
+                f"mode={batch.forward_mode}",
+                flush=True,
+            )
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
         if batch.extend_num_tokens:
@@ -5031,13 +5032,14 @@ class Scheduler(
                 self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
-        _ts_t1 = time.perf_counter()
-        print(
-            f"[SGL-TS] BATCH-END t={_ts_t1:.6f} rank={get_parallel().tp_rank} "
-            f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
-            f"mode={batch.forward_mode} dur={_ts_t1 - _ts_t0:.3f}s",
-            flush=True,
-        )
+        if envs.SGLANG_DEBUG_STAGE_LATENCY.get():
+            _ts_t1 = time.perf_counter()
+            print(
+                f"[SGL-TS] BATCH-END t={_ts_t1:.6f} rank={get_parallel().tp_rank} "
+                f"nreq={len(batch.reqs)} ntok={batch.extend_num_tokens} "
+                f"mode={batch.forward_mode} dur={_ts_t1 - _ts_t0:.3f}s",
+                flush=True,
+            )
 
         return ret
 

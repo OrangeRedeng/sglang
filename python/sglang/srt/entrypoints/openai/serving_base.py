@@ -14,6 +14,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -85,11 +86,12 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
-        _ts_t = time.perf_counter()
-        print(
-            f"[SGL-TS] RECV-HTTP t={_ts_t:.6f} stream={getattr(request, 'stream', None)}",
-            flush=True,
-        )
+        if envs.SGLANG_DEBUG_STAGE_LATENCY.get():
+            _ts_t = time.perf_counter()
+            print(
+                f"[SGL-TS] RECV-HTTP t={_ts_t:.6f} stream={getattr(request, 'stream', None)}",
+                flush=True,
+            )
 
         try:
             # Validate request

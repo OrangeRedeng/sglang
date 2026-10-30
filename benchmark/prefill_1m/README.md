@@ -182,9 +182,9 @@ The branch carries the bde_v2 print-build `[SGL-TS]` probes:
 `RECV-HTTP` (serving_base), `RECV-TM` (tokenizer_manager), `BATCH-START/END`
 (scheduler), `MODEL-FWD-START/END` (model_runner), `SENDBACK`
 (serving_chat). Grep the server log for `SGL-TS` to segment TTFT into
-tokenize / schedule / forward / send-back. These prints are always-on in the
-current import commit; gate or strip them before quoting clean throughput
-numbers.
+tokenize / schedule / forward / send-back. Enable these probes with
+`SGLANG_DEBUG_STAGE_LATENCY=1`; they are off by default for clean throughput
+measurements.
 
 ## Divergence from the cookbook
 
