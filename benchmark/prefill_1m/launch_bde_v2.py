@@ -108,7 +108,14 @@ def launch_config(args, inherited):
         command += ["--context-length", str(args.context_length)]
     if env.get("AG_RS", "0") == "1":
         command += ["--dcp-comm-backend", "ag_rs"]
-    command += shlex.split(env.get("EXTRA_ARGS", ""))
+    extra = shlex.split(env.get("EXTRA_ARGS", ""))
+    command += extra
+    # Packed DCP reads require one request; larger batches duplicate and reorder
+    # each long prefix. Keep decode capacity independent of prefill batching.
+    if not any(arg.split("=", 1)[0] == "--prefill-max-requests" for arg in extra):
+        prefill_max = env.get("PREFILL_MAXREQ", "1" if dcp > 1 else None)
+        if prefill_max is not None:
+            command += ["--prefill-max-requests", prefill_max]
     command += [
         "--enable-metrics",
         "--trust-remote-code",

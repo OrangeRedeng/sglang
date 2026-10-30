@@ -169,6 +169,10 @@ def variant_launch(harness, repo, config):
         PORT="30000",
         EXTRA_ARGS=f"--quantization modelslim --watchdog-timeout 7200 --max-total-tokens {config['kv_rows']}",
     )
+    if scenario.get("dcp"):
+        inherited["PREFILL_MAXREQ"] = "1"
+    else:
+        inherited.pop("PREFILL_MAXREQ", None)
     args = argparse.Namespace(
         tp=16,
         dcp=16 if scenario.get("dcp") else 1,
@@ -322,6 +326,11 @@ def worker():
             ):
                 if resolved.get(key) != expected:
                     raise RuntimeError(f"Unexpected {key}: {resolved.get(key)}")
+            if (
+                harness.SCENARIOS[config["variant"]].get("dcp")
+                and resolved.get("prefill_max_requests") != 1
+            ):
+                raise RuntimeError("DCP timing requires prefill_max_requests=1")
             fuseep = harness.SCENARIOS[config["variant"]].get("fuseep")
             if fuseep and (
                 resolved.get("moe_ep_size") != 16

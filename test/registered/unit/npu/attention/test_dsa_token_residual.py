@@ -770,6 +770,7 @@ class TestDsaTokenResidual(CustomTestCase):
             ("--load-format", "dummy"),
             ("--chunked-prefill-size", "32768"),
             ("--max-running-requests", "64"),
+            ("--prefill-max-requests", "1"),
             ("--mem-fraction-static", "0.70"),
         ):
             self.assertEqual(command[command.index(flag) + 1], value)
@@ -792,6 +793,30 @@ class TestDsaTokenResidual(CustomTestCase):
         launch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(launch)
         return launch
+
+    def test_dcp_prefill_cap_is_independent_of_decode_and_overridable(self):
+        launch = self._load_launch_module()
+        args = self._launch_args()
+        args.tp, args.dcp = 16, 16
+        for extra in ("--prefill-max-requests 2", "--prefill-max-requests=2"):
+            with self.subTest(extra=extra):
+                command, _, _ = launch.launch_config(
+                    args, {"MAXREQ": "64", "EXTRA_ARGS": extra}
+                )
+                flags = [
+                    arg
+                    for arg in command
+                    if arg.split("=", 1)[0] == "--prefill-max-requests"
+                ]
+                self.assertEqual(len(flags), 1)
+                self.assertEqual(
+                    command[command.index("--max-running-requests") + 1], "64"
+                )
+        command, _, _ = launch.launch_config(args, {"PREFILL_MAXREQ": "3"})
+        self.assertEqual(command[command.index("--prefill-max-requests") + 1], "3")
+        args.dcp = 1
+        command, _, _ = launch.launch_config(args, {})
+        self.assertNotIn("--prefill-max-requests", command)
 
     @staticmethod
     def _launch_args():

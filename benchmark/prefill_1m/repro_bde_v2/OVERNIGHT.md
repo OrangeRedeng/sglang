@@ -15,7 +15,7 @@ Defaults match the supplied installation:
 | Full ModelSlim checkpoint | `/home/weights/GLM5.2-w4a8-int` |
 | Host AISBench directory | `/home/tbaydasov/aisbench/aisbench_auto_tools_prefix` |
 | Host environment script | `/home/tbaydasovset_env.sh` |
-| DCP server | TP16/DCP16, eager, CHUNK32768, MAXREQ64, MEMFRAC0.88 |
+| DCP server | TP16/DCP16, eager, CHUNK32768, MAXREQ64, one request per prefill batch, MEMFRAC0.88 |
 | KV cap | 81920 local rows, or 1310720 logical tokens |
 | Context | 1048576; benchmark input is 1000000 plus chat framing |
 | Workload | seed 4, prefix repeat 0.99, 16 requests/concurrency, one output token |
@@ -99,6 +99,29 @@ weights. Missing capabilities are reported, not silently replaced by the TP
 backend. The BDE residual path requires EP1, so it is not combined with the
 EP16 FuseEP modes. MoE and DCP are different workload groups; compare MoE
 variants to the MoE reference, not to the reported 20-second 1M DCP baseline.
+Packed DCP reads support a single request per prefill batch. The DCP group
+therefore pins `--prefill-max-requests 1` while keeping `MAXREQ64` for running
+requests/decode. Batching two 1M contexts selects the permutation-based gather
+instead, duplicating the shared prefix and increasing KV movement. MoE tests
+retain their normal batching. For manual launcher experiments, override the
+prefill cap with `PREFILL_MAXREQ` or `EXTRA_ARGS='--prefill-max-requests ...'`.
+
+For the supplied 1M prefix workload, the 67584-row TP16 pool holds 1081344
+logical tokens. The shared prefix plus sixteen distinct tails needs roughly
+1150000 tokens before page/decode overhead; the runner's 81920-row cap provides
+1310720. To retest manually with the baseline's 16384-token chunk size:
+
+```bash
+CAPTURE=0 CHUNK=16384 MEMFRAC=0.88 MAXREQ=64 PREFILL_MAXREQ=1 PORT=30000 \
+EXTRA_ARGS='--quantization modelslim --watchdog-timeout 7200 --max-total-tokens 81920' \
+python3 benchmark/prefill_1m/launch_bde_v2.py 16 --tp 16 \
+  --model-path /home/weights/GLM5.2-w4a8-int --real-weights --context-length 1048576
+```
+
+Check resolved `prefill_max_requests=1` and `#new-seq: 1` in prefill batches.
+Repeat the original AISBench input1000000/output1/concurrency16/prefix0.99
+workload after a cache flush. Compare its measured sixteen-request phase;
+the initial one-request 990k-token cold-prefix phase is separate.
 Override MoE input/output lengths and prefix reuse with `--moe-length`,
 `--moe-output-len` and `--moe-repeat-rate`; input plus output must fit context8192.
 

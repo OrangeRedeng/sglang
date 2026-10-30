@@ -170,6 +170,12 @@ class TestBdeOvernight(CustomTestCase):
                     command[command.index("--dcp-size") + 1],
                     "16" if variant == "bde-v2" else "1",
                 )
+                if variant == "bde-v2":
+                    self.assertEqual(
+                        command[command.index("--prefill-max-requests") + 1], "1"
+                    )
+                else:
+                    self.assertNotIn("--prefill-max-requests", command)
                 self.assertEqual(
                     env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"],
                     "True" if variant == "bde-v2" else "False",
