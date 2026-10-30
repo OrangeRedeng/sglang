@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
 
+import numpy as np
 import torch
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
@@ -76,6 +77,9 @@ def frozen_kv_fia_v2(query, key, value, *, output_dim, **kwargs):
     tasks, resources = state
     if kwargs.get("input_layout") not in ("TND", "BSND"):
         raise ValueError("Frozen-KV FIA graphs require TND or BSND")
+    for name in ("actual_seq_qlen", "actual_seq_kvlen"):
+        if isinstance(kwargs.get(name), np.ndarray):
+            kwargs[name] = kwargs[name].tolist()
     params = dict(query=query, key=key, value=value, **kwargs)
     # Workspace is shared only between identical operator signatures in one graph.
     signature = tuple(
