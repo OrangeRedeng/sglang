@@ -132,21 +132,23 @@ class _IndexerQueryShard:
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Same arithmetic, but the two sites read their inputs separately;
             # if those ever drift, the gather stays correct where this would not.
-            print_info_once(
-                "DSA token-shard and indexer sharding disagree on the row range "
-                f"(plan {plan.local_start}+{plan.rows} against shard "
-                f"{self.start}+{self.rows}); keeping the top-k all-gather"
-            )
+            if envs.SGLANG_NPU_DEBUG_DCP.get():
+                print_info_once(
+                    "DSA token-shard and indexer sharding disagree on the row range "
+                    f"(plan {plan.local_start}+{plan.rows} against shard "
+                    f"{self.start}+{self.rows}); keeping the top-k all-gather"
+                )
             local = False
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
             return self.gather(topk_indices, num_tokens)
         # Every rank logs, so a grep counts ranks: the output is identical either
         # way, which makes this line the only evidence it ran.
-        print_info_once(
-            "DSA token-shard: skipping the indexer top-k all-gather; each rank "
-            "keeps the rows it scored"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA token-shard: skipping the indexer top-k all-gather; each rank "
+                "keeps the rows it scored"
+            )
         if self.num_real < self.rows:
             topk_indices[self.num_real :] = 0
         return topk_indices
@@ -169,11 +171,12 @@ def _build_indexer_query_shard(
     start, rows, num_real, cum_query_lens, key_lens = plan_indexer_query_shard(
         prefix_lens, extend_lens, parallel.attn_tp_size, parallel.attn_tp_rank
     )
-    # Every rank logs, so a grep counts ranks; /server_info cannot show it.
-    print_info_once(
-        "DSA indexer query sharding is active: prefill indexer queries split "
-        f"across attn_tp_size={parallel.attn_tp_size}"
-    )
+    # Debug output includes every rank; /server_info cannot show this path.
+    if envs.SGLANG_NPU_DEBUG_DCP.get():
+        print_info_once(
+            "DSA indexer query sharding is active: prefill indexer queries split "
+            f"across attn_tp_size={parallel.attn_tp_size}"
+        )
     device = forward_batch.seq_lens.device
     return _IndexerQueryShard(
         start=start,
@@ -218,10 +221,11 @@ def _get_indexer_query_shard(
         )
     if get_attn_tp_context().input_scattered:
         # A scattered input is already sliced.
-        print_info_once(
-            "DSA indexer query sharding is off: the attention input "
-            "is scattered across the TP group"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA indexer query sharding is off: the attention input "
+                "is scattered across the TP group"
+            )
         return None
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
         forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
@@ -234,10 +238,11 @@ def _get_indexer_query_shard(
     # total alone would disable sharding for 15 token counts in 16.
     padded = shard.rows * shard.tp_size
     if not shard.total <= num_tokens <= padded:
-        print_info_once(
-            "DSA indexer query sharding is off for this forward: "
-            f"num_tokens={num_tokens} is outside [{shard.total}, {padded}]"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA indexer query sharding is off for this forward: "
+                f"num_tokens={num_tokens} is outside [{shard.total}, {padded}]"
+            )
         return None
     return shard
 

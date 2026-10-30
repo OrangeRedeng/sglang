@@ -1200,10 +1200,11 @@ class ModelRunner:
                 continue
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
             n_prepared += 1
-        logger.info(
-            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
-            n_prepared,
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            logger.info(
+                "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+                n_prepared,
+            )
 
     def _prepare_dsa_cp_full_q_weights(self) -> None:
         # DSA-CP Q full width (version B): gather each rank's attn-TP head
@@ -1301,14 +1302,15 @@ class ModelRunner:
                 )
             total_bytes += m.q_b_proj_qrep_weight.numel() + m.w_kc_qrep.numel()
             n_prepared += 1
-        logger.info(
-            "dsa_cp_q_full_width: prepared full-head q_b/w_kc for %d MLA layers, "
-            "%d bytes/rank (%.2f GiB), peak device memory %.2f GiB",
-            n_prepared,
-            total_bytes,
-            total_bytes / (1 << 30),
-            torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            logger.info(
+                "dsa_cp_q_full_width: prepared full-head q_b/w_kc for %d MLA layers, "
+                "%d bytes/rank (%.2f GiB), peak device memory %.2f GiB",
+                n_prepared,
+                total_bytes,
+                total_bytes / (1 << 30),
+                torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
+            )
 
     def _prepare_dsa_cp_token_sharded(self) -> None:
         # DSA-CP token sharding (D1v3): the full rebuild. The gate is a hard
@@ -1472,41 +1474,44 @@ class ModelRunner:
                 # over dim 1, not dim 0.
                 m.o_proj_qrep_weight = tp_group.all_gather(w_o, dim=1)
                 total_bytes += m.o_proj_qrep_weight.numel()
-        logger.info(
-            "dsa_cp_token_sharded: prepared the token-sharded rebuild for %d "
-            "DSA layers, %d new elements/rank (%.2f GiB bf16-equivalent), "
-            "peak device memory %.2f GiB",
-            len(dsa_layers),
-            total_bytes,
-            total_bytes * 2 / (1 << 30),
-            torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            logger.info(
+                "dsa_cp_token_sharded: prepared the token-sharded rebuild for %d "
+                "DSA layers, %d new elements/rank (%.2f GiB bf16-equivalent), "
+                "peak device memory %.2f GiB",
+                len(dsa_layers),
+                total_bytes,
+                total_bytes * 2 / (1 << 30),
+                torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
+            )
         m0 = dsa_layers[0]
         if stream_o_proj:
-            logger.info(
-                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
-                "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj STREAMED "
-                "(shard %s, full %s assembled on the gather side stream) "
-                "(first layer shown; all DSA layers share the same shapes)",
-                tuple(m0.q_b_proj_qrep_weight.shape),
-                tuple(m0.w_kc_qrep.shape),
-                tuple(m0.w_vc_qrep.shape),
-                tuple(m0.o_proj_stream_shard.shape),
-                (
-                    m0.o_proj_stream_shard.shape[0],
-                    m0.o_proj_stream_shard.shape[1] * parallel.attn_tp_size,
-                ),
-            )
+            if envs.SGLANG_NPU_DEBUG_DCP.get():
+                logger.info(
+                    "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                    "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj STREAMED "
+                    "(shard %s, full %s assembled on the gather side stream) "
+                    "(first layer shown; all DSA layers share the same shapes)",
+                    tuple(m0.q_b_proj_qrep_weight.shape),
+                    tuple(m0.w_kc_qrep.shape),
+                    tuple(m0.w_vc_qrep.shape),
+                    tuple(m0.o_proj_stream_shard.shape),
+                    (
+                        m0.o_proj_stream_shard.shape[0],
+                        m0.o_proj_stream_shard.shape[1] * parallel.attn_tp_size,
+                    ),
+                )
         else:
-            logger.info(
-                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
-                "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj_qrep %s "
-                "(first layer shown; all DSA layers share the same shapes)",
-                tuple(m0.q_b_proj_qrep_weight.shape),
-                tuple(m0.w_kc_qrep.shape),
-                tuple(m0.w_vc_qrep.shape),
-                tuple(m0.o_proj_qrep_weight.shape),
-            )
+            if envs.SGLANG_NPU_DEBUG_DCP.get():
+                logger.info(
+                    "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                    "q_b_proj_qrep %s, w_kc_qrep %s, w_vc_qrep %s, o_proj_qrep %s "
+                    "(first layer shown; all DSA layers share the same shapes)",
+                    tuple(m0.q_b_proj_qrep_weight.shape),
+                    tuple(m0.w_kc_qrep.shape),
+                    tuple(m0.w_vc_qrep.shape),
+                    tuple(m0.o_proj_qrep_weight.shape),
+                )
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm the sampling path after graph initialization."""

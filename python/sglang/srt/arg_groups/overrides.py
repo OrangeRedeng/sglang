@@ -1419,11 +1419,12 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         backend = "a2a"
     else:
         backend = "ag_rs"
-    logger.info(
-        "DCP (dcp_size=%d) selects communication backend %r.",
-        view.dcp_size,
-        backend,
-    )
+    if envs.SGLANG_NPU_DEBUG_DCP.get():
+        logger.info(
+            "DCP (dcp_size=%d) selects communication backend %r.",
+            view.dcp_size,
+            backend,
+        )
     return {"dcp_comm_backend": backend}
 
 

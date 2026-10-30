@@ -382,6 +382,43 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    def test_ascend_dcp_budget_matches_physical_pool_storage(self):
+        """Replicated index-K must not shrink the usable pool through double pricing."""
+        import torch
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        rows, layers = 67584, 2
+        mr = _make_model_runner(self, num_layers=layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.bfloat16
+        _publish_config(self, attention_backend="ascend")
+        for dcp in (1, 16):
+            with self.subTest(dcp=dcp):
+                latent = torch.empty(
+                    (layers, rows, 576), device="meta", dtype=torch.bfloat16
+                )
+                indexer = torch.empty(
+                    (layers, rows * dcp, 128), device="meta", dtype=torch.bfloat16
+                )
+                budget = sum(t.numel() * t.element_size() for t in (latent, indexer))
+                with (
+                    mock_cpu_env(tp_size=dcp),
+                    get_parallel().override(attn_dcp_size=dcp),
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator.sfa_packed_kv_cache_row_bytes",
+                        return_value=None,
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                        return_value=False,
+                    ),
+                ):
+                    config = DefaultPoolConfigurator(mr).calculate_pool_sizes(
+                        budget, 128
+                    )
+                self.assertEqual(config.max_total_num_tokens, rows)
+
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
         the per-draft-layer ratio under-reserves the pad."""

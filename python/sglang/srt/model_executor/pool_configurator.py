@@ -425,7 +425,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     dcp_size,
                     index_buf_is_replicated=self._is_ascend_mla_pool(kvc),
                 )
-                if not kvc.is_draft_worker:
+                # Ascend's widening factor already prices the replicated indexer.
+                if not kvc.is_draft_worker and not self._is_ascend_mla_pool(kvc):
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):

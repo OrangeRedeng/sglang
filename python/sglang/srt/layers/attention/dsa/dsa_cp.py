@@ -64,11 +64,12 @@ if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
             "itself, at a slot mapping DSA-CP has already sliced."
         )
     _enable_dsa_cp = False
-    print_info_once(
-        "DSA-CP is off because SGLANG_NPU_USE_MLAPO is on: the fused MLA "
-        "preprocess writes the KV cache at a slot mapping DSA-CP would have "
-        "sliced. Unset SGLANG_NPU_USE_MLAPO to get the sharded attention back"
-    )
+    if envs.SGLANG_NPU_DEBUG_DCP.get():
+        print_info_once(
+            "DSA-CP is off because SGLANG_NPU_USE_MLAPO is on: the fused MLA "
+            "preprocess writes the KV cache at a slot mapping DSA-CP would have "
+            "sliced. Unset SGLANG_NPU_USE_MLAPO to get the sharded attention back"
+        )
 
 
 _enable_dsa_cp_multi_request = envs.SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST.get()
@@ -264,7 +265,8 @@ def get_dsa_cp_plan(
 def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
-        print_info_once("DSA-CP is off: attention TP size is 1, nothing to shard")
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once("DSA-CP is off: attention TP size is 1, nothing to shard")
         return None
 
     mode = forward_batch.forward_mode
@@ -273,16 +275,18 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
         # defect: see the docstring.
         return None
     if mode.is_draft_extend_v2() or mode.is_target_verify():
-        print_info_once(
-            f"DSA-CP is off for {mode}: the draft and verify paths carry their "
-            "own per-step sequence-length tables, which this does not build yet"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA-CP is off for {mode}: the draft and verify paths carry their "
+                "own per-step sequence-length tables, which this does not build yet"
+            )
         return None
 
     extend_lens = forward_batch.extend_seq_lens_cpu
     prefix_lens = forward_batch.extend_prefix_lens_cpu
     if not extend_lens or prefix_lens is None:
-        print_info_once("DSA-CP is off: this extend carries no CPU length metadata")
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once("DSA-CP is off: this extend carries no CPU length metadata")
         return None
 
     if not threshold_allows("SGLANG_NPU_DSA_CP_MIN_TOKENS", sum(extend_lens)):
@@ -303,29 +307,32 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
     if not lift_applies and multi_request:
         # The restriction is the KV layout, not the query arithmetic: the
         # buffer's cumulative KV lengths double as its request boundaries.
-        print_info_once(
-            "DSA-CP is off for multi-request extends "
-            f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
-            "cumulative KV lengths it would need describe the buffer's own "
-            "request boundaries. SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST lifts this"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA-CP is off for multi-request extends "
+                f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
+                "cumulative KV lengths it would need describe the buffer's own "
+                "request boundaries. SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST lifts this"
+            )
         return None
 
     if plan.num_tokens < parallel.attn_tp_size:
         # Fewer tokens than ranks: most ranks would hold nothing but padding and
         # the all-gathers would move more than the attention saves.
-        print_info_once(
-            f"DSA-CP is off for batches under {parallel.attn_tp_size} tokens "
-            f"(this one has {plan.num_tokens}); the slice would be mostly padding"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA-CP is off for batches under {parallel.attn_tp_size} tokens "
+                f"(this one has {plan.num_tokens}); the slice would be mostly padding"
+            )
         return None
 
     # Log when it engages, not only when it refuses: an unset flag leaves this
     # function before every refusal, so no refusal line proves nothing.
-    print_info_once(
-        f"DSA-CP is ON: the attention query is sharded across "
-        f"{parallel.attn_tp_size} ranks at extend"
-    )
+    if envs.SGLANG_NPU_DEBUG_DCP.get():
+        print_info_once(
+            f"DSA-CP is ON: the attention query is sharded across "
+            f"{parallel.attn_tp_size} ranks at extend"
+        )
     return plan
 
 

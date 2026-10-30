@@ -330,12 +330,13 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
         buf = None
         buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
         _dcp_extend_gather_buffers[key] = buf
-        logger.info(
-            "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
-            name,
-            rows,
-            buf.numel() * buf.element_size() / (1 << 30),
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            logger.info(
+                "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
+                name,
+                rows,
+                buf.numel() * buf.element_size() / (1 << 30),
+            )
     return buf[:rows]
 
 
@@ -517,7 +518,12 @@ def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
         and prefix_lens
         and all(p + 1 >= index_topk for p in prefix_lens)
     )
-    if not ok and index_topk is not None and prefix_lens:
+    if (
+        not ok
+        and index_topk is not None
+        and prefix_lens
+        and envs.SGLANG_NPU_DEBUG_DCP.get()
+    ):
         print_info_once(
             f"DCP extend keeps the operator's causal crop: a request here has a "
             f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)})"
@@ -813,31 +819,35 @@ def dcp_packed_read_plan(
         # Refuse, and CACHE the refusal: a forward has to take one path the
         # whole way down. Resolving later would leave earlier layers' top-k
         # unremapped while later layers read a packed buffer.
-        print_info_once(
-            "DCP packed read is off: this forward reached the extend gather "
-            "with no top-k, so the causal bound cannot be checked"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DCP packed read is off: this forward reached the extend gather "
+                "with no top-k, so the causal bound cannot be checked"
+            )
     elif not extend_lens or prefix_lens is None:
-        print_info_once("DCP packed read is off: no CPU length metadata on this extend")
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once("DCP packed read is off: no CPU length metadata on this extend")
     elif len(extend_lens) != 1:
         # ONE REQUEST, for the layout reason in DcpPackedReadPlan: the
         # all-gather is rank-major over the WHOLE send, so with two requests a
         # request's rows land in dcp_size separate blocks and the operator's
         # cumulative actual_seq_lengths_kv cannot describe them. The permuting
         # path handles those; it is 13% of the tokens in the served benchmark.
-        print_info_once(
-            f"DCP packed read is off for multi-request extends "
-            f"({len(extend_lens)} requests here); the all-gather is rank-major "
-            "over the whole send, so no request is contiguous in it"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DCP packed read is off for multi-request extends "
+                f"({len(extend_lens)} requests here); the all-gather is rank-major "
+                "over the whole send, so no request is contiguous in it"
+            )
     elif not dcp_crop_free_extend(forward_batch, index_topk):
         # Measured, stage A, 2026-09-19: dropping the crop below this bound
         # moved prefill logprobs by up to 2.09 against a 0.354 noise floor.
         # dcp_crop_free_extend has already logged which request fell short.
-        print_info_once(
-            "DCP packed read is off: this chunk needs the operator's causal "
-            "crop, and the packed layout cannot use one"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DCP packed read is off: this chunk needs the operator's causal "
+                "crop, and the packed layout cannot use one"
+            )
     else:
         plan = plan_dcp_packed_read(
             prefix_lens[0],
@@ -845,10 +855,11 @@ def dcp_packed_read_plan(
             get_parallel().dcp_size,
             get_attn_backend().page_size,
         )
-        print_info_once(
-            "DCP packed read is ON: the sparse operator reads the all-gather's "
-            "own rank-major output and the top-k is remapped instead"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DCP packed read is ON: the sparse operator reads the all-gather's "
+                "own rank-major output and the top-k is remapped instead"
+            )
     forward_batch.npu_dcp_packed_plan = plan
     return plan
 

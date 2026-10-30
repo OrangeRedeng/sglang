@@ -68,8 +68,8 @@ def get_dsa_token_shard_plan(
 ) -> Optional[DsaTokenShardPlan]:
     """This forward's token slice for this rank, or None. Cached on the batch.
 
-    Extend only: decode is already fast under graph capture. Every refusal is
-    logged once, because a silent refusal looks the same as the feature running.
+    Extend only: decode is already fast under graph capture. Debug logging
+    reports each refusal once to distinguish fallback from activation.
     ``index_topk`` matters only to a multi-request DCP extend, and only the
     first caller's counts: pass it from the first one.
     """
@@ -90,7 +90,8 @@ def _build_dsa_token_shard_plan(
         return None
     parallel = get_parallel()
     if parallel.attn_tp_size <= 1:
-        print_info_once("DSA token-shard is off: attention TP size is 1")
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once("DSA token-shard is off: attention TP size is 1")
         return None
 
     # The same modes the indexer query shard admits.
@@ -101,9 +102,10 @@ def _build_dsa_token_shard_plan(
         # This extend all-gathers the query across the DCP group, which expects
         # every head-sharded query row, not this rank's token slice. An extend
         # that gathers the KV instead carries the metadata.
-        print_info_once(
-            "DSA token-shard is off for DCP extends that gather the attention query"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA token-shard is off for DCP extends that gather the attention query"
+            )
         return None
 
     if dsa_use_prefill_cp(forward_batch):
@@ -111,18 +113,20 @@ def _build_dsa_token_shard_plan(
 
     if get_attn_tp_context().input_scattered:
         # A scattered input is already sliced; slicing it again cuts twice.
-        print_info_once(
-            "DSA token-shard is off: the attention input is scattered across the "
-            "TP group"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA token-shard is off: the attention input is scattered across the "
+                "TP group"
+            )
         return None
 
     extend_lens = forward_batch.extend_seq_lens_cpu
     prefix_lens = forward_batch.extend_prefix_lens_cpu
     if not extend_lens or prefix_lens is None:
-        print_info_once(
-            "DSA token-shard is off: this extend carries no CPU length metadata"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                "DSA token-shard is off: this extend carries no CPU length metadata"
+            )
         return None
 
     plan = plan_dsa_token_shard(
@@ -141,18 +145,20 @@ def _build_dsa_token_shard_plan(
         # to its last sharded token moves the next request's start. Without the
         # crop the full lengths are only causal when the top-k cannot reach
         # past a token's own position.
-        print_info_once(
-            f"DSA token-shard is off for multi-request DCP extends ({num_requests} "
-            "requests here) with a prefix under index_topk"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA token-shard is off for multi-request DCP extends ({num_requests} "
+                "requests here) with a prefix under index_topk"
+            )
         return None
 
     if plan.num_tokens < parallel.attn_tp_size:
-        print_info_once(
-            f"DSA token-shard is off for batches under {parallel.attn_tp_size} "
-            f"tokens (this one has {plan.num_tokens}): the slice would be mostly "
-            "padding"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA token-shard is off for batches under {parallel.attn_tp_size} "
+                f"tokens (this one has {plan.num_tokens}): the slice would be mostly "
+                "padding"
+            )
         return None
 
     # Attention-DP MAX_LEN pads a rank to the widest DP rank, past the
@@ -160,18 +166,20 @@ def _build_dsa_token_shard_plan(
     # reads the plan, so neither it nor attention ever takes a token slice.
     num_rows = forward_batch.input_ids.shape[0]
     if num_rows > plan.num_tokens_pad:
-        print_info_once(
-            f"DSA token-shard is off for batches padded past the plan ({num_rows} "
-            f"rows for {plan.num_tokens} tokens): attention-DP MAX_LEN padding"
-        )
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA token-shard is off for batches padded past the plan ({num_rows} "
+                f"rows for {plan.num_tokens} tokens): attention-DP MAX_LEN padding"
+            )
         return None
 
     # Logged on engage too: an unset flag returns before every refusal, so the
     # absence of a refusal proves nothing.
-    print_info_once(
-        f"DSA token-shard is ON: the attention query is sharded across "
-        f"{parallel.attn_tp_size} ranks at extend"
-    )
+    if envs.SGLANG_NPU_DEBUG_DCP.get():
+        print_info_once(
+            f"DSA token-shard is ON: the attention query is sharded across "
+            f"{parallel.attn_tp_size} ranks at extend"
+        )
     return plan
 
 
