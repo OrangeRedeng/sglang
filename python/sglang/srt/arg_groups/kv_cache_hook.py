@@ -22,6 +22,9 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
+# Fused drafts require MHA backends that translate their KV indices.
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha", "fa4"})
+
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
     "nvfp4": "trtllm_mha",
