@@ -19,6 +19,8 @@ switches.
 
 ## Run
 
+After the TP8/DCP8 dummy smoke passes, follow the [eight-NPU next steps](repro_bde_v2/NEXT_STEPS_TP8.md) for real-weight validation and staged benchmarks.
+
 Use SGLang's serving benchmark against an already running server for a
 single cold long-context point:
 
