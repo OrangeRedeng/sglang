@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     model_config_of,
     record_foreign_defaults,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -62,6 +63,25 @@ def handle_npu_backends(server_args: Any):
                     "because dense W4A4 is inaccurate; it is currently MoE-only. "
                     f"Got architectures={architectures}."
                 )
+
+
+def handle_sail_backends(server_args: Any):
+    if not get_platform().is_sail:
+        return
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    cfg = resolving_view(server_args)
+    # SAIL FA3 rejects q_v from absorbed MLA prefill; DSA has its own policy.
+    if use_mla_backend(server_args) and not is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_sail_backends",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
 
 def handle_mps_backends(server_args: Any):
