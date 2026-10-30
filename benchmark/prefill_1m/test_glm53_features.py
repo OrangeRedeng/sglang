@@ -51,6 +51,7 @@ UNIT_SUITES = {
     ],
     "dcp-gather": [
         "unit/npu/attention/test_dcp_prefix_gather.py",
+        "unit/npu/attention/test_dsa_token_residual.py",
         "dcp/test_dcp_sfa_gather_overlap.py",
         "dcp/test_dcp_extend_gather_prefetch.py",
         "dcp/test_dcp_extend_gather_plan.py",
@@ -164,17 +165,68 @@ SCENARIOS = {
         "env": {"SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP": "True"},
         "expected": ["dcp-sfa-overlap"],
     },
+    "dcp-full-width-q": {
+        "dcp": True,
+        "env": {
+            "SGLANG_NPU_ENABLE_DSA_CP": "True",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "True",
+            "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+        },
+        "expected": ["dsa-full-width-q", "dsa-local-topk"],
+    },
     "dcp-legacy-token-shard": {
         "dcp": True,
-        "unsupported": "Legacy residual token sharding lacks a compatible attention consumer; reviewed query sharding has separate cases and does not prove equivalence.",
+        "env": {
+            "SGLANG_NPU_ENABLE_DSA_CP": "True",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "True",
+            "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+        },
+        "expected": ["dsa-residual-shard", "dsa-input-logprob-gather"],
     },
     "dcp-stream-o-proj": {
         "dcp": True,
-        "unsupported": "Streamed versus resident o_proj requires the disconnected legacy residual token-sharded path.",
+        "env": {
+            "SGLANG_NPU_ENABLE_DSA_CP": "True",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "True",
+            "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+            "SGLANG_NPU_STREAM_O_PROJ": "True",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True",
+        },
+        "expected": ["dsa-residual-shard", "dsa-o-proj-stream"],
+        "equal_tp_dcp": True,
     },
-    "dcp-legacy-q-variants": {
+    "dcp-decode-q-preissue": {
         "dcp": True,
-        "unsupported": "Legacy full-width Q, Q preissue and local top-k have no compatible consumer; distributed replacement equivalence is unproven.",
+        "env": {"SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True"},
+        "expected": ["dcp-decode-q-preissue"],
+    },
+    "bde-v2": {
+        "dcp": True,
+        "env": {
+            "SGLANG_NPU_ENABLE_DSA_CP": "True",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "True",
+            "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+            "SGLANG_NPU_STREAM_O_PROJ": "True",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True",
+            "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
+            "SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP": "True",
+            "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True",
+            "SGLANG_NPU_SFA_KV_8BIT": "True",
+            "SGLANG_NPU_INDEXER_INT8": "True",
+            "SGLANG_ENABLE_CHAT_ENCODE_POOL": "True",
+            "SGLANG_CHAT_ENCODE_MEMO": "True",
+            "SGLANG_CHAT_ENCODE_RAW": "True",
+        },
+        "expected": [
+            "dsa-residual-shard",
+            "dsa-o-proj-stream",
+            "indexer-int8",
+            "dcp-decode-q-preissue",
+        ],
+        "equal_tp_dcp": True,
     },
 }
 
@@ -615,8 +667,8 @@ def serve(args, case, directory, env):
                     raise RuntimeError(f"empty chat response: {chat}")
                 responses.append(chat)
             if scenario.get("dcp"):
-                prefix = [1] * 4096
-                for ids in (prefix, prefix + [2] * 256):
+                prefix = [1] * 6144
+                for ids in (prefix, prefix + [2] * 32):
                     responses.append(
                         request(
                             base + "/generate",
@@ -750,6 +802,11 @@ def validate_serving(args, case, directory, case_env, base_env):
     from feature_checks import compare_responses
 
     scenario = case["scenario"]
+    if scenario.get("equal_tp_dcp") and args.tp != args.dcp:
+        return dict(
+            status="blocked",
+            reason="BDE streamed o_proj requires identical TP/DCP groups; select --dcp equal to --tp",
+        )
     if scenario.get("unsupported"):
         return dict(status="coverage_blocked", reason=scenario["unsupported"])
     if scenario.get("graph") and scenario.get("dcp"):
@@ -772,6 +829,10 @@ def validate_serving(args, case, directory, case_env, base_env):
         for key, value in scenario.items()
         if key in ("quant", "dcp", "separate_shared")
     }
+    reference_env = base_env
+    if case["id"].endswith("dcp-stream-o-proj"):
+        reference["env"] = dict(scenario["env"], SGLANG_NPU_STREAM_O_PROJ="False")
+        reference_env = dict(base_env, **reference["env"])
     reference_key = json.dumps(reference, sort_keys=True)
     if reference_key in _REFERENCE_FAILURES:
         return dict(status="blocked", reason=_REFERENCE_FAILURES[reference_key])
@@ -785,7 +846,7 @@ def validate_serving(args, case, directory, case_env, base_env):
         reference_directory = directory / "reference"
         reference_directory.mkdir()
         try:
-            serve(args, reference_case, reference_directory, base_env)
+            serve(args, reference_case, reference_directory, reference_env)
         except Exception as exc:
             _REFERENCE_FAILURES[reference_key] = (
                 f"reference {reference_key} failed: {exc} (first occurrence: {case['id']})"
@@ -1469,7 +1530,7 @@ def main():
             "limitations": [
                 "Unit/mock passes are host evidence only.",
                 "Serving smoke does not establish optimization activation, numerical quality, graph replay or performance.",
-                "Legacy experimental D1v3 is disabled; reviewed PR token sharding is tested instead.",
+                "BDE residual sharding and streamed o_proj are opt-in ports; device activation, parity and memory measurements are required.",
             ],
         }
         args.output.write_text(
@@ -1513,6 +1574,11 @@ def main():
                 elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
                     result.update(
                         status="blocked", reason="DCP scenario needs --dcp > 1"
+                    )
+                elif case["id"] == "npu-dcp-prefix-hccl" and args.tp < 2:
+                    result.update(
+                        status="blocked",
+                        reason="distributed prefix/o_proj tests require at least two NPU ranks",
                     )
                 elif case["stage"] in SERVING_STAGES:
                     result.update(

@@ -6,28 +6,79 @@ from types import SimpleNamespace
 import torch
 
 
-def validate_legacy_dcp_flags(environment):
-    unsupported = (
-        "SGLANG_NPU_ENABLE_DSA_CP",
-        "SGLANG_NPU_DSA_CP_TOKEN_SHARDED",
-        "SGLANG_NPU_STREAM_O_PROJ",
-        "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH",
-        "SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE",
-        "SGLANG_NPU_DSA_CP_LOCAL_TOPK",
-        "SGLANG_NPU_DCP_DECODE_Q_PREISSUE",
-    )
-    enabled = [
-        key
-        for key in unsupported
-        if str(environment.get(key, "")).lower() in ("1", "true", "yes")
-    ]
-    if enabled:
+def validate_legacy_dcp_flags(environment, *, tp_size=None, dcp_size=None):
+    def enabled(key):
+        return str(environment.get(key, "")).lower() in ("1", "true", "yes")
+
+    cp = enabled("SGLANG_NPU_ENABLE_DSA_CP")
+    residual = enabled("SGLANG_NPU_DSA_CP_TOKEN_SHARDED")
+    full_q = enabled("SGLANG_NPU_DSA_CP_Q_FULL_WIDTH")
+    stream = enabled("SGLANG_NPU_STREAM_O_PROJ")
+    if enabled("SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE"):
         raise ValueError(
-            "Legacy DSA-CP features have no compatible consumer in the current attention path: "
-            + ", ".join(enabled)
-            + ". Use SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD for query sharding; "
-            "the legacy residual/o_proj memory optimization remains unvalidated."
+            "SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE is incompatible with the restored full-head path; leave it off"
         )
+    for flag in (
+        "SGLANG_NPU_DSA_CP_TOKEN_SHARDED",
+        "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH",
+        "SGLANG_NPU_DSA_CP_LOCAL_TOPK",
+    ):
+        if enabled(flag) and not cp:
+            raise ValueError(flag + " requires SGLANG_NPU_ENABLE_DSA_CP=True")
+    if cp and not (residual or full_q):
+        raise ValueError(
+            "SGLANG_NPU_ENABLE_DSA_CP requires full-width Q or the token-residual rebuild"
+        )
+    if stream and not residual:
+        raise ValueError(
+            "SGLANG_NPU_STREAM_O_PROJ requires SGLANG_NPU_DSA_CP_TOKEN_SHARDED=True"
+        )
+    if stream and (tp_size is None or dcp_size != tp_size):
+        raise ValueError(
+            "SGLANG_NPU_STREAM_O_PROJ requires equal TP/DCP sizes and rank order"
+        )
+    if (cp or enabled("SGLANG_NPU_DCP_DECODE_Q_PREISSUE")) and (
+        dcp_size is None or dcp_size < 2
+    ):
+        raise ValueError(
+            "SGLANG_NPU_ENABLE_DSA_CP / SGLANG_NPU_DCP_DECODE_Q_PREISSUE require DCP >= 2"
+        )
+
+
+def start_o_proj_gather(group, shard):
+    # RowParallel shards columns. Gather transposed shards along rows, then
+    # expose a transpose view; gathering raw [out, in_r] bytes scrambles W.
+    send = shard.t().contiguous()
+    gathered = send.new_empty((send.shape[0] * group.world_size, send.shape[1]))
+    work = group.all_gather_into_tensor_async(gathered, send)
+    return gathered, send, work
+
+
+@dataclass
+class PendingQueryHeads:
+    gathered: torch.Tensor
+    send: torch.Tensor
+    work: object
+    rope_dim: int
+
+    def finish(self):
+        if self.work is not None:
+            self.work.wait()
+        rope, nope = self.gathered.split(
+            [self.rope_dim, self.gathered.shape[-1] - self.rope_dim], dim=-1
+        )
+        return nope.transpose(0, 1), rope.transpose(0, 1)
+
+
+def start_query_head_gather(group, nope, rope):
+    send = torch.cat((rope.transpose(0, 1), nope.transpose(0, 1)), dim=-1).contiguous()
+    gathered = send.new_empty((send.shape[0] * group.world_size, *send.shape[1:]))
+    return PendingQueryHeads(
+        gathered,
+        send,
+        group.all_gather_into_tensor_async(gathered, send),
+        rope.shape[-1],
+    )
 
 
 @dataclass
@@ -109,14 +160,18 @@ class DcpGatherPipeline:
     def __init__(self):
         self.stream = torch.npu.Stream()
         self.slots = {}
+        self.o_proj_slots = {}
 
     def reset(self):
         # A reused ForwardBatch is not a forward identity. Prepare calls reset
         # on the first local layer of every forward, after prior consumers.
         self.stream.wait_stream(torch.npu.current_stream())
         self.slots.clear()
+        self.o_proj_slots.clear()
 
-    def issue(self, layer_id, pool, indices, refs, plan, parallel, packed):
+    def issue(
+        self, layer_id, pool, indices, refs, plan, parallel, packed, stream_o_proj=False
+    ):
         if layer_id in self.slots:
             return
         self.stream.wait_stream(torch.npu.current_stream())
@@ -132,6 +187,29 @@ class DcpGatherPipeline:
                     work.wait()
             pending.works.clear()
             event = self.stream.record_event()
+            if stream_o_proj:
+                from sglang.srt.layers.attention.dsa.dsa_cp import (
+                    get_o_proj_stream_shard,
+                )
+
+                shard = get_o_proj_stream_shard(layer_id)
+                if shard is None:
+                    raise RuntimeError(
+                        f"o_proj shard for layer {layer_id} was not prepared"
+                    )
+                if list(parallel.dcp_group.ranks) != list(parallel.attn_tp_group.ranks):
+                    raise ValueError(
+                        "Streamed o_proj requires identical DCP and attention-TP rank order"
+                    )
+                gathered, send, work = start_o_proj_gather(parallel.dcp_group, shard)
+                if work is not None:
+                    work.wait()
+                self.o_proj_slots[layer_id] = (
+                    gathered,
+                    send,
+                    self.stream.record_event(),
+                )
+                shard.record_stream(self.stream)
             for tensor in (*sends, *refs):
                 tensor.record_stream(self.stream)
         self.slots[layer_id] = (pending, event)
@@ -147,3 +225,13 @@ class DcpGatherPipeline:
         ):
             tensor.record_stream(current)
         return pending.finish(own)
+
+    def take_o_proj(self, layer_id):
+        gathered, send, event = self.o_proj_slots.pop(layer_id)
+        current = torch.npu.current_stream()
+        current.wait_event(event)
+        gathered.record_stream(current)
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("dsa-o-proj-stream")
+        return gathered.t()

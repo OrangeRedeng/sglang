@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmul,
     GroupedMatmulSwigluQuant,
@@ -259,7 +258,6 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     @staticmethod
     def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype: str) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
-        ascend_dispatch.set_dispatch_dtype(layer, dtype)
         if hasattr(layer, "dispatcher"):
             if dtype == "bf16":
                 from sglang.srt.hardware_backend.npu.moe.contracts import (
@@ -282,8 +280,6 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
                 ):
                     dtype = contract.kind
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
-
-    _set_moe_dispatch_dtype = _set_dispatcher_output_dtype
 
     @staticmethod
     def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:
@@ -605,7 +601,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
 
         # Set DeepEP dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_moe_dispatch_dtype(layer, "bf16")
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
     def _pack_int4(self, weight) -> torch.Tensor:
         """
@@ -727,7 +723,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_moe_dispatch_dtype(layer, "int8")
+            self._set_dispatcher_output_dtype(layer, "int8")
 
     def apply(
         self,
@@ -835,7 +831,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_moe_dispatch_dtype(layer, "int8")
+            self._set_dispatcher_output_dtype(layer, "int8")
 
     @staticmethod
     def _update_bias(
@@ -979,7 +975,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_moe_dispatch_dtype(layer, "bf16")
+            self._set_dispatcher_output_dtype(layer, "bf16")
 
     def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
         assert weight.dim() == 3
@@ -1225,9 +1221,10 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     (weights already quantised); ``process_weights_after_loading`` tells the two
     apart by weight dtype.
 
-    Plain SwiGLU uses ``apply_fused_gmm1_swiglu`` for w13. A positive
-    ``swiglu_limit`` uses an unfused w13 GEMM and the existing grouped clipped
-    SwiGLU + MXFP8 quantization before w2.
+    gmm1 re-quantises its own output, so it is a single fused kernel rather than
+    a matmul plus a separate activation: the runner calls
+    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
+    per-prefix matmul chosen here.
 
     Where the *activation* quant happens depends on the dispatcher. On
     ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
@@ -1240,7 +1237,6 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         if weight_prefix == "w13":
             self.matmul = GroupedMatmulSwigluQuant()
-            self.unfused_matmul = GroupedMatmul()
             self.hidden_states_quantizer = HiddenStatesDynamicQuant(
                 quant_dtype=torch.float8_e4m3fn
             )
@@ -1333,7 +1329,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
         Returns the e4m3 activations and their e8m0 block scale, i.e. exactly
         what the w2 gmm needs, which is why the runner skips its activation step
-        for plain SwiGLU.
+        for MXFP8.
 
         ``pertoken_scale`` is None when the dispatcher handed over unquantised
         hidden states (the BF16 fallback), in which case the activation quant that
@@ -1369,7 +1365,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: Optional[torch.Tensor],
+        pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,

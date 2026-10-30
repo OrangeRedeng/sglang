@@ -293,6 +293,7 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
         [p + e for p, e in zip(prefix_lens, extend_lens)],
         parallel.attn_tp_size,
         parallel.attn_tp_rank,
+        padded_num_tokens=getattr(forward_batch, "npu_dsa_cp_input_rows", None),
     )
     multi_request = sum(1 for n in extend_lens if n > 0) > 1
     # The lift applies only where the causal crop is not load-bearing.

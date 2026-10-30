@@ -77,6 +77,7 @@ def plan_dsa_cp_shard(
     seq_lens: Sequence[int],
     tp_size: int,
     tp_rank: int,
+    padded_num_tokens: int | None = None,
 ) -> DsaCpPlan:
     """Plan one rank's token slice of an extend batch.
 
@@ -117,6 +118,13 @@ def plan_dsa_cp_shard(
     num_tokens = sum(extend_seq_lens)
     rows = -(-num_tokens // tp_size)  # ceil
     num_tokens_pad = rows * tp_size
+    if padded_num_tokens is not None:
+        if padded_num_tokens < num_tokens or padded_num_tokens % tp_size:
+            raise ValueError(
+                "DSA-CP runtime width must cover real tokens and divide by TP"
+            )
+        num_tokens_pad = padded_num_tokens
+        rows = padded_num_tokens // tp_size
     local_start = tp_rank * rows
     local_end_with_pad = local_start + rows
     local_end = min(local_end_with_pad, num_tokens)

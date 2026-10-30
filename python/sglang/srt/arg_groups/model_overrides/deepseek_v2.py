@@ -40,7 +40,10 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
             overrides["attention_backend"] = "ascend"
         from sglang.srt.environ import envs
 
-        if envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get():
+        if (
+            envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get()
+            or envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+        ):
             if cfg.dcp_replicate_q_proj:
                 raise ValueError(
                     "Ascend DSA full-width Q conflicts with --dcp-replicate-q-proj; "
