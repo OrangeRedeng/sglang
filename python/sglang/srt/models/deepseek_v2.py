@@ -2452,7 +2452,8 @@ class DeepseekV2AttentionMLA(
         # before w_vc and o_proj -- so q_b_proj, kv_b_proj, w_kc, w_vc and
         # o_proj all stay head-sharded exactly as they are without DSA-CP.
         self.attn_mqa_for_dsa_cp = None
-        if dsa_cp_enabled():
+        # Skip-topk DSA layers still need this module even without an indexer.
+        if self.use_dsa and dsa_cp_enabled():
             self.attn_mqa_for_dsa_cp = RadixAttention(
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,

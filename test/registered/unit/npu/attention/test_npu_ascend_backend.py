@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
 
@@ -818,6 +819,69 @@ class TestGenerateAlibiBias(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(result.dtype, torch.bfloat16)
+
+
+class TestDcpDsaPrefixMetadata(CustomTestCase):
+    def test_only_dsa_dcp_targets_skip_legacy_prefix_tables(self):
+        from sglang.srt.hardware_backend.npu.attention import ascend_backend
+        from sglang.srt.layers.dcp import layout
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        for use_dsa, dcp, draft in (
+            (True, True, False),
+            (True, True, True),
+            (True, False, False),
+            (False, True, False),
+        ):
+            with self.subTest(use_dsa=use_dsa, dcp=dcp, draft=draft):
+                backend = object.__new__(AscendAttnBackend)
+                backend.device = "cpu"
+                backend.page_size = 2
+                backend.use_mla = True
+                backend.use_dsa = use_dsa
+                backend.is_draft_worker = draft
+                backend.is_hybrid_swa = False
+                backend.use_sliding_window_kv_pool = False
+                backend.quant_indexer_enabled = False
+                backend.req_to_token = torch.arange(32, dtype=torch.int32).reshape(
+                    1, 32
+                )
+                backend.req_to_token_pool = SimpleNamespace(
+                    req_to_token=backend.req_to_token
+                )
+                batch = SimpleNamespace(
+                    seq_lens=torch.tensor([18]),
+                    seq_lens_cpu=torch.tensor([18]),
+                    req_pool_indices=torch.tensor([0]),
+                    forward_mode=ForwardMode.EXTEND,
+                    extend_seq_lens=torch.tensor([2]),
+                    extend_seq_lens_cpu=[2],
+                    extend_prefix_lens=torch.tensor([16]),
+                    extend_prefix_lens_cpu=[16],
+                    origin_out_cache_loc=None,
+                    out_cache_loc=None,
+                )
+                parallel = SimpleNamespace(
+                    dcp_enabled=dcp, attn_dcp_size=8 if dcp else 1, attn_dcp_rank=0
+                )
+                with (
+                    patch.object(ascend_backend, "get_parallel", return_value=parallel),
+                    patch.object(layout, "get_parallel", return_value=parallel),
+                ):
+                    backend.init_forward_metadata(batch)
+                md = backend.forward_metadata
+                if use_dsa and dcp and not draft:
+                    self.assertIsNone(md.prefix_lens)
+                    self.assertIsNone(md.flatten_prefix_block_tables)
+                    torch.testing.assert_close(
+                        md.dcp_block_tables, torch.tensor([[0, 1]], dtype=torch.int32)
+                    )
+                else:
+                    torch.testing.assert_close(md.prefix_lens, torch.tensor([16]))
+                    torch.testing.assert_close(
+                        md.flatten_prefix_block_tables,
+                        torch.arange(8, dtype=torch.int32),
+                    )
 
 
 class TestMlaPrefixFia(unittest.TestCase):

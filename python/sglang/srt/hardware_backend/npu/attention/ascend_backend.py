@@ -886,6 +886,10 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
+            # DSA targets use DCP metadata; draft workers keep global slots.
+            and not (
+                self.use_dsa and get_parallel().dcp_enabled and not self.is_draft_worker
+            )
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(

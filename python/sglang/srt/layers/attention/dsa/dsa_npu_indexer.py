@@ -147,6 +147,8 @@ class _IndexerQueryShard:
             "DSA token-shard: skipping the indexer top-k all-gather; each rank "
             "keeps the rows it scored"
         )
+        if self.num_real < self.rows:
+            topk_indices[self.num_real :] = 0
         return topk_indices
 
 

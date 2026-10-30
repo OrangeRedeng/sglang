@@ -244,11 +244,108 @@ class TestDsaTokenResidual(CustomTestCase):
             self.assertEqual((shard.start, shard.rows, shard.num_real), (8, 8, 0))
             topk = torch.arange(16).reshape(8, 2)
             torch.testing.assert_close(
-                shard.resolve(topk, 16, batch), topk, rtol=0, atol=0
+                shard.resolve(topk, 16, batch), torch.zeros_like(topk), rtol=0, atol=0
             )
             self.assertTrue(batch.npu_indexer_topk_is_local)
             with self.assertRaisesRegex(ValueError, "different local token grid"):
                 indexer._get_indexer_query_shard(batch, 4)
+
+    @staticmethod
+    def _tp8_indexer_case(legacy, total, rank):
+        from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
+        from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+            plan_dsa_token_shard,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        planner = plan_dsa_cp_shard if legacy else plan_dsa_token_shard
+        plan = planner([total], [4096 + total], 8, rank)
+        batch = SimpleNamespace(
+            npu_dsa_cp_plan=plan if legacy else None,
+            npu_dsa_token_shard_plan=None if legacy else plan,
+            npu_dsa_cp_token_sharded=legacy,
+            positions=torch.arange(plan.num_tokens_pad),
+            seq_lens=torch.tensor([4096 + total]),
+            extend_seq_lens_cpu=[total],
+            extend_prefix_lens_cpu=[4096],
+            forward_mode=ForwardMode.EXTEND,
+        )
+        with patch.object(
+            indexer,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=8, attn_tp_rank=rank),
+        ):
+            shard = indexer._get_indexer_query_shard(
+                batch, plan.rows if legacy else plan.num_tokens_pad
+            )
+        return indexer, shard, batch, plan
+
+    def test_tp8_indexer_gathers_when_row_plans_disagree_or_are_absent(self):
+        from sglang.srt.environ import envs
+
+        with (
+            patch.object(dsa_cp, "_enable_dsa_cp", True),
+            envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(True),
+        ):
+            for legacy in (False, True):
+                for mismatch in ("absent", "start", "rows"):
+                    with self.subTest(legacy=legacy, mismatch=mismatch):
+                        indexer, shard, batch, plan = self._tp8_indexer_case(
+                            legacy, 17, 2
+                        )
+                        plan = (
+                            None
+                            if mismatch == "absent"
+                            else plan._replace(
+                                **(
+                                    {"local_start": plan.local_start + plan.rows}
+                                    if mismatch == "start"
+                                    else {"rows": plan.rows + 1}
+                                )
+                            )
+                        )
+                        if legacy:
+                            batch.npu_dsa_cp_plan = plan
+                        else:
+                            batch.npu_dsa_token_shard_plan = plan
+                        full = torch.arange(shard.rows * 8 * 2).reshape(-1, 2)
+                        local = full[shard.start : shard.start + shard.rows].clone()
+                        with patch.object(
+                            indexer,
+                            "attn_tp_all_gather_into_tensor",
+                            side_effect=lambda out, value: out.copy_(full),
+                        ):
+                            result = shard.resolve(local, 17, batch)
+                        torch.testing.assert_close(result, full[:17])
+                        self.assertFalse(batch.npu_indexer_topk_is_local)
+
+    def test_tp8_local_topk_clears_partial_and_empty_rank_padding(self):
+        from sglang.srt.environ import envs
+
+        with (
+            patch.object(dsa_cp, "_enable_dsa_cp", True),
+            envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(True),
+        ):
+            for legacy in (False, True):
+                for total in (9, 17):
+                    for rank in range(8):
+                        with self.subTest(legacy=legacy, total=total, rank=rank):
+                            indexer, shard, batch, _ = self._tp8_indexer_case(
+                                legacy, total, rank
+                            )
+                            topk = torch.arange(shard.rows * 2).reshape(-1, 2) + 1
+                            expected = topk.clone()
+                            expected[shard.num_real :] = 0
+                            with patch.object(
+                                indexer,
+                                "attn_tp_all_gather_into_tensor",
+                                side_effect=AssertionError(
+                                    "matching rows must stay local"
+                                ),
+                            ):
+                                result = shard.resolve(topk, total, batch)
+                            torch.testing.assert_close(result, expected)
+                            self.assertTrue(batch.npu_indexer_topk_is_local)
 
     def test_indexer_keys_use_per_request_not_cumulative_lengths(self):
         from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
