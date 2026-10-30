@@ -1028,11 +1028,8 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
-    # Experimental: synchronize on phase changes before switching dispatch queues.
-    SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE = EnvBool(False)
-    SGLANG_NPU_PREFILL_TASK_QUEUE_MODE = EnvInt(0)
-    SGLANG_NPU_DECODE_TASK_QUEUE_MODE = EnvInt(1)
     SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM = EnvBool(False)
+    SGLANG_ENABLE_NPU_GEMMA4_MTP_Q_ONLY = EnvBool(False)
     SGLANG_ENABLE_NPU_FIA_METADATA_REUSE = EnvBool(False)
     SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE = EnvBool(False)
     SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH = EnvBool(False)

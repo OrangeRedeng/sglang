@@ -30,6 +30,58 @@ def _make_backend():
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_legacy_backend_preserves_replay_order_and_previous_fence(self):
+        for frozen_kv in (False, True):
+            with self.subTest(frozen_kv=frozen_kv):
+                backend, runner = _make_backend(frozen_kv=frozen_kv)
+                key = ShapeKey(size=2)
+                graph = mock.Mock()
+                backend._graphs[key] = graph
+                backend._outputs[key] = "output"
+                order = []
+                graph.update.side_effect = lambda order=order, **kwargs: order.append(
+                    "update"
+                )
+                graph.replay.side_effect = lambda order=order: order.append("replay")
+                previous = mock.Mock()
+                previous.synchronize.side_effect = lambda order=order: order.append(
+                    "fence"
+                )
+                backend._rebind_fence = previous
+
+                def defer_update(fn, **kwargs):
+                    return SimpleNamespace(result=lambda: fn(**kwargs))
+
+                with mock.patch.object(
+                    backend._update_executor, "submit", side_effect=defer_update
+                ):
+                    output = backend.replay_with_input_update(
+                        key,
+                        seq_lens=None,
+                        cpu_update_input=[{"actual_seq_kvlen": [7, 9]}],
+                    )
+                self.assertEqual(order, ["fence", "replay", "update"])
+                self.assertEqual(output, "output")
+                runner.device_module.Event.return_value.record.assert_called_once()
+                backend.cleanup()
+
+    def test_legacy_update_failure_propagates(self):
+        backend, runner = _make_backend()
+        key = ShapeKey(size=2)
+        graph = mock.Mock()
+        graph.update.side_effect = RuntimeError("FIA update failed")
+        backend._graphs[key] = graph
+        backend._outputs[key] = "output"
+        try:
+            with self.assertRaisesRegex(RuntimeError, "FIA update failed"):
+                backend.replay_with_input_update(
+                    key, seq_lens=None, cpu_update_input=[{"actual_seq_kvlen": [7, 9]}]
+                )
+            graph.replay.assert_called_once()
+            runner.device_module.Event.assert_not_called()
+        finally:
+            backend.cleanup()
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

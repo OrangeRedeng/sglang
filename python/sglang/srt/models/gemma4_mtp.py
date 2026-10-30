@@ -18,9 +18,7 @@ import logging
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig, PreTrainedModel
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
@@ -28,12 +26,15 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,20 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             layer.self_attn.kv_shared_layer_index = target_phys
             layer.self_attn.attn.layer_id = target_phys
             layer.self_attn.layer_id = assistant_logical
+            layer.self_attn._npu_frozen_q_only = (
+                is_npu()
+                and envs.SGLANG_ENABLE_NPU_GEMMA4_MTP_Q_ONLY.get()
+                and get_parallel().tp_size == 1
+                and self.quant_config is None
+                and type(layer.self_attn.qkv_proj.quant_method) is UnquantizedLinearMethod
+                and not layer.self_attn.qkv_proj.skip_bias_add
+            )
         self.kv_context = ctx
+        if is_npu() and envs.SGLANG_ENABLE_NPU_GEMMA4_MTP_Q_ONLY.get():
+            logger.info(
+                "Frozen-KV NPU Q-only projection enabled for %d assistant layers.",
+                sum(layer.self_attn._npu_frozen_q_only for layer in self.model.layers),
+            )
 
     def build_frozen_kv_mtp_context(
         self,
