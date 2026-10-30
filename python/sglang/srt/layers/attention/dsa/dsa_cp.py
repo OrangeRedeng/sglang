@@ -289,7 +289,18 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
             print_info_once("DSA-CP is off: this extend carries no CPU length metadata")
         return None
 
-    if not threshold_allows("SGLANG_NPU_DSA_CP_MIN_TOKENS", sum(extend_lens)):
+    num_tokens = sum(extend_lens)
+    if num_tokens < parallel.attn_tp_size:
+        # Fewer tokens than ranks: most ranks would hold nothing but padding and
+        # the all-gathers would move more than the attention saves.
+        if envs.SGLANG_NPU_DEBUG_DCP.get():
+            print_info_once(
+                f"DSA-CP is off for batches under {parallel.attn_tp_size} tokens "
+                f"(this one has {num_tokens}); the slice would be mostly padding"
+            )
+        return None
+
+    if not threshold_allows("SGLANG_NPU_DSA_CP_MIN_TOKENS", num_tokens):
         return None
 
     plan = plan_dsa_cp_shard(
@@ -313,16 +324,6 @@ def _build_dsa_cp_plan(forward_batch, index_topk=None) -> Optional[DsaCpPlan]:
                 f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
                 "cumulative KV lengths it would need describe the buffer's own "
                 "request boundaries. SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST lifts this"
-            )
-        return None
-
-    if plan.num_tokens < parallel.attn_tp_size:
-        # Fewer tokens than ranks: most ranks would hold nothing but padding and
-        # the all-gathers would move more than the attention saves.
-        if envs.SGLANG_NPU_DEBUG_DCP.get():
-            print_info_once(
-                f"DSA-CP is off for batches under {parallel.attn_tp_size} tokens "
-                f"(this one has {plan.num_tokens}); the slice would be mostly padding"
             )
         return None
 

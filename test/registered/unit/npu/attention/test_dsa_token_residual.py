@@ -88,6 +88,32 @@ class Norm:
 
 
 class TestDsaTokenResidual(CustomTestCase):
+    def test_tp16_short_unpadded_warmup_uses_unsharded_path(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        with (
+            patch.object(dsa_cp, "_enable_dsa_cp", True),
+            patch.object(
+                dsa_cp,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=16, attn_tp_rank=0),
+            ),
+            envs.SGLANG_NPU_DSA_CP_MIN_TOKENS.override(0),
+        ):
+            for tokens in (1, 6, 15, 16):
+                with self.subTest(tokens=tokens):
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        extend_seq_lens_cpu=[tokens],
+                        extend_prefix_lens_cpu=[0],
+                        npu_dsa_cp_input_rows=tokens,
+                    )
+                    plan = dsa_cp.get_dsa_cp_plan(batch, 2048)
+                    if tokens < 16:
+                        self.assertIsNone(plan)
+                    else:
+                        self.assertEqual(plan.rows, 1)
+
     @staticmethod
     def _native_decoder_forward():
         # Execute the real entry point without importing accelerator-only model classes.
