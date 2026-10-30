@@ -60,6 +60,15 @@ def resolve_decode_backend(
     enable_memory_saver = get_exec().features.enable_memory_saver
 
     if model_runner.device == "npu":
+        spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+        if spec_algorithm is not None and spec_algorithm.is_frozen_kv_mtp():
+            from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_backend import (
+                FrozenKVMTPNpuGraphBackend,
+            )
+
+            return FrozenKVMTPNpuGraphBackend(
+                cuda_graph_runner, enable_memory_saver=enable_memory_saver
+            )
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )

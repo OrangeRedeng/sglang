@@ -44,6 +44,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
 
+    _auto_dispatch_capture = True
+
     def __init__(
         self,
         cuda_graph_runner: BaseCudaGraphRunner,
@@ -65,12 +67,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cuda_graph_runner, "enable_torch_compile", False
         )
         # Reuse one device-bound worker for graph input updates.
-        self._update_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="npu-graph-update",
-            initializer=self._device_module.set_device,
-            initargs=(self._device_id,),
-        )
+        self._update_executor = None
+        if self._auto_dispatch_capture:
+            self._update_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="npu-graph-update",
+                initializer=self._device_module.set_device,
+                initargs=(self._device_id,),
+            )
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
@@ -129,13 +133,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                auto_dispatch_capture=True,
+                auto_dispatch_capture=self._auto_dispatch_capture,
             ),
+            self._graph_capture_context(graph),
         ):
             out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+
+    def _graph_capture_context(self, graph):
+        return empty_context()
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -194,7 +202,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
-        self._update_executor.shutdown(wait=True, cancel_futures=True)
+        if self._update_executor is not None:
+            self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
