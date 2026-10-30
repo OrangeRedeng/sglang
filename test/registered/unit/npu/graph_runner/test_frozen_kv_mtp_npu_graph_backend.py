@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from sglang.srt.hardware_backend.npu.graph_runner import (
@@ -210,6 +211,37 @@ def test_eager_call_keeps_original_operator(runtime):
     mod.frozen_kv_fia_v2(query, query, query, output_dim=8, input_layout="TND")
     runtime[1].npu_fused_infer_attention_score_v2.assert_called_once()
     runtime[1].npu_fused_infer_attention_score_v2.out.assert_not_called()
+
+
+def test_numpy_verify_lengths_capture_reuse_workspace_and_own_host_arrays(runtime):
+    b = backend(runtime)
+    graph = SimpleNamespace()
+    query = torch.zeros(4, 1, 8)
+    qlen = np.arange(2, 6, 2, dtype=np.int64)
+    kvlen = np.array([7, 9], dtype=np.int32)
+    with b._graph_capture_context(graph):
+        for q, kv in ((qlen, kvlen), (qlen.tolist(), kvlen.tolist())):
+            mod.frozen_kv_fia_v2(
+                query,
+                query,
+                query,
+                output_dim=8,
+                input_layout="TND",
+                actual_seq_qlen=q,
+                actual_seq_kvlen=kv,
+            )
+    plugin = runtime[1]
+    assert plugin._npu_fused_infer_attention_score_v2_get_max_workspace.call_count == 1
+    for call in plugin.npu_fused_infer_attention_score_v2.out.call_args_list:
+        assert call.kwargs["actual_seq_qlen"] == [2, 4]
+        assert call.kwargs["actual_seq_kvlen"] == [7, 9]
+    qlen[:] = 99
+    kvlen[:] = 99
+    assert len(graph._frozen_fia_tasks) == 2
+    for task in graph._frozen_fia_tasks:
+        assert task.kwargs["actual_seq_qlen"] == (2, 4)
+        assert task.kwargs["actual_seq_kvlen"] == (7, 9)
+        assert task.bind({"actual_seq_kvlen": [17, 19]})["actual_seq_qlen"] == [2, 4]
 
 
 def test_capture_disables_automatic_dispatch_and_excludes_warmup(runtime, monkeypatch):
