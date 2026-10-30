@@ -345,7 +345,7 @@ class TestMTPAttentionLayout(unittest.TestCase):
             torch.testing.assert_close(lengths, torch.tensor([7, 11], dtype=dtype))
             self.assertEqual(backend.forward_metadata.seq_lens_cpu_list, [11, 15])
 
-    def test_verify_512_uses_bsnd_with_per_request_prefix_masks(self):
+    def test_verify_512_bsnd_batches_requests_with_prefix_masks(self):
         backend = object.__new__(AscendAttnBackend)
         backend.reuse_fia_metadata = False
         backend.use_mla = False
@@ -384,24 +384,23 @@ class TestMTPAttentionLayout(unittest.TestCase):
             forward_mode=ForwardMode.TARGET_VERIFY,
             global_num_token_non_padded_cpu=8,
         )
-        calls = []
+        kv_lens = (2933, 9)
 
         def fia(query, key, value, **kwargs):
-            index = len(calls)
-            calls.append(kwargs)
             self.assertEqual(kwargs["input_layout"], "BSND")
-            self.assertEqual(tuple(query.shape), (1, 4, 1, 512))
-            self.assertEqual(kwargs["actual_seq_qlen"], [4])
-            kv_len = (2933, 9)[index]
-            self.assertEqual(kwargs["actual_seq_kvlen"], [kv_len])
-            torch.testing.assert_close(kwargs["block_table"], blocks[index : index + 1])
+            self.assertEqual(tuple(query.shape), (2, 4, 1, 512))
+            self.assertEqual(kwargs["actual_seq_qlen"], [4, 4])
+            self.assertEqual(kwargs["actual_seq_kvlen"], list(kv_lens))
+            torch.testing.assert_close(kwargs["block_table"], blocks)
             mask = kwargs["atten_mask"]
             self.assertEqual(kwargs["sparse_mode"], 0)
+            self.assertEqual(tuple(mask.shape)[0], 2)
             self.assertGreaterEqual(mask.shape[-1], 23 * 128)
-            self.assertFalse(mask[0, 0, kv_len - 4].item())
-            self.assertTrue(mask[0, 0, kv_len - 3].item())
-            self.assertFalse(mask[0, -1, kv_len - 1].item())
-            return query.clone(), None
+            for seq, kv_len in enumerate(kv_lens):
+                self.assertFalse(mask[seq, 0, kv_len - 4].item())
+                self.assertTrue(mask[seq, 0, kv_len - 3].item())
+                self.assertFalse(mask[seq, -1, kv_len - 1].item())
+            return query.reshape(-1, 512).clone(), None
 
         query = torch.randn(8, 512)
         with patch(
@@ -410,7 +409,6 @@ class TestMTPAttentionLayout(unittest.TestCase):
             side_effect=fia,
         ):
             result = backend.forward_mtp(query, None, None, layer, batch, False)
-        self.assertEqual(len(calls), 2)
         torch.testing.assert_close(result, query)
 
     def test_verify_graph_mask_tracks_device_prefix_and_keeps_bsnd_batch(self):

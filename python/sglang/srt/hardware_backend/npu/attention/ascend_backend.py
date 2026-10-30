@@ -2656,6 +2656,56 @@ class AscendAttnBackend(AttentionBackend):
             )
             return result.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        width = self.speculative_num_draft_tokens
+        ends = [int(end) for end in query_ends]
+        if (
+            query.shape[0] > 0
+            and ends
+            and ends[-1] == query.shape[0]
+            and ends[0] == width
+            and all(ends[i] - ends[i - 1] == width for i in range(1, len(ends)))
+        ):
+            # Uniform-width rows (target verify): one batched BSND call, same
+            # recipe as the graph-mode branch above. A per-request call here
+            # costs a mask build plus a full FIA host launch per request per
+            # layer, which dominates eager verify host time.
+            bs = len(ends)
+            positions = (
+                torch.as_tensor(kv_lens[:bs], dtype=torch.long, device=query.device)[
+                    :, None
+                ]
+                - width
+                + torch.arange(width, device=query.device)[None, :]
+            )
+            keys = torch.arange(
+                block_table.shape[1] * self.page_size, device=query.device
+            )
+            mask = keys[None, None, :] > positions[:, :, None]
+            if layer.sliding_window_size != -1:
+                mask = mask | (
+                    keys[None, None, :]
+                    < positions[:, :, None] - layer.sliding_window_size
+                )
+            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query.reshape(bs, width, layer.tp_q_head_num, layer.qk_head_dim),
+                k_cache,
+                v_cache,
+                block_table=block_table,
+                block_size=self.page_size,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=mask,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=[width] * bs,
+                actual_seq_kvlen=list(kv_lens[:bs]),
+                sparse_mode=0,
+                pre_tokens=FULL_ATTENTION_WINDOW,
+                next_tokens=0,
+                learnable_sink=sinks,
+            )
+            return result.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+
         output = query.new_empty(
             (query.shape[0], layer.tp_q_head_num, layer.v_head_dim)
         )
