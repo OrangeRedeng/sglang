@@ -14,7 +14,7 @@ Defaults match the supplied installation:
 | Checkout inside container | `/home/swx1199799/megamoe_test/sglang` |
 | Full ModelSlim checkpoint | `/home/weights/GLM5.2-w4a8-int` |
 | Host AISBench directory | `/home/tbaydasov/aisbench/aisbench_auto_tools_prefix` |
-| Host environment script | `/home/tbaydasovset_env.sh` |
+| Host environment script | First existing: `/home/tbaydasov/set_env.sh`, `/home/tbaydasovset_env.sh` |
 | DCP server | TP16/DCP16, eager, CHUNK32768, MAXREQ64, one request per prefill batch, MEMFRAC0.88 |
 | KV cap | 81920 local rows, or 1310720 logical tokens |
 | Context | 1048576; benchmark input is 1000000 plus chat framing |
@@ -24,8 +24,16 @@ Defaults match the supplied installation:
 | MoE KV cap | 65536 tokens; MAXREQ64, sixteen concurrent benchmark requests |
 | MegaMoE | `ascend_fuseep`, mode3, EP16; modes1/2 tested separately |
 
-The environment-script spelling above is taken literally from your message.
-If its actual path is `/home/tbaydasov/set_env.sh`, pass that with `--ais-env`.
+An explicit `--ais-env` overrides detection. Missing paths are reported separately,
+with the exact host filenames. Check them in the foreground before starting screen:
+
+```bash
+bash /tmp/start_bde_overnight.sh --check-paths
+```
+
+If needed, pass `--ais-dir /actual/aisbench_auto_tools_prefix --ais-env /actual/set_env.sh`
+to both the path check and the overnight command. The check validates file presence;
+the actual AISBench invocation sources the environment script.
 Use `--repo`, `--checkpoint`, `--container`, `--ais-dir` and `--output` to
 override paths. The checkpoint and repo paths are paths **inside Docker**;
 AISBench, its environment script and the output directory are **host paths**.

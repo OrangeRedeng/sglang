@@ -30,6 +30,38 @@ class TestBdeOvernight(CustomTestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_host_path_detection_and_explicit_missing_path(self):
+        module = self.runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            envfile = root / "set_env.sh"
+            missing = root / "missing.sh"
+            envfile.touch()
+            with patch.object(
+                module, "AIS_ENV_CANDIDATES", (str(missing), str(envfile))
+            ):
+                self.assertEqual(module.resolve_ais_env(None), str(envfile))
+                self.assertEqual(module.resolve_ais_env(str(missing)), str(missing))
+            with self.assertRaises(ValueError) as caught:
+                module.check_ais_paths(root, missing)
+            self.assertIn(str(root / "aisbench_test.py"), str(caught.exception))
+            self.assertIn(str(missing), str(caught.exception))
+            (root / "aisbench_test.py").touch()
+            module.check_ais_paths(root, envfile)
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "night",
+                    "--check-paths",
+                    "--ais-dir",
+                    str(root),
+                    "--ais-env",
+                    str(envfile),
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
     def test_failed_server_does_not_stop_remaining_cases_or_lose_results(self):
         module = self.runner()
         with tempfile.TemporaryDirectory() as temporary:

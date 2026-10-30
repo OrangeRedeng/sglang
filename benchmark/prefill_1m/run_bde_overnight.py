@@ -23,6 +23,10 @@ import urllib.request
 from pathlib import Path
 
 RELATIVE = "benchmark/prefill_1m/run_bde_overnight.py"
+AIS_ENV_CANDIDATES = (
+    "/home/tbaydasov/set_env.sh",
+    "/home/tbaydasovset_env.sh",
+)
 DCP_VARIANTS = (
     "dcp-kv-gather",
     "dcp-packed-read",
@@ -67,6 +71,27 @@ BASE_FLAGS = (
     "SGLANG_CHAT_ENCODE_MEMO",
     "SGLANG_CHAT_ENCODE_RAW",
 )
+
+
+def resolve_ais_env(explicit):
+    if explicit is not None:
+        return explicit
+    return next(
+        (path for path in AIS_ENV_CANDIDATES if Path(path).is_file()),
+        AIS_ENV_CANDIDATES[0],
+    )
+
+
+def check_ais_paths(directory, env_file):
+    missing = []
+    for option, path in (
+        ("--ais-dir", Path(directory) / "aisbench_test.py"),
+        ("--ais-env", Path(env_file)),
+    ):
+        if not path.is_file():
+            missing.append(f"{option}: missing host file {path}")
+    if missing:
+        raise ValueError("; ".join(missing))
 
 
 def save(path, data):
@@ -452,7 +477,12 @@ def main():
     parser.add_argument(
         "--ais-dir", default="/home/tbaydasov/aisbench/aisbench_auto_tools_prefix"
     )
-    parser.add_argument("--ais-env", default="/home/tbaydasovset_env.sh")
+    parser.add_argument(
+        "--ais-env", help="Host environment script; auto-detect known paths"
+    )
+    parser.add_argument(
+        "--check-paths", action="store_true", help="Check host AISBench paths and exit"
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--feature-cases", default="*")
@@ -481,6 +511,15 @@ def main():
     args = parser.parse_args()
     if args.worker:
         return worker()
+    args.ais_env = resolve_ais_env(args.ais_env)
+    if args.check_paths or not (args.features_only or args.dry_run):
+        try:
+            check_ais_paths(args.ais_dir, args.ais_env)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.check_paths:
+        print(f"AISBench host paths OK: {args.ais_dir}; environment: {args.ais_env}")
+        return 0
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
     if args.moe_only and args.feature_cases == "*":
         args.feature_cases = ",".join("serve-" + name for name in MOE_VARIANTS)
@@ -584,6 +623,8 @@ def main():
                     "variants": variants,
                     "repeats": args.repeats,
                     "ais_args": ais_args,
+                    "ais_dir": args.ais_dir,
+                    "ais_env": args.ais_env,
                     "moe_workload": {
                         "input_len": args.moe_length,
                         "output_len": args.moe_output_len,
@@ -600,13 +641,6 @@ def main():
         )
         return 0
     require_free_port()
-    if not args.features_only and (
-        not Path(args.ais_env).is_file()
-        or not (Path(args.ais_dir) / "aisbench_test.py").is_file()
-    ):
-        parser.error(
-            "AISBench directory or environment script is missing; set --ais-dir/--ais-env"
-        )
     lock = open("/tmp/sglang-bde-overnight.lock", "w")  # noqa: SIM115 - held for the driver lifetime
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     output.mkdir(parents=True, exist_ok=False)
