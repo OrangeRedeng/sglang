@@ -30,22 +30,23 @@ Use `--repo`, `--checkpoint`, `--container`, `--ais-dir` and `--output` to
 override paths. The checkpoint and repo paths are paths **inside Docker**;
 AISBench, its environment script and the output directory are **host paths**.
 
-## Install the prepared changes
+## Update the branch
 
-The runner and the final-chunk padding fix must both be present in the
-container checkout. If using the supplied patch, download it to the A3 host
-as `/tmp/bde-overnight.patch`, then run on that host:
+The runner and padding fix are committed to `glm52-a3-optimizations`.
+The old `bde-overnight.patch` was only for delivery before publication;
+do not apply it to the updated branch. Already-existing-file errors mean
+that patch cannot be applied to the current checkout. Normal `git apply`
+without `--reject` makes no partial changes when it fails.
+
+Run on the host, with the container checkout on the integration branch:
 
 ```bash
 REPO=/home/swx1199799/megamoe_test/sglang
-docker cp /tmp/bde-overnight.patch sglang-a3:/tmp/bde-overnight.patch
-docker exec -w "$REPO" sglang-a3 git apply --check /tmp/bde-overnight.patch
-docker exec -w "$REPO" sglang-a3 git apply /tmp/bde-overnight.patch
-docker cp "sglang-a3:$REPO/benchmark/prefill_1m/run_bde_overnight.py" /tmp/run_bde_overnight.py
+docker exec -w "$REPO" sglang-a3 git pull --ff-only \
+  https://github.com/OrangeRedeng/sglang.git glm52-a3-optimizations
+docker cp "sglang-a3:$REPO/benchmark/prefill_1m/start_bde_overnight.sh" /tmp/start_bde_overnight.sh
 ```
 
-The patch is based on `8319071dde`. Do not apply it again if these changes
-are already installed; `git apply --check` refuses conflicting application.
 The padding fix aligns input IDs, positions, embeddings and KV write IDs
 before eager-buffer loading and metadata planning. Real request lengths stay
 unchanged. This covers the 6972-token final chunk in the supplied crash and
@@ -54,14 +55,19 @@ the 10828-token cached tails, while six-token warmup remains unsharded.
 ## Launch on the host
 
 ```bash
-python3 /tmp/run_bde_overnight.py --moe-only --dry-run
+bash /tmp/start_bde_overnight.sh --moe-only --dry-run
 screen -dmS bde-night bash -lc \
-  'python3 -u /tmp/run_bde_overnight.py --moe-only > /tmp/bde-night.log 2>&1'
+  'bash /tmp/start_bde_overnight.sh --moe-only > /tmp/bde-night.log 2>&1'
 tail -f /tmp/bde-night.log
 ```
 
+The wrapper copies the current runner from the container each time and prints
+its checkout commit, avoiding an outdated host copy. It uses Docker even for
+`--dry-run`; the runner itself does not start servers or benchmark during dry run.
+Set `SGLANG_CONTAINER`/`SGLANG_REPO` to override the wrapper's container/repo.
+
 The command above focuses on **MoE**. Omit `--moe-only` to include the 1M DCP
-matrix too. No model loading or Docker calls happen during `--dry-run`. For a smaller
+matrix too. For a smaller
 AISBench matrix while retaining feature qualification, add
 `--variants dcp-kv-gather,bde-v2`. To run qualification without AISBench, use
 `--features-only`. This matrix can take many hours; each server start may
