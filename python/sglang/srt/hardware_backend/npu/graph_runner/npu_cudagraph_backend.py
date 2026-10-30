@@ -60,6 +60,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
         self._capture_stream = None
+        spec_algorithm = getattr(
+            getattr(cuda_graph_runner, "model_runner", None), "spec_algorithm", None
+        )
+        self._wait_for_input_update = (
+            spec_algorithm is not None and spec_algorithm.is_frozen_kv_mtp()
+        )
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -188,8 +194,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
-        graph.replay()
-        update_future.result()
+        if self._wait_for_input_update:
+            # Frozen draft and verify share TorchNPU's update stream. Publish all
+            # external-event signals before submitting either dependent replay.
+            update_future.result()
+            graph.replay()
+        else:
+            graph.replay()
+            update_future.result()
 
         fence = self._device_module.Event()
         fence.record()

@@ -206,3 +206,16 @@ must preserve the committed CPU lengths, including int32 inputs.
 
 These changes do not enable draft graphs or change draft sampling probabilities.
 NPU replay, output parity and end-to-end performance still require validation.
+
+## Frozen-KV graph update ordering
+
+Frozen-KV draft and target verification now finish host-side FIA updates before
+submitting graph replay. This follows the TorchNPU update-then-replay lifecycle
+and propagates update errors before launching a graph that waits for its external
+events. Other speculative families retain their existing scheduling. The previous
+replay fence is retained to protect host length bindings.
+
+This is a host-tested ordering fix, not confirmation that the observed NPU stall
+is resolved. Keep the draft graph disabled by default until a target-NPU smoke
+request completes with both graph switches set to0 and steps greater than1.
+Then check greedy output/logprob parity and changing batch buckets before timing.
