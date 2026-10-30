@@ -88,6 +88,111 @@ class Norm:
 
 
 class TestDsaTokenResidual(CustomTestCase):
+    def test_tp16_tail_padding_preserves_real_lengths_and_kv_ownership(self):
+        import dataclasses
+
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        runner = SimpleNamespace(
+            device="npu",
+            is_draft_worker=False,
+            model=SimpleNamespace(model=SimpleNamespace(use_dsa=True)),
+            attn_backend=SimpleNamespace(
+                get_cpu_graph_seq_len_fill_value=lambda: 1,
+                get_cuda_graph_seq_len_fill_value=lambda: 1,
+            ),
+            _extend_forward_kwargs=lambda batch, proxy: {},
+        )
+        path = (
+            Path(__file__).resolve().parents[5]
+            / "python/sglang/srt/model_executor/runner/eager_runner.py"
+        )
+        tree = ast.parse(path.read_text())
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "EagerRunner"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_extend"
+        )
+        namespace = {}
+        exec("from __future__ import annotations\n" + ast.unparse(method), namespace)  # noqa: S102 - production entry point
+
+        def input_buffer_boundary(batch, proxy):
+            raise StopIteration("reached eager input buffers")
+
+        eager = SimpleNamespace(
+            model_runner=runner, enable_pdmux=False, load_batch=input_buffer_boundary
+        )
+        with (
+            patch.object(
+                residual,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=16, attn_tp_size=16),
+            ),
+            envs.SGLANG_NPU_ENABLE_DSA_CP.override(True),
+            envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.override(True),
+        ):
+            for tokens, expected in (
+                (6, 6),
+                (6972, 6976),
+                (10828, 10832),
+                (32768, 32768),
+            ):
+                with self.subTest(tokens=tokens):
+                    batch = object.__new__(ForwardBatch)
+                    for field in dataclasses.fields(ForwardBatch):
+                        value = (
+                            field.default
+                            if field.default is not dataclasses.MISSING
+                            else None
+                        )
+                        if field.default_factory is not dataclasses.MISSING:
+                            value = field.default_factory()
+                        setattr(batch, field.name, value)
+                    batch.forward_mode = ForwardMode.EXTEND
+                    batch.batch_size = 1
+                    batch.input_ids = torch.arange(tokens)
+                    batch.positions = torch.arange(tokens)
+                    batch.out_cache_loc = torch.arange(1, tokens + 1)
+                    batch.origin_out_cache_loc = torch.arange(1, tokens + 1)
+                    batch.req_pool_indices = torch.tensor([0])
+                    batch.seq_lens = torch.tensor([tokens + 100])
+                    batch.seq_lens_cpu = batch.seq_lens.clone()
+                    batch.seq_lens_sum = tokens + 100
+                    batch.extend_seq_lens = torch.tensor([tokens])
+                    batch.extend_seq_lens_cpu = [tokens]
+                    batch.extend_prefix_lens_cpu = [100]
+                    with self.assertRaisesRegex(
+                        StopIteration, "reached eager input buffers"
+                    ):
+                        namespace["_execute_extend"](eager, batch)
+                    self.assertEqual(batch.input_ids.numel(), expected)
+                    self.assertEqual(batch.positions.numel(), expected)
+                    self.assertEqual(batch.out_cache_loc.numel(), expected)
+                    self.assertEqual(batch.origin_out_cache_loc.numel(), expected)
+                    self.assertEqual(batch.extend_seq_lens_cpu, [tokens])
+                    self.assertEqual(batch.seq_lens.tolist(), [tokens + 100])
+                    torch.testing.assert_close(
+                        batch.out_cache_loc[:tokens], torch.arange(1, tokens + 1)
+                    )
+                    self.assertTrue((batch.out_cache_loc[tokens:] == 0).all())
+                    plan = (
+                        plan_dsa_cp_shard(
+                            [tokens], [tokens + 100], 16, 0, padded_num_tokens=expected
+                        )
+                        if tokens >= 16
+                        else None
+                    )
+                    if plan is not None:
+                        self.assertEqual(plan.num_tokens, tokens)
+
     def test_tp16_short_unpadded_warmup_uses_unsharded_path(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 

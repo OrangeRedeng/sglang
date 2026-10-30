@@ -16,6 +16,29 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_forward, get_parallel
 
 
+def pad_extend_batch(batch, runner):
+    """Align the complete token grid before eager buffers and KV metadata are built."""
+    parallel = get_parallel()
+    if (
+        runner.device != "npu"
+        or runner.is_draft_worker
+        or parallel.attn_dcp_size <= 1
+        or not getattr(getattr(runner.model, "model", None), "use_dsa", False)
+        or not envs.SGLANG_NPU_ENABLE_DSA_CP.get()
+        or not (
+            envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get()
+            or envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+        )
+        or not batch.forward_mode.is_extend()
+    ):
+        return
+    tokens = batch.input_ids.shape[0]
+    tp = parallel.attn_tp_size
+    if tokens >= tp and tokens % tp:
+        padded = (tokens + tp - 1) // tp * tp
+        batch._pad_inputs_to_size(runner, padded, batch.batch_size)
+
+
 def reset_forward(batch, padded_rows):
     batch.npu_dsa_cp_plan = _MISSING
     batch.npu_dsa_cp_input_rows = padded_rows

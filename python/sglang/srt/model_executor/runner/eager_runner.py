@@ -278,6 +278,12 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
+        if model_runner.device == "npu":
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                pad_extend_batch,
+            )
+
+            pad_extend_batch(forward_batch, model_runner)
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
         if not self.enable_pdmux:
