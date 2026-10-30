@@ -6,6 +6,10 @@ from typing import List, Optional
 
 import torch
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_cp import (
+    dsa_cp_token_sharded,
+    get_dsa_cp_plan,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
@@ -119,7 +123,11 @@ class _IndexerQueryShard:
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
-        plan = get_dsa_token_shard_plan(forward_batch)
+        plan = (
+            get_dsa_cp_plan(forward_batch)
+            if dsa_cp_token_sharded(forward_batch)
+            else get_dsa_token_shard_plan(forward_batch)
+        )
         local = plan is not None
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Same arithmetic, but the two sites read their inputs separately;
@@ -188,6 +196,24 @@ def _get_indexer_query_shard(
     tp16. Planned once per forward from inputs identical across the group, so
     all ranks take the collective or none do.
     """
+    if dsa_cp_token_sharded(forward_batch):
+        plan = get_dsa_cp_plan(forward_batch)
+        if plan is None or num_tokens != plan.rows:
+            raise ValueError("indexer received a different local token grid")
+        device = forward_batch.positions.device
+        return _IndexerQueryShard(
+            start=plan.local_start,
+            rows=plan.rows,
+            num_real=plan.num_local_tokens,
+            total=plan.num_tokens,
+            tp_size=plan.num_tokens_pad // plan.rows,
+            actual_seq_lengths_q=torch.tensor(
+                cumulative(plan.query_lens), dtype=torch.int32, device=device
+            ),
+            actual_seq_lengths_kv=torch.tensor(
+                plan.key_lens, dtype=torch.int32, device=device
+            ),
+        )
     if get_attn_tp_context().input_scattered:
         # A scattered input is already sliced.
         print_info_once(

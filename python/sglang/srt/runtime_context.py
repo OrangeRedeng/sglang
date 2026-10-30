@@ -718,6 +718,7 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        "npu_dsa_cp_token_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -735,6 +736,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "npu_dsa_cp_token_sharded",
         }
     )
 

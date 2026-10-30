@@ -341,11 +341,111 @@ class TestDsaTokenResidual(CustomTestCase):
         self.assertNotIn("--context-length", command)
         validate_legacy_dcp_flags(env, tp_size=8, dcp_size=8)
         with self.assertRaisesRegex(ValueError, "equal TP/DCP"):
-            validate_legacy_dcp_flags(env, tp_size=16, dcp_size=8)
+            validate_legacy_dcp_flags(env, tp_size=8, dcp_size=4)
         args.real_weights, args.context_length = True, 65536
         command, _, _ = launch.launch_config(args, {})
         self.assertEqual(command[command.index("--load-format") + 1], "auto")
         self.assertEqual(command[command.index("--context-length") + 1], "65536")
+
+    @staticmethod
+    def _load_launch_module():
+        path = (
+            Path(__file__).resolve().parents[5]
+            / "benchmark/prefill_1m/launch_bde_v2.py"
+        )
+        spec = importlib.util.spec_from_file_location("bde_launch", path)
+        launch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launch)
+        return launch
+
+    @staticmethod
+    def _launch_args():
+        return SimpleNamespace(
+            tp=None, dcp=None, model_path=None, real_weights=False, context_length=None
+        )
+
+    def test_archive_recipe_env_stack_at_tp8_dcp8(self):
+        # Pin the archived recipe so launcher drift cannot invalidate A/B runs.
+        launch = self._load_launch_module()
+        command, env, selected = launch.launch_config(
+            self._launch_args(), {"TP": "8", "DCP": "8"}
+        )
+        self.assertEqual(command[command.index("--tp-size") + 1], "8")
+        self.assertEqual(command[command.index("--dcp-size") + 1], "8")
+        expected = {
+            "SGLANG_NPU_INDEXER_INT8": "True",
+            "SGLANG_NPU_ENABLE_DSA_CP": "True",
+            "SGLANG_NPU_SFA_KV_8BIT": "1",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "1",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "1",
+            "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "1",
+            "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "1",
+            "SGLANG_NPU_STREAM_O_PROJ": "1",
+            "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True",
+            "SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP": "True",
+            "SGLANG_ENABLE_CHAT_ENCODE_POOL": "True",
+            "SGLANG_CHAT_ENCODE_MEMO": "True",
+            "SGLANG_CHAT_ENCODE_RAW": "True",
+            "SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP": "True",
+            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+            "SGLANG_NPU_USE_MULTI_STREAM": "1",
+            "DEEPEP_HCCL_BUFFSIZE": "2500",
+            "HCCL_BUFFSIZE": "1000",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "HCCL_SOCKET_IFNAME": "lo",
+            "GLOO_SOCKET_IFNAME": "lo",
+            "STREAMS_PER_DEVICE": "32",
+            "SGLANG_SET_CPU_AFFINITY": "1",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+        }
+        self.assertEqual(selected, expected)
+        # The exact Phase A recipe combo must pass the restored-tree gate.
+        validate_legacy_dcp_flags(selected, tp_size=8, dcp_size=8)
+
+    def test_recipe_env_overrides_win(self):
+        # Attribution runs must be able to disable one optimization at a time.
+        launch = self._load_launch_module()
+        inherited = {
+            "TP": "8",
+            "DCP": "8",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "0",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "0",
+            "SGLANG_NPU_STREAM_O_PROJ": "0",
+        }
+        command, env, selected = launch.launch_config(self._launch_args(), inherited)
+        self.assertEqual(selected["SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH"], "0")
+        self.assertEqual(selected["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "0")
+        self.assertEqual(selected["SGLANG_NPU_STREAM_O_PROJ"], "0")
+        validate_legacy_dcp_flags(selected, tp_size=8, dcp_size=8)
+        validate_legacy_dcp_flags(selected, tp_size=8, dcp_size=4)
+
+    def test_decode_graph_capture_paths(self):
+        # Misaligned buckets previously emptied capture_bs and killed startup.
+        launch = self._load_launch_module()
+        command, _, _ = launch.launch_config(self._launch_args(), {})
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-prefill") + 1], "disabled"
+        )
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-decode") + 1], "disabled"
+        )
+        self.assertNotIn("--cuda-graph-max-bs-decode", command)
+        command, _, _ = launch.launch_config(
+            self._launch_args(), {"CAPTURE": "1", "GRAPH_BS": "16"}
+        )
+        self.assertEqual(command[command.index("--cuda-graph-max-bs-decode") + 1], "16")
+        self.assertNotIn("--cuda-graph-backend-decode", command)
+        command, _, _ = launch.launch_config(
+            self._launch_args(),
+            {"CAPTURE": "1", "GRAPH_BS": "16", "GRAPH_BS_LIST": "8 16", "TP": "8"},
+        )
+        bucket_at = command.index("--cuda-graph-bs-decode")
+        self.assertEqual(command[bucket_at + 1 : bucket_at + 3], ["8", "16"])
+        with self.assertRaisesRegex(ValueError, "multiples of TP"):
+            launch.launch_config(
+                self._launch_args(), {"CAPTURE": "1", "GRAPH_BS": "12", "TP": "8"}
+            )
 
 
 if __name__ == "__main__":
