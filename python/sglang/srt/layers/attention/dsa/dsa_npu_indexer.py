@@ -125,10 +125,15 @@ class _IndexerQueryShard:
         """
         plan = (
             get_dsa_cp_plan(forward_batch)
-            if dsa_cp_token_sharded(forward_batch)
+            if getattr(forward_batch, "npu_dsa_cp_attention_local", False)
+            or dsa_cp_token_sharded(forward_batch)
             else get_dsa_token_shard_plan(forward_batch)
         )
-        local = plan is not None
+        local = plan is not None and (
+            dsa_cp_token_sharded(forward_batch)
+            or envs.SGLANG_NPU_DSA_CP_LOCAL_TOPK.get()
+            or not getattr(forward_batch, "npu_dsa_cp_attention_local", False)
+        )
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Same arithmetic, but the two sites read their inputs separately;
             # if those ever drift, the gather stays correct where this would not.
@@ -151,6 +156,9 @@ class _IndexerQueryShard:
             )
         if self.num_real < self.rows:
             topk_indices[self.num_real :] = 0
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("dsa-local-topk")
         return topk_indices
 
 
@@ -201,7 +209,9 @@ def _get_indexer_query_shard(
     tp16. Planned once per forward from inputs identical across the group, so
     all ranks take the collective or none do.
     """
-    if dsa_cp_token_sharded(forward_batch):
+    if getattr(
+        forward_batch, "npu_dsa_cp_attention_local", False
+    ) or dsa_cp_token_sharded(forward_batch):
         plan = get_dsa_cp_plan(forward_batch)
         if plan is None or num_tokens != plan.rows:
             raise ValueError("indexer received a different local token grid")
@@ -275,6 +285,7 @@ class DSANPUIndexerMixin:
         )
 
         bs = q_lora.shape[0]
+        token_local = getattr(forward_batch, "npu_dsa_cp_attention_local", False)
 
         # A rank that scores only its own rows projects only those: wq_b is
         # 25.2 MFLOP per token. k stays full width -- every rank writes the whole
@@ -287,12 +298,12 @@ class DSANPUIndexerMixin:
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
             if is_prefill
-            and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+            and (token_local or envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get())
             and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
-        if q_sliced_early:
+        if q_sliced_early and not token_local:
             if dynamic_scale is not None:
                 dynamic_scale = shard.take(dynamic_scale)
             q_lora = shard.take(q_lora)
@@ -312,7 +323,9 @@ class DSANPUIndexerMixin:
 
             # q rotates on this rank's rows; k still needs every one of them.
             sin_q, cos_q = (
-                (shard.take(sin), shard.take(cos)) if q_sliced_early else (sin, cos)
+                (shard.take(sin), shard.take(cos))
+                if q_sliced_early and not token_local
+                else (sin, cos)
             )
 
             if self.alt_stream is not None:
@@ -450,9 +463,14 @@ class DSANPUIndexerMixin:
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
-            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+            expected_rows = (
+                get_dsa_cp_plan(forward_batch).num_tokens_pad
+                if token_local
+                else positions.shape[0]
+            )
+            assert indexer_cache_loc.shape[0] == expected_rows, (
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
-                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+                f"length: {indexer_cache_loc.shape[0]} != {expected_rows}"
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
@@ -463,6 +481,19 @@ class DSANPUIndexerMixin:
                 pool.index_k_store_dtype,
                 pool.index_k_scale_dtype,
             )
+        if token_local:
+            # Every rank scores local queries against the complete replicated index-K.
+            group = parallel.attn_tp_group
+            send = k.reshape(-1, k.shape[-1]).contiguous()
+            full = send.new_empty((send.shape[0] * group.world_size, send.shape[-1]))
+            group.all_gather_into_tensor(full, send)
+            k = full
+            if use_quant_indexer:
+                send_scale = k_scale.reshape(-1).contiguous()
+                full_scale = send_scale.new_empty(send_scale.numel() * group.world_size)
+                group.all_gather_into_tensor(full_scale, send_scale)
+                k_scale = full_scale
+        if use_quant_indexer:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
@@ -540,13 +571,16 @@ class DSANPUIndexerMixin:
             )
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
-            num_query_tokens = bs
+            num_query_tokens = (
+                get_dsa_cp_plan(forward_batch).num_tokens_pad if token_local else bs
+            )
             if shard is not None:
-                if not q_sliced_early:
+                if not q_sliced_early and not token_local:
                     query = shard.take(query)
                 # A late take: under _use_ag_after_qlora weights is gathered
                 # to full width above, so an earlier slice would cut twice.
-                weights = shard.take(weights)
+                if not token_local:
+                    weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 

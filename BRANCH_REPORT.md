@@ -1,3 +1,27 @@
+# BDE runtime restoration (2026-10-30)
+
+The eager A3 INT path now connects the archived packed-prefix/prefetch design,
+full-head attention, token-local residual/MoE execution, replicated index-K
+writes, streamed output projection and decode query preissue to their actual
+runtime callers. This supersedes the earlier statement that legacy D1v3 was
+disabled. Normal inference paths and page-interleaved KV ownership are retained.
+The pending SGL-TS probes are now default-off via `SGLANG_DEBUG_STAGE_LATENCY`.
+
+Focused host validation: 99 tests and 122 subtests passed; the pre-existing
+`test_plain_extend_plans_int32_inputs` mock-planning failure is excluded.
+The strengthened native decoder regression fails against the pre-fix entry
+point. Native indexer row ownership covers both rotary layouts and replicated
+INT8 keys/scales; packed attention verifies padded KV extent and causal mode.
+These are CPU/operator-boundary checks, not an NPU performance result.
+
+Mainline selection and the controlled TP16 launch/benchmark procedure are in
+[`BDE_RESTORATION.md`](benchmark/prefill_1m/repro_bde_v2/BDE_RESTORATION.md).
+Target-NPU numerical parity, activation, HCCL, peak memory and the reported
+20-second baseline comparison remain pending. No fastest configuration is
+claimed from host tests.
+
+---
+
 # Current integration update (2026-10-28)
 
 Integrated code from the following live PR heads without changing their upstream PRs:

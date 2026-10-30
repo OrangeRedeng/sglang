@@ -28,6 +28,9 @@ def reset_forward(batch, padded_rows):
         "npu_indexer_query_shard",
         "npu_indexer_sin_cos_cache",
         "npu_dsa_cp_indexer_key_lens",
+        "npu_dsa_token_shard_cu_query_lens",
+        "npu_dsa_token_shard_cu_key_lens",
+        "npu_dsa_token_shard_key_lens",
     ):
         if hasattr(batch, key):
             delattr(batch, key)
@@ -41,6 +44,8 @@ def full_head_plan(batch, index_topk=None):
         return None
     if batch.attn_dcp_metadata is None or not batch.forward_mode.is_extend():
         return None
+    if get_parallel().pp_size != 1:
+        raise ValueError("BDE full-head extend requires pipeline parallel size one")
     if getattr(batch, "can_run_tbo", False):
         raise ValueError(
             "BDE residual sharding requires sequential layer execution without TBO"

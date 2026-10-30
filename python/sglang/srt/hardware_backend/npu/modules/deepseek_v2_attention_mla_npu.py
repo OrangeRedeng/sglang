@@ -406,6 +406,26 @@ def forward_dsa_prepare_npu(
     input_on_attn_tp_slices: bool,
     prev_topk_indices: torch.Tensor = None,
 ):
+    from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+        full_head_plan,
+        prepare_attention,
+    )
+
+    plan = full_head_plan(
+        forward_batch, m.indexer.index_topk if m.indexer is not None else None
+    )
+    if plan is not None:
+        return prepare_attention(
+            m,
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices,
+            plan,
+        )
+    if _dsa_dcp_extend_gathers_kv(forward_batch):
+        _prepare_dcp_prefix(m, forward_batch, hidden_states)
     dynamic_scale = None
     # Packed INT8 KV keeps its separate attention ABI and full query rows.
     forward_batch.npu_dsa_no_token_shard = getattr(
@@ -527,6 +547,19 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+    pending_query = None
+    if (
+        forward_batch.forward_mode.is_decode()
+        and _use_dsa_dcp_partial_attention(forward_batch)
+        and envs.SGLANG_NPU_DCP_DECODE_Q_PREISSUE.get()
+    ):
+        from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
+            start_query_head_gather,
+        )
+
+        pending_query = start_query_head_gather(
+            runtime_context.get_parallel().dcp_group, q_nope_out, q_pe
+        )
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -552,7 +585,13 @@ def forward_dsa_prepare_npu(
         topk_indices = prev_topk_indices
 
     if _use_dsa_dcp_partial_attention(forward_batch):
-        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        if pending_query is None:
+            q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        else:
+            q_nope_out, q_pe = pending_query.finish()
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("dcp-decode-q-preissue")
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
@@ -567,6 +606,122 @@ def forward_dsa_prepare_npu(
         positions,
         mla_preprocess_used,
     )
+
+
+_dcp_pipeline = None
+
+
+def _prepare_dcp_prefix(m, batch, hidden_states):
+    global _dcp_pipeline
+    from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
+        DcpGatherPipeline,
+        start_prefix_gather,
+    )
+
+    pool = get_token_to_kv_pool()
+    if m.layer_id == pool.start_layer:
+        batch.npu_dcp_packed_plan = dcp_layout._PACKED_MISSING
+        batch.npu_dcp_extend_gather = None
+        batch.npu_dcp_prefix_pending = None
+        if _dcp_pipeline is not None:
+            _dcp_pipeline.reset()
+    parallel = runtime_context.get_parallel()
+    backend = forward_context.get_attn_backend()
+    index_topk = m.indexer.index_topk if m.indexer is not None else None
+    packed = dcp_layout.dcp_packed_read_plan(batch, index_topk)
+    if packed is None:
+        plan = batch.npu_dcp_extend_gather
+        if plan is None:
+            plan = dcp_layout.plan_dcp_extend_gather(
+                batch.extend_prefix_lens_cpu,
+                batch.extend_seq_lens_cpu,
+                parallel.dcp_size,
+                parallel.dcp_rank,
+                _dcp_extend_gather_piece_rows,
+                backend.page_size,
+            )
+            plan = plan._replace(
+                pieces=[
+                    piece._replace(index=piece.index.to(hidden_states.device))
+                    for piece in plan.pieces
+                ]
+            )
+            batch.npu_dcp_extend_gather = plan
+    else:
+        plan = packed
+    refs = (
+        hidden_states.new_empty((0, 1, m.kv_lora_rank)),
+        hidden_states.new_empty((0, 1, m.qk_rope_head_dim)),
+    )
+    batch.npu_dcp_prefix_layout = packed
+    prefetch = envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
+    if prefetch:
+        if _dcp_pipeline is None:
+            _dcp_pipeline = DcpGatherPipeline()
+        _dcp_pipeline.issue(
+            m.layer_id,
+            pool,
+            batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+            refs,
+            plan,
+            parallel,
+            packed is not None,
+            stream_o_proj=getattr(batch, "npu_dsa_cp_token_sharded", False)
+            and envs.SGLANG_NPU_STREAM_O_PROJ.get(),
+        )
+    elif envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.get():
+        sends = pool.get_mla_kv_buffer(
+            m.attn_mqa, batch.attn_dcp_metadata.dcp_local_prefix_kv_indices
+        )
+        batch.npu_dcp_prefix_pending = start_prefix_gather(
+            parallel.dcp_group, sends, refs, plan, parallel.dcp_size, packed is not None
+        )
+
+
+def _take_dcp_prefix(m, batch, k_nope, k_pe):
+    from sglang.srt.hardware_backend.npu.attention.dcp_gather import start_prefix_gather
+    from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+    pool = get_token_to_kv_pool()
+    parallel = runtime_context.get_parallel()
+    packed = batch.npu_dcp_prefix_layout
+    plan = packed if packed is not None else batch.npu_dcp_extend_gather
+    indices = batch.attn_dcp_metadata.dcp_local_prefix_kv_indices
+    if envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get():
+        result = _dcp_pipeline.take(m.layer_id, (k_nope, k_pe))
+        # The pool's actual storage, rather than end_layer's ambiguous
+        # inclusive/exclusive convention, bounds one-layer lookahead.
+        if m.layer_id + 1 < pool.start_layer + len(pool.k_buffer):
+            _dcp_pipeline.issue(
+                m.layer_id + 1,
+                pool,
+                indices,
+                (k_nope, k_pe),
+                plan,
+                parallel,
+                packed is not None,
+                stream_o_proj=getattr(batch, "npu_dsa_cp_token_sharded", False)
+                and envs.SGLANG_NPU_STREAM_O_PROJ.get(),
+            )
+            if plan.send_rows:
+                record("dcp-gather-prefetch")
+    else:
+        pending = getattr(batch, "npu_dcp_prefix_pending", None)
+        if pending is not None:
+            result = pending.finish((k_nope, k_pe))
+            batch.npu_dcp_prefix_pending = None
+            if plan.send_rows:
+                record("dcp-sfa-overlap")
+        elif packed is not None:
+            sends = pool.get_mla_kv_buffer(m.attn_mqa, indices)
+            result = start_prefix_gather(
+                parallel.dcp_group, sends, (k_nope, k_pe), plan, parallel.dcp_size, True
+            ).finish((k_nope, k_pe))
+        else:
+            return _dcp_gather_extend_kv_npu(m, batch, k_nope, k_pe)
+    if packed is not None:
+        record("dcp-packed-read")
+    return result
 
 
 def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
@@ -683,12 +838,20 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if getattr(forward_batch, "npu_dsa_cp_attention_local", False):
+        from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+            core_attention,
+        )
+
+        return core_attention(
+            m, q_pe, k_pe, q_nope_out, k_nope, topk_indices, forward_batch, gate
+        )
     use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
     attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
     # The backend's sparse operator reads this in place of the paged pool.
     dcp_gathers_kv = _dsa_dcp_extend_gathers_kv(forward_batch)
     if dcp_gathers_kv:
-        forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
+        forward_batch.npu_dcp_extend_kv = _take_dcp_prefix(
             m, forward_batch, k_nope, k_pe
         )
     attn_topk_indices = topk_indices
@@ -723,6 +886,10 @@ def forward_dsa_core_npu(
                 topk_indices, dsa_token_shard_plan
             )
         attn = m.attn_mqa_for_dsa_token_shard
+    if dcp_gathers_kv and forward_batch.npu_dcp_prefix_layout is not None:
+        attn_topk_indices = dcp_layout.remap_topk_to_packed(
+            attn_topk_indices, forward_batch.npu_dcp_prefix_layout
+        )
     attn_output = attn(
         q_nope_out.contiguous(),
         k_nope.contiguous(),

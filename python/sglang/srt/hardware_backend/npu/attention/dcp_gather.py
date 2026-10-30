@@ -112,11 +112,23 @@ class PendingGather:
         return self.outputs
 
 
-def start_prefix_gather(group, sends, refs, plan, dcp_size, packed=False):
+def start_prefix_gather(
+    group, sends, refs, plan, dcp_size, packed=False, *, buffer_slot=None
+):
     """Retain sends and disjoint per-piece scratch until all work completes."""
+
+    def allocate(name, ref, rows):
+        if buffer_slot is None:
+            return ref.new_empty((rows, *ref.shape[1:]))
+        from sglang.srt.layers.dcp.layout import dcp_extend_gather_buffer
+
+        return dcp_extend_gather_buffer(f"pipeline-{buffer_slot}-{name}", ref, rows)
+
     works, scratches = [], []
     if packed:
-        outputs = tuple(ref.new_empty((plan.rows, *ref.shape[1:])) for ref in refs)
+        outputs = tuple(
+            allocate(f"out-{i}", ref, plan.rows) for i, ref in enumerate(refs)
+        )
         padded = []
         for send in sends:
             value = send.new_zeros((plan.send_rows, *send.shape[1:]))
@@ -130,7 +142,7 @@ def start_prefix_gather(group, sends, refs, plan, dcp_size, packed=False):
             ]
     else:
         rows = plan.pieces[-1].out_end if plan.pieces else 0
-        outputs = tuple(ref.new_empty((rows, *ref.shape[1:])) for ref in refs)
+        outputs = tuple(allocate(f"out-{i}", ref, rows) for i, ref in enumerate(refs))
         padded = []
         for send in sends:
             value = send.new_zeros((plan.send_rows, *send.shape[1:]))
@@ -141,10 +153,13 @@ def start_prefix_gather(group, sends, refs, plan, dcp_size, packed=False):
                 dst += width
             padded.append(value)
         sends = tuple(padded)
-        for piece in plan.pieces:
+        for piece_id, piece in enumerate(plan.pieces):
             gathered = (piece.send_end - piece.send_start) * dcp_size
             rows = gathered + piece.extend_end - piece.extend_start
-            pair = tuple(ref.new_empty((rows, *ref.shape[1:])) for ref in refs)
+            pair = tuple(
+                allocate(f"scratch-{piece_id}-{i}", ref, rows)
+                for i, ref in enumerate(refs)
+            )
             scratches.append(pair)
             if gathered:
                 works.extend(
@@ -178,7 +193,13 @@ class DcpGatherPipeline:
         with torch.npu.stream(self.stream):
             sends = pool.get_mla_kv_buffer(SimpleNamespace(layer_id=layer_id), indices)
             pending = start_prefix_gather(
-                parallel.dcp_group, sends, refs, plan, parallel.dcp_size, packed
+                parallel.dcp_group,
+                sends,
+                refs,
+                plan,
+                parallel.dcp_size,
+                packed,
+                buffer_slot=layer_id % 2,
             )
             # Work completion must be queued on the producing stream before
             # its event; the consumer's wait then orders every output read.

@@ -1152,6 +1152,17 @@ class DeepseekV2MoE(nn.Module):
                     boundary_operand=boundary_operand,
                 )
 
+        if _is_npu and get_forward().npu_dsa_cp_token_sharded:
+            # This path owns the quantized token gather before expert dispatch.
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                return_moe_output=return_moe_output,
+                leave_output_sum=leave_output_sum,
+            )
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
                 self,
@@ -3106,6 +3117,26 @@ class DeepseekV2DecoderLayer(nn.Module):
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states_orig = residual_access.buffer(hidden_states)
+        if (
+            _is_npu
+            and self.self_attn.use_dsa
+            and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+        ):
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                decoder_forward,
+            )
+
+            result = decoder_forward(
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices,
+            )
+            if result is not None:
+                get_attn_tp_context().clear_attn_inputs()
+                return result
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
@@ -3417,6 +3448,12 @@ class DeepseekV2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         dsa_forward_uses_topk = self._dsa_forward_uses_topk()
+        if _is_npu and self.use_dsa:
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                reset_forward,
+            )
+
+            reset_forward(forward_batch, positions.shape[0])
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3562,19 +3599,11 @@ class DeepseekV2Model(nn.Module):
                     # Gather them (a [num_requests, hidden] all-gather, not
                     # the full [N, hidden]) so the logits code below sees the
                     # shape it always did.
-                    from sglang.srt.layers.attention.dsa.dsa_cp import (
-                        dsa_cp_gather_last_token_rows,
+                    from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                        gather_logit_rows,
                     )
-                    from sglang.srt.utils.common import print_info_once
 
-                    print_info_once(
-                        "D1v3: the logits path gathers only the last-token "
-                        "rows across the ranks (a [num_requests, hidden] "
-                        "all-gather, not the full token grid) before the LM head."
-                    )
-                    hidden_states = dsa_cp_gather_last_token_rows(
-                        hidden_states, forward_batch
-                    )
+                    hidden_states = gather_logit_rows(hidden_states, forward_batch)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -3761,7 +3790,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+            if getattr(forward_batch, "npu_dsa_cp_logits_pruned", False):
                 # D1v3: the residual stream ran token-sharded, so the model
                 # forward already gathered the last-token rows and
                 # hidden_states is [num_requests, hidden] -- already pruned.

@@ -1,5 +1,6 @@
 """Residual-state and collective parity for the BDE D1v3/D2v3 port."""
 
+import ast
 import importlib.util
 import threading
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
     start_o_proj_gather,
     start_query_head_gather,
@@ -18,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
 from sglang.srt.hardware_backend.npu.modules import dsa_token_residual as residual
 from sglang.srt.layers.attention.dsa import dsa_cp
 from sglang.srt.layers.attention.dsa.dsa_cp_layout import plan_dsa_cp_shard
+from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -85,7 +88,44 @@ class Norm:
 
 
 class TestDsaTokenResidual(CustomTestCase):
+    @staticmethod
+    def _native_decoder_forward():
+        # Execute the real entry point without importing accelerator-only model classes.
+        path = (
+            Path(__file__).resolve().parents[5]
+            / "python/sglang/srt/models/deepseek_v2.py"
+        )
+        tree = ast.parse(path.read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "DeepseekV2DecoderLayer"
+        )
+        forward = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "forward"
+        )
+        namespace = {
+            "_is_npu": True,
+            "envs": envs,
+            "residual_access": residual_access,
+            "get_attn_tp_context": lambda: SimpleNamespace(
+                clear_attn_inputs=lambda: None
+            ),
+        }
+        exec(  # noqa: S102 - executes the production entry point
+            compile(
+                "from __future__ import annotations\n" + ast.unparse(forward),
+                str(path),
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace["forward"]
+
     def test_decoder_stream_and_last_rows_match_full_width(self):
+        native_forward = self._native_decoder_forward()
         for dtype in (torch.float32, torch.bfloat16):
             for lengths, padded in (([5], 6), ([3, 4], 8), ([5], 16)):
                 with self.subTest(dtype=dtype, lengths=lengths, padded=padded):
@@ -107,7 +147,7 @@ class TestDsaTokenResidual(CustomTestCase):
                     reference = norm(reference)
                     last = torch.tensor(lengths).cumsum(0) - 1
 
-                    def worker(rank):
+                    def worker(rank, local=local):
                         group = world.group(rank)
                         local.parallel = SimpleNamespace(
                             attn_tp_group=group, attn_tp_size=2, attn_tp_rank=rank
@@ -115,6 +155,7 @@ class TestDsaTokenResidual(CustomTestCase):
                         plan = plan_dsa_cp_shard(
                             lengths, lengths, 2, rank, padded_num_tokens=padded
                         )
+                        local.plan = plan
                         batch = SimpleNamespace(
                             npu_dsa_cp_plan=plan,
                             extend_seq_lens_cpu=lengths,
@@ -125,6 +166,7 @@ class TestDsaTokenResidual(CustomTestCase):
 
                         class Attention:
                             indexer = None
+                            use_dsa = True
 
                             def __call__(self, **kwargs):
                                 return F.linear(kwargs["hidden_states"], wa), None
@@ -144,13 +186,12 @@ class TestDsaTokenResidual(CustomTestCase):
                         )
                         output = hidden.clone()
                         for _ in range(2):
-                            output, _ = residual.decoder_forward(
+                            output, _ = native_forward(
                                 layer,
                                 torch.arange(padded),
                                 output,
                                 batch,
                                 None,
-                                plan=plan,
                             )
                         output = residual_batch.final_norm(output, batch, norm)
                         pruned = residual.gather_logit_rows(output, batch)
@@ -172,11 +213,177 @@ class TestDsaTokenResidual(CustomTestCase):
                     lookup = lambda: local.parallel
                     with (
                         patch.object(residual, "get_parallel", side_effect=lookup),
+                        patch.object(
+                            residual,
+                            "full_head_plan",
+                            side_effect=lambda *args, local=local: local.plan,
+                        ),
+                        envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.override(True),
                         patch.object(dsa_cp, "get_parallel", side_effect=lookup),
                         patch.object(dsa_cp, "_enable_dsa_cp", True),
                         ThreadPoolExecutor(2) as pool,
                     ):
                         list(pool.map(worker, range(2)))
+
+    def test_native_indexer_keeps_local_queries_and_replicates_int8_keys(self):
+        """The full entry point must neither slice local rows twice nor write partial index-K."""
+        for neox in (False, True):
+            with self.subTest(neox=neox):
+                self._check_native_indexer(neox)
+
+    def _check_native_indexer(self, neox):
+        from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        world, local = World(2), threading.local()
+        hidden = torch.arange(64).reshape(16, 4).float() / 2
+        expected_key = hidden.to(torch.int8)
+
+        class Rope:
+            is_neox_style = neox
+            cos_sin_cache = torch.tensor([[1.0, 0.0]]).expand(16, 2)
+
+            def __call__(self, positions, q, k):
+                return q, k
+
+        def quantize(value, *unused):
+            return value.to(torch.int8), torch.ones(value.shape[:-1])
+
+        def lightning(**kwargs):
+            q, k = kwargs["query"][:, 0].float(), kwargs["key"].float()
+            scores = q @ k.T
+            end = int(kwargs["actual_seq_lengths_key"][-1])
+            frontier = torch.arange(q.shape[0]) + end - q.shape[0]
+            scores.masked_fill_(
+                torch.arange(k.shape[0])[None] > frontier[:, None],
+                -float("inf"),
+            )
+            return scores.topk(2, dim=-1).indices.unsqueeze(1)
+
+        def worker(rank):
+            group = world.group(rank)
+            plan = plan_dsa_cp_shard([16], [16], 2, rank)
+            batch = SimpleNamespace(
+                npu_dsa_cp_plan=plan,
+                npu_dsa_cp_attention_local=True,
+                npu_dsa_cp_token_sharded=True,
+                positions=torch.arange(16),
+                out_cache_loc=torch.arange(16),
+                forward_mode=ForwardMode.EXTEND,
+                attn_cp_metadata=None,
+                seq_lens=torch.tensor([16]),
+                extend_seq_lens=torch.tensor([16]),
+            )
+            cache = SimpleNamespace(
+                start_layer=0,
+                index_k_scale_buffer=True,
+                indexer_hadamard_128=None,
+                index_k_store_dtype=torch.int8,
+                index_k_scale_dtype=torch.float32,
+            )
+            cache.set_index_k_buffer = lambda layer, loc, value: setattr(
+                cache, "keys", value
+            )
+            cache.set_index_k_scale_buffer = lambda layer, loc, value: setattr(
+                cache, "scales", value
+            )
+            cache.get_index_k_buffer = lambda layer: cache.keys
+            cache.get_index_k_scale_buffer = lambda layer: cache.scales
+            local.pool, local.parallel = (
+                cache,
+                SimpleNamespace(
+                    dcp_enabled=True,
+                    attn_dcp_size=2,
+                    attn_tp_size=2,
+                    attn_tp_rank=rank,
+                    attn_tp_group=group,
+                ),
+            )
+            local.backend = SimpleNamespace(
+                is_draft_worker=False,
+                forward_metadata=SimpleNamespace(
+                    seq_lens_cpu_int=torch.tensor([16]),
+                    dcp_origin_out_cache_loc=torch.arange(16),
+                    block_tables=torch.tensor([[0]]),
+                ),
+            )
+            projection = lambda value: (value, None)
+            model = SimpleNamespace(
+                dsa_enable_prefill_cp=False,
+                rotary_emb=Rope(),
+                alt_stream=None,
+                wq_b=projection,
+                wk=projection,
+                k_norm=lambda value: value,
+                weights_proj=lambda value: (
+                    torch.ones((value.shape[0], 1)),
+                    None,
+                ),
+                hidden_size=4,
+                n_heads=1,
+                head_dim=4,
+                rope_head_dim=2,
+                index_topk=2,
+            )
+            own = hidden[plan.local_start : plan.local_start + plan.rows]
+            actual = indexer.DSANPUIndexerMixin.forward_npu(
+                model,
+                own,
+                own,
+                batch.positions[plan.local_start : plan.local_end],
+                batch,
+                0,
+            )
+            q = own.reshape(8, 1, 4)
+            if neox:
+                q = torch.cat((q[..., :2], q[..., 2:]), -1)
+            expected = lightning(
+                query=q.to(torch.int8),
+                key=expected_key,
+                actual_seq_lengths_key=torch.tensor([plan.key_lens[-1]]),
+            ).squeeze(1)
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(cache.keys, expected_key)
+            self.assertEqual(cache.scales.numel(), 16)
+            self.assertTrue(batch.npu_indexer_topk_is_local)
+
+        with (
+            envs.SGLANG_NPU_USE_MULTI_STREAM.override(False),
+            patch.object(dsa_cp, "_enable_dsa_cp", True),
+            patch.object(indexer, "get_parallel", side_effect=lambda: local.parallel),
+            patch.object(
+                indexer, "get_attn_backend", side_effect=lambda: local.backend
+            ),
+            patch.object(
+                indexer, "get_token_to_kv_pool", side_effect=lambda: local.pool
+            ),
+            patch.object(indexer, "_use_ag_after_qlora", False),
+            patch.object(
+                indexer,
+                "_quantize_npu_indexer_activation",
+                side_effect=quantize,
+            ),
+            patch.object(
+                indexer,
+                "torch_npu",
+                SimpleNamespace(npu_rotary_mul=lambda value, *args: value),
+                create=True,
+            ),
+            patch.object(
+                torch.ops.npu,
+                "npu_rotary_mul",
+                lambda value, *args: value,
+                create=True,
+            ),
+            patch.object(
+                torch.ops.npu,
+                "npu_quant_lightning_indexer",
+                lightning,
+                create=True,
+            ),
+            ThreadPoolExecutor(2) as pool,
+        ):
+            list(pool.map(worker, range(2)))
 
     def test_streamed_column_shards_match_resident_matrix(self):
         world = World(2)

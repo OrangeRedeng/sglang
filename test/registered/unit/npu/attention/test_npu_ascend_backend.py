@@ -822,6 +822,53 @@ class TestGenerateAlibiBias(unittest.TestCase):
 
 
 class TestDcpDsaPrefixMetadata(CustomTestCase):
+    def test_packed_gather_uses_padded_kv_extent_without_causal_crop(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.kv_cache_dtype = torch.bfloat16
+        key = torch.arange(6, dtype=torch.bfloat16).reshape(6, 1, 1)
+        query = torch.ones((1, 1, 1), dtype=torch.bfloat16)
+        batch = SimpleNamespace(
+            npu_dcp_prefix_layout=SimpleNamespace(rows=6),
+            attn_dcp_metadata=SimpleNamespace(dcp_kv_indptr=torch.tensor([0, 5])),
+        )
+
+        def sparse(**kwargs):
+            self.assertEqual(kwargs["actual_seq_lengths_kv"].tolist(), [6])
+            self.assertEqual(kwargs["sparse_mode"], 0)
+            indices = kwargs["sparse_indices"][:, 0].long()
+            selected = kwargs["key"][indices, 0].float()
+            scores = (kwargs["query"][:, None, 0].float() * selected).sum(-1)
+            weights = (scores * kwargs["scale_value"]).softmax(-1)
+            return (
+                (weights.unsqueeze(-1) * selected).sum(1).unsqueeze(1).to(key.dtype),
+                None,
+                None,
+            )
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.torch_npu.npu_sparse_flash_attention",
+            side_effect=sparse,
+        ):
+            actual = backend._forward_sparse_dcp_gathered(
+                query,
+                torch.zeros_like(query),
+                (key, torch.zeros_like(key)),
+                torch.tensor([[0, 5]], dtype=torch.int32),
+                SimpleNamespace(scaling=0.5),
+                torch.tensor([1]),
+                batch,
+                None,
+            )
+        expected = (
+            torch.tensor([0.0, 2.5]).softmax(0) * torch.tensor([0.0, 5.0])
+        ).sum()
+        torch.testing.assert_close(
+            actual.float().squeeze(), expected, atol=0.02, rtol=0
+        )
+
     def test_only_dsa_dcp_targets_skip_legacy_prefix_tables(self):
         from sglang.srt.hardware_backend.npu.attention import ascend_backend
         from sglang.srt.layers.dcp import layout
