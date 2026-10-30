@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
@@ -47,6 +48,8 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,33 @@ def get_last_loc_torch(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
+    )
+
+
+def _storage(
+    tree_cache: BasePrefixCache, batch: Optional[ScheduleBatch] = None
+) -> KVStorage | StaticKVStorage:
+    """The storage the tree's pools present to a request's lifecycle."""
+    return kv_storage_of(
+        tree_cache.req_to_token_pool,
+        tree_cache.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        batch=batch,
+    )
+
+
+def retire_window(
+    req: Req, frontier: int, tree_cache: BasePrefixCache, *, eviction_interval: int = 1
+) -> None:
+    """Retire the window rows of a running request behind ``frontier``,
+    keeping what the prefix tree still needs of the window."""
+    _storage(tree_cache).advance(
+        req,
+        frontier,
+        window=tree_cache.swa_retain_window,
+        retain_floor=tree_cache.swa_retain_floor(req),
+        shares_prefixes=tree_cache.supports_prefix_sharing(),
+        eviction_interval=eviction_interval,
     )
 
 
