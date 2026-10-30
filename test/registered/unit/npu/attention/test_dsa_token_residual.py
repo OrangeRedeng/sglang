@@ -198,7 +198,7 @@ class TestDsaTokenResidual(CustomTestCase):
                                 return F.linear(kwargs["hidden_states"], wa), None
 
                         class Mlp:
-                            reduce_results = False
+                            down_proj = SimpleNamespace(reduce_results=False)
 
                             def __call__(self, value, *unused):
                                 return F.linear(value, wf / 2)

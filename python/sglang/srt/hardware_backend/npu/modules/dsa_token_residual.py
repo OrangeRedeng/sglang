@@ -118,7 +118,12 @@ def decoder_forward(
         normalized = full
     with get_forward().scoped(npu_dsa_cp_token_sharded=layer.is_layer_sparse):
         output = layer.mlp(normalized, batch, None)
-    if not layer.mlp.reduce_results:
+    reduce_results = (
+        layer.mlp.reduce_results
+        if layer.is_layer_sparse
+        else layer.mlp.down_proj.reduce_results
+    )
+    if not reduce_results:
         output = dsa_cp_reduce_scatter_tokens(output)
     if output.shape[0] != plan.rows:
         raise RuntimeError("DSA-CP FFN must return this rank's local residual rows")
