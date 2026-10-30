@@ -79,12 +79,80 @@ validate prefill graphs or overlap with speculative execution.
 
 Append `--print` to inspect serving commands. Keep QKV and both FIA preparation
 switches identical between runs. Capture complete logs, including graph capture
-and fallback warnings. A captured bucket without FIA host-update records falls
-back to eager. Buckets outside the capture range and missing CPU lengths also
+and fallback warnings. Frozen-KV full graphs now use explicit FIA task groups,
+per-operation external events and runner-owned update streams. Capture fails
+if no supported FIA tasks were recorded. Buckets outside the capture range and missing CPU lengths
 keep the assistant eager. Target verification rebinds prefix+draft lengths;
 every assistant step rebinds the unchanged committed prefix. Wide-head verify
 masks are computed from replayed device lengths rather than capture-time values.
 These paths have CPU orchestration coverage, not target-NPU acceptance.
+
+### Explicit FIA lifecycle validation
+
+The explicit backend follows the task/event protocol in vLLM-Ascend
+[`updatable_graph.py`](https://github.com/vllm-project/vllm-ascend/blob/0f515fe1e246a967dc41c9aa3d4e8ecb24cbbae2/vllm_ascend/compilation/updatable_graph.py)
+and its normal replay-before-update ordering. It does not use TorchNPU's
+automatic dispatcher or class-wide update stream. Each captured FIA call owns
+an event and handle, including every seed/recurrent draft call. Output buffers
+and workspaces remain stable; fresh host length lists live until replay completes.
+An update failure after replay submission is fatal: restart that worker rather
+than retrying or synchronizing a graph with unsatisfied events.
+
+Record the deployed SHA, NPU model/count, CANN, torch/torch_npu and
+sgl-kernel-npu versions before running this matrix. Start with one NPU,
+overlap disabled, steps2/tokens3; restart between the four graph-switch trials
+in the table below. Keep all other settings identical. Example launch:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2 TASK_QUEUE_ENABLE=1 ASCEND_USE_FIA=1 \
+SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=0 \
+SGLANG_ENABLE_NPU_GEMMA4_MTP_Q_ONLY=0 \
+SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=1 \
+SGLANG_ENABLE_NPU_FIA_KV_VIEW_REUSE=0 \
+SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH=0 \
+SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH=0 \
+SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC=0 \
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True PYTHONPATH="$PWD/python" \
+python3 -m sglang.launch_server \
+  --model-path /home/test1/models/gemma4-26B-A4B-w8a8 \
+  --served-model-name gemma4-w8a8-test --host 0.0.0.0 --port 30014 \
+  --device npu --attention-backend ascend --tp-size 1 --dp-size 1 \
+  --context-length 8192 --max-running-requests 64 \
+  --max-prefill-tokens 8192 --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.82 --disable-overlap-schedule \
+  --cuda-graph-config '{"prefill":{"backend":"disabled"},"decode":{"backend":"full","bs":[1,2,4,8,12,16,24,32,48,64]}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path /home/test1/models/gemma-4-26B-A4B-it-assistant \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 3 \
+  --enable-prefill-delayer --prefill-delayer-queue-min-ratio 0.5 \
+  --prefill-delayer-max-delay-ms 50 --prefill-delayer-max-delay-passes 4 \
+  --prefill-max-requests 6 --trust-remote-code
+```
+
+Look for separate `Frozen-KV NPU draft explicit FIA graph replay active` and
+`Frozen-KV NPU verify explicit FIA graph replay active` messages. Bucket capture
+logs report task counts. Exercise repeated requests, mixed lengths, changing
+request slots/partial buckets and prefixes crossing the checkpoint's actual SWA
+window. Compare greedy tokens/logprobs to eager MTP and check that assistant
+execution leaves target KV unchanged. Repeat with steps3/tokens4, then on
+devices2,3 with DP2. Validate overlap separately after these checks pass.
+
+The independent expert switch `SGLANG_ENABLE_NPU_GEMMA4_MTP_Q_ONLY=1` enables
+Q-only projection for unquantized TP1 NPU assistants. It defaults off and uses
+the Q rows of the existing packed projection without changing checkpoint keys.
+Quantized drafts, TP>1 and other models keep the existing path. Restart for the
+A/B trial, and check the enabled-layer count in startup logs. Compare this
+switch independently after validating graph replay. Logits, probabilities and
+sampling are unchanged by design; target-NPU parity is still required.
+
+For timing, retain C24/RPS87,1600 prompts, prefix250/input1100/output100,
+temperature0/ignore-EOS, fixed seed48 and identical warmup/cache preparation.
+Run three interleaved repetitions per candidate and report TTFT/TPOT/E2E,
+tails, output TPS/completed RPS, acceptance length and per-replica batches.
+Do not use diagnostic synchronization for timing. The separate recovery
+runner still defaults to one draft step/eager draft and strips inherited
+experiment flags; use explicit launches for this multi-step graph matrix.
 
 With the fixed recommendation/RAG datasets available, capture greedy completions
 and logprobs from eager MTP, then repeat against graph MTP:

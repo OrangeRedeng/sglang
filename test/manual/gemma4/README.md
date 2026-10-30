@@ -1,5 +1,9 @@
 # Gemma 4 two-NPU throughput experiments
 
+For the fixed random C24 workload and recovery of the earlier ~9.3req/s
+two-NPU result, use [recover_throughput.md](recover_throughput.md).
+It provides explicit settings, matched MTP controls and repeated-run comparisons.
+
 Target: recommendation **21.75 completed requests/s**, RAG **8 completed requests/s**,
 for all four cases each, with total concurrency below 30. Preserve checkpoint
 precision, datasets, output lengths and scenario latency SLOs. No draft model.

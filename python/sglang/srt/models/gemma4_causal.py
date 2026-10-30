@@ -490,6 +490,17 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _project_qkv(self, hidden_states):
+        if getattr(self, "_npu_frozen_q_only", False):
+            # Assistant K/V come from the target; keep the existing checkpoint layout.
+            weight = self.qkv_proj.weight.narrow(0, 0, self.q_size)
+            bias = self.qkv_proj.bias
+            if bias is not None:
+                bias = bias.narrow(0, 0, self.q_size)
+            return torch.nn.functional.linear(hidden_states, weight, bias), None, None
+        qkv, _ = self.qkv_proj(hidden_states)
+        return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -497,8 +508,7 @@ class Gemma4Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self._project_qkv(hidden_states)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
         # Preconditions for the fused path: tensors on CUDA or XPU (the kernel

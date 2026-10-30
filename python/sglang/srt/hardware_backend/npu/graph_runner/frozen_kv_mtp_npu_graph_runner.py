@@ -31,11 +31,10 @@ class FrozenKVMTPNpuGraphRunner(FrozenKVMTPCudaGraphRunner):
     def _check_graph_update_records(self):
         self._updatable_graphs = set()
         for key, graph in self.backend._graphs.items():
-            dispatch = getattr(graph, "graph_dispatch_mode", None)
-            records = getattr(dispatch, "graph_dispatch_records", None)
+            records = getattr(graph, "_frozen_fia_tasks", None)
             if not isinstance(records, (list, tuple)) or not records:
                 logger.warning(
-                    "Frozen-KV draft bucket %s has no FIA update records; using eager.",
+                    "Frozen-KV draft bucket %s has no FIA update tasks; using eager.",
                     key.size,
                 )
                 continue

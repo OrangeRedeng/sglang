@@ -291,7 +291,6 @@ def run_server(args, schedule_name, out, concurrencies, repeats, env):
                         "SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH",
                         "SGLANG_DISABLE_NPU_MTP_VERIFY_GRAPH",
                         "SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC",
-                        "SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE",
                     )
                 },
             },
@@ -576,7 +575,6 @@ def main():
         TASK_QUEUE_ENABLE="1",
         ASCEND_USE_FIA="1",
         PYTORCH_NPU_ALLOC_CONF="expandable_segments:True",
-        SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE="0",
         SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM="0" if args.qkv == "native" else "1",
     )
     env["PYTHONPATH"] = (

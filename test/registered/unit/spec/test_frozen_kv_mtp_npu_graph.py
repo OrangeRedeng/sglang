@@ -61,7 +61,7 @@ def test_inspection_is_side_effect_free_and_replay_updates_every_operator(
         records[:] = [list(entry["actual_seq_kvlen"]) for entry in entries]
 
     graph = SimpleNamespace(
-        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=records),
+        _frozen_fia_tasks=records,
         update=Mock(side_effect=update),
     )
 
@@ -89,11 +89,11 @@ def test_recordless_draft_bucket_falls_back_to_eager():
     missing, supported = ShapeKey(size=2), ShapeKey(size=4)
     runner.backend._graphs = {
         missing: SimpleNamespace(
-            graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]),
+            _frozen_fia_tasks=[],
             update=Mock(),
         ),
         supported: SimpleNamespace(
-            graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[object()]),
+            _frozen_fia_tasks=[object()],
             update=Mock(),
         ),
     }
@@ -112,7 +112,7 @@ def test_recordless_draft_bucket_falls_back_to_eager():
 def test_empty_dispatch_records_are_rejected_even_when_broadcast_update_is_a_noop():
     runner = draft_runner()
     graph = SimpleNamespace(
-        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[]), update=Mock()
+        _frozen_fia_tasks=[], update=Mock()
     )
     runner.backend._graphs = {ShapeKey(size=2): graph}
     runner._check_graph_update_records()
@@ -211,9 +211,7 @@ def test_verify_capture_only_inspects_records_without_signaling_graph_events(
     )
     runner._make_graph_key = lambda size: ShapeKey(size=size)
     graph = SimpleNamespace(
-        graph_dispatch_mode=SimpleNamespace(
-            graph_dispatch_records=[object()] if has_records else []
-        ),
+        _frozen_fia_tasks=[object()] if has_records else [],
         update=Mock(),
     )
     runner.backend = SimpleNamespace(_graphs={ShapeKey(size=2): graph})

@@ -47,6 +47,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
 
+    _auto_dispatch_capture = True
+
     def __init__(
         self,
         cuda_graph_runner: BaseCudaGraphRunner,
@@ -60,12 +62,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
         self._capture_stream = None
-        spec_algorithm = getattr(
-            getattr(cuda_graph_runner, "model_runner", None), "spec_algorithm", None
-        )
-        self._wait_for_input_update = (
-            spec_algorithm is not None and spec_algorithm.is_frozen_kv_mtp()
-        )
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -74,12 +70,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cuda_graph_runner, "enable_torch_compile", False
         )
         # Reuse one device-bound worker for graph input updates.
-        self._update_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="npu-graph-update",
-            initializer=self._device_module.set_device,
-            initargs=(self._device_id,),
-        )
+        self._update_executor = None
+        if self._auto_dispatch_capture:
+            self._update_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="npu-graph-update",
+                initializer=self._device_module.set_device,
+                initargs=(self._device_id,),
+            )
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
@@ -138,13 +136,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                auto_dispatch_capture=True,
+                auto_dispatch_capture=self._auto_dispatch_capture,
             ),
+            self._graph_capture_context(graph),
         ):
             out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+
+    def _graph_capture_context(self, graph):
+        return empty_context()
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -194,14 +196,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
-        if self._wait_for_input_update:
-            # Frozen draft and verify share TorchNPU's update stream. Publish all
-            # external-event signals before submitting either dependent replay.
-            update_future.result()
-            graph.replay()
-        else:
-            graph.replay()
-            update_future.result()
+        graph.replay()
+        update_future.result()
 
         fence = self._device_module.Event()
         fence.record()
@@ -209,7 +205,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
-        self._update_executor.shutdown(wait=True, cancel_futures=True)
+        if self._update_executor is not None:
+            self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

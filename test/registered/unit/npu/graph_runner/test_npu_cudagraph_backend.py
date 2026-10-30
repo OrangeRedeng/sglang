@@ -35,7 +35,7 @@ def _make_backend(*, frozen_kv=False):
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
-    def test_frozen_updates_finish_before_replay_and_preserve_previous_fence(self):
+    def test_legacy_backend_preserves_replay_order_and_previous_fence(self):
         for frozen_kv in (False, True):
             with self.subTest(frozen_kv=frozen_kv):
                 backend, runner = _make_backend(frozen_kv=frozen_kv)
@@ -65,14 +65,13 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
                         seq_lens=None,
                         cpu_update_input=[{"actual_seq_kvlen": [7, 9]}],
                     )
-                expected = ["update", "replay"] if frozen_kv else ["replay", "update"]
-                self.assertEqual(order, ["fence"] + expected)
+                self.assertEqual(order, ["fence", "replay", "update"])
                 self.assertEqual(output, "output")
                 runner.device_module.Event.return_value.record.assert_called_once()
                 backend.cleanup()
 
-    def test_failed_frozen_update_does_not_launch_a_graph_waiting_for_events(self):
-        backend, runner = _make_backend(frozen_kv=True)
+    def test_legacy_update_failure_propagates(self):
+        backend, runner = _make_backend()
         key = ShapeKey(size=2)
         graph = mock.Mock()
         graph.update.side_effect = RuntimeError("FIA update failed")
@@ -83,7 +82,7 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
                 backend.replay_with_input_update(
                     key, seq_lens=None, cpu_update_input=[{"actual_seq_kvlen": [7, 9]}]
                 )
-            graph.replay.assert_not_called()
+            graph.replay.assert_called_once()
             runner.device_module.Event.assert_not_called()
         finally:
             backend.cleanup()

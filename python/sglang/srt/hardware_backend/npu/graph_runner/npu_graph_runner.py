@@ -145,8 +145,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph = self.backend._graphs[self._make_graph_key(size)]
         # Inspect records without updating: updates enqueue external-event
         # signals and belong to the normal update/replay lifecycle.
-        dispatch = getattr(graph, "graph_dispatch_mode", None)
-        records = getattr(dispatch, "graph_dispatch_records", None)
+        records = getattr(graph, "_frozen_fia_tasks", None)
         if not isinstance(records, (list, tuple)) or not records:
             self._frozen_graph_updates_available = False
             logger.warning(

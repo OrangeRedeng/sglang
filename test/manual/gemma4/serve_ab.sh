@@ -62,7 +62,6 @@ export ASCEND_RT_VISIBLE_DEVICES="$devices"
 export TASK_QUEUE_ENABLE=1
 export ASCEND_USE_FIA=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_ENABLE_NPU_ADAPTIVE_TASK_QUEUE=0
 export SGLANG_ENABLE_NPU_GEMMA4_QKV_NORM=$norm
 export PYTHONPATH="$server_root/python${PYTHONPATH:+:$PYTHONPATH}"
 

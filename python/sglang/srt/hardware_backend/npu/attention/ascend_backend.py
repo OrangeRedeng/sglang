@@ -24,6 +24,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_backend import (
+    frozen_kv_fia_v2,
+    reject_unhandled_fia_capture,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -2631,10 +2635,11 @@ class AscendAttnBackend(AttentionBackend):
                     keys[None, None, :]
                     < positions[:, :, None] - layer.sliding_window_size
                 )
-            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            result, _ = frozen_kv_fia_v2(
                 query.reshape(bs, width, layer.tp_q_head_num, layer.qk_head_dim),
                 k_cache,
                 v_cache,
+                output_dim=layer.v_head_dim,
                 block_table=block_table,
                 block_size=self.page_size,
                 num_query_heads=layer.tp_q_head_num,
@@ -2828,10 +2833,11 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch,
                     )
                 else:
-                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    attn_output, _ = frozen_kv_fia_v2(
                         query,
                         k_cache,
                         v_cache,
+                        output_dim=layer.v_head_dim,
                         block_table=block_table,
                         block_size=self.page_size,
                         num_query_heads=layer.tp_q_head_num,
@@ -3155,10 +3161,11 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, _ = frozen_kv_fia_v2(
                     query,
                     k_cache,
                     v_cache,
+                    output_dim=layer.v_head_dim,
                     num_query_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="TND",
@@ -3213,10 +3220,11 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             bs = q.shape[0]
-            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            result, _ = frozen_kv_fia_v2(
                 q.reshape(bs, 1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_cache,
                 v_cache,
+                output_dim=layer.v_head_dim,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
                 num_query_heads=layer.tp_q_head_num,
@@ -3255,6 +3263,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
 
             num_tokens = query.shape[0]
+            reject_unhandled_fia_capture()
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,

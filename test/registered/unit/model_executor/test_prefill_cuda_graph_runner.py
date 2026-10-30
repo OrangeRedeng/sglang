@@ -298,10 +298,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             device="cuda",
-            npu_task_queue_policy=SimpleNamespace(
-                prefill_mode=0,
-                set_mode=lambda mode: capture_events.append(mode)
-            ),
             gpu_id=0,
             is_draft_worker=False,
             # A real ModelRunner always has this attribute; the prefill gate
@@ -347,7 +343,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
-        self.assertEqual(capture_events, [0, "capture"])
+        self.assertEqual(capture_events, ["capture"])
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
