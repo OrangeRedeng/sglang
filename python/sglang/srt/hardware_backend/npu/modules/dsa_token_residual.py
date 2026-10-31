@@ -180,6 +180,64 @@ def gather_logit_rows(hidden, batch):
     return full
 
 
+def runtime_gather_reserve_bytes(model, tokens):
+    projection_bytes = 0
+    row_bytes = 0
+    for layer in model.modules():
+        shard = getattr(layer, "o_proj_stream_shard", None)
+        if shard is not None:
+            full_bytes = (
+                shard.numel() * shard.element_size() * get_parallel().attn_tp_size
+            )
+            projection_bytes = max(projection_bytes, 3 * full_bytes)
+        if getattr(layer, "w_vc_qrep", None) is not None:
+            hidden = layer.o_proj.output_size
+            row_bytes = max(
+                row_bytes, 2 * tokens * hidden * layer.w_vc_qrep.element_size()
+            )
+    return projection_bytes + row_bytes
+
+
+def prepare_quantized_q_projection(m, group):
+    from types import SimpleNamespace
+
+    from sglang.srt.hardware_backend.npu.moe.contracts import linear_kernel
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        NPUOnlineW8A8Int8LinearMethod,
+        NPUW8A8Int8DynamicLinearMethod,
+    )
+
+    kernel = linear_kernel(m.q_b_proj)
+    if not isinstance(
+        kernel, (NPUOnlineW8A8Int8LinearMethod, NPUW8A8Int8DynamicLinearMethod)
+    ):
+        return False
+    layer = m.q_b_proj
+    weight = group.all_gather(layer.weight.contiguous(), dim=1)
+    scale = group.all_gather(layer.weight_scale.flatten().contiguous(), dim=0)
+    m.npu_cp_q_b_proj = SimpleNamespace(
+        weight=weight, weight_scale=scale, quant_method=kernel
+    )
+    # Keep head geometry available without a second BF16 replica.
+    m.q_b_proj_qrep_weight = weight.t()
+    return True
+
+
+def full_width_q_projection(m, x):
+    projection = getattr(m, "npu_cp_q_b_proj", None)
+    if projection is not None:
+        return projection.quant_method.apply(projection, x)
+    return F.linear(x, m.q_b_proj_qrep_weight)
+
+
+def replicated_q_storage_bytes(m):
+    tensors = [m.q_b_proj_qrep_weight, m.w_kc_qrep]
+    projection = getattr(m, "npu_cp_q_b_proj", None)
+    if projection is not None:
+        tensors.append(projection.weight_scale)
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
 def prepare_attention(m, positions, hidden, batch, allocator, previous_topk, plan):
     from sglang.srt.hardware_backend.npu.modules import (
         deepseek_v2_attention_mla_npu as mla,
@@ -196,7 +254,7 @@ def prepare_attention(m, positions, hidden, batch, allocator, previous_topk, pla
     qkv = m.fused_qkv_a_proj_with_mqa(hidden)[0]
     q, latent = qkv.split([m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1)
     q_lora = m.q_a_layernorm(q)
-    q = F.linear(q_lora, m.q_b_proj_qrep_weight).view(plan.rows, -1, m.qk_head_dim)
+    q = full_width_q_projection(m, q_lora).view(plan.rows, -1, m.qk_head_dim)
     q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
     key_nope, key_pe = latent.unsqueeze(1).split(
         [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1

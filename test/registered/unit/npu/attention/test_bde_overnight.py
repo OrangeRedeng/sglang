@@ -100,7 +100,7 @@ class TestBdeOvernight(CustomTestCase):
                     print("a" * 40)
                 elif "cat" in arguments:
                     for name in ("dcp-kv-gather", "dcp-packed-read", "bde-v2"):
-                        print("```json\\n" + json.dumps({"id":"serve-"+name, "status":"pass", "quality":"verified", "missing":[]}) + "\\n```")
+                        print("```json\\n" + json.dumps({"id":"serve-"+name, "status":"pass", "quality":"verified", "activation":"verified", "missing":[]}) + "\\n```")
             """)
             )
             docker.chmod(0o755)

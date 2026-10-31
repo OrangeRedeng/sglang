@@ -1,8 +1,71 @@
 """Feature activation, numerical comparisons and bounded report excerpts."""
 
+import hashlib
 import json
 import math
 import re
+from pathlib import Path
+
+
+def checkpoint_identity(model_path):
+    root = Path(model_path)
+    hashes = {}
+    for name in (
+        "config.json",
+        "quant_model_description.json",
+        "model.safetensors.index.json",
+    ):
+        path = root / name
+        if path.is_file():
+            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    config = root / "config.json"
+    return dict(
+        path=str(root.resolve()),
+        metadata_sha256=hashes,
+        config=json.loads(config.read_text()) if config.is_file() else None,
+    )
+
+
+def expert_quantization(model_path):
+    path = Path(model_path) / "quant_model_description.json"
+    if not path.is_file():
+        return set()
+    description = json.loads(path.read_text())
+    return {
+        value
+        for name, value in description.items()
+        if ".experts." in name
+        and name.endswith(".weight")
+        and name.rsplit(".", 2)[-2] in {"gate_proj", "up_proj", "down_proj"}
+        and isinstance(value, str)
+    }
+
+
+def serving_failure(error, directory, phase):
+    directory = Path(directory)
+    log = directory / "server.log"
+    text = log.read_text(errors="replace") if log.exists() else ""
+    capacity = bool(re.search(r"(?:OutOfMemoryError|out of memory)", text, re.I))
+    return dict(
+        status="capacity_blocked"
+        if capacity
+        else "blocked"
+        if phase == "reference"
+        else "fail",
+        failure_phase=phase,
+        failure_kind="capacity" if capacity else "runtime",
+        error=str(error),
+        artifacts=str(directory.resolve()),
+    )
+
+
+def benchmark_qualified(result, *, baseline=False):
+    return (
+        result.get("status") == "pass"
+        and result.get("quality") == "verified"
+        and not result.get("missing")
+        and (baseline or result.get("activation") == "verified")
+    )
 
 
 def evidence(log):
@@ -206,9 +269,17 @@ def self_check_workloads():
             scenario={"dcp": True},
             command=[],
             checkpoint_path=str(directory),
+            checkpoint_format="bf16",
         )
-        runner._REFERENCE_RESPONSES[json.dumps({"dcp": True}, sort_keys=True)] = (
-            reference
+        launch_args = SimpleNamespace(
+            model_path=directory,
+            checkpoint_format="bf16",
+            tp=16,
+            dcp=16,
+            context_length=8192,
+            chunk=4096,
+            mem_fraction=0.85,
+            port=31000,
         )
 
         def serve(args, case, path, env):
@@ -216,7 +287,7 @@ def self_check_workloads():
             return dict(status="smoke_pass", benchmarks=[{"status": "pass"}])
 
         with patch.object(runner, "serve", side_effect=serve):
-            result = runner.validate_serving(SimpleNamespace(), case, directory, {}, {})
+            result = runner.validate_serving(launch_args, case, directory, {}, {})
         assert result["status"] == "pass" and result["benchmarks"]
         from feature_benchmarks import CapacityBlocked
 
@@ -226,7 +297,7 @@ def self_check_workloads():
             return serve(args, case, path, env)
 
         with patch.object(runner, "serve", side_effect=no_capacity):
-            result = runner.validate_serving(SimpleNamespace(), case, directory, {}, {})
+            result = runner.validate_serving(launch_args, case, directory, {}, {})
         assert result["status"] == "capacity_blocked"
     print(
         "PASS: long cache regimes, flush/prime lifecycle, exact token lengths, benchmark commands and parity failure"

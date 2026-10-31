@@ -520,6 +520,8 @@ def boundary_self_check():
 
 
 def case_checkpoint(args, scenario):
+    if scenario.get("fuseep") in (1, 2):
+        return getattr(args, "w8a8_model_path", None), "modelslim"
     if scenario.get("quant") and args.checkpoint_format == "modelslim":
         return args.bf16_model_path, "bf16"
     return args.model_path, args.checkpoint_format
@@ -562,6 +564,8 @@ def server_command(args, scenario):
     ]
     if checkpoint_format == "modelslim":
         command += ["--quantization", "modelslim"]
+    if getattr(args, "kv_rows", None) is not None:
+        command += ["--max-total-tokens", str(args.kv_rows)]
     if scenario.get("graph"):
         command += [
             "--cuda-graph-backend-decode",
@@ -597,7 +601,12 @@ def server_command(args, scenario):
 
 
 def serve(args, case, directory, env):
+    from feature_checks import checkpoint_identity
+
     scenario = case["scenario"]
+    (directory / "checkpoint_metadata.json").write_text(
+        json.dumps(checkpoint_identity(case["checkpoint_path"]), indent=2)
+    )
     base = f"http://127.0.0.1:{args.port}"
     # Never send test traffic to, or stop, a pre-existing server.
     with socket.socket() as connection:
@@ -756,6 +765,12 @@ def serve(args, case, directory, env):
                 if scenario.get("graph") and not missing
                 else "not_requested",
             )
+            if missing:
+                outcome["failure_phase"] = "activation"
+                outcome["ineligibility"] = [
+                    event for event in events
+                    if event["feature"].endswith("-ineligible")
+                ]
             if case["stage"] == "small":
                 from feature_benchmarks import small_commands
 
@@ -799,9 +814,22 @@ _REFERENCE_FAILURES = {}
 
 
 def validate_serving(args, case, directory, case_env, base_env):
-    from feature_checks import compare_responses
+    from feature_checks import (
+        benchmark_qualified,
+        compare_responses,
+        expert_quantization,
+        serving_failure,
+    )
 
     scenario = case["scenario"]
+    if scenario.get("fuseep") in (1, 2):
+        schemes = expert_quantization(case["checkpoint_path"])
+        if not schemes or not schemes <= {"W8A8", "W8A8_DYNAMIC"}:
+            return dict(
+                status="dependency_blocked",
+                failure_phase="preflight",
+                reason=f"FuseEP modes 1/2 require W8A8 INT experts, found {sorted(schemes)}; provide --w8a8-model-path",
+            )
     if scenario.get("equal_tp_dcp") and args.tp != args.dcp:
         return dict(
             status="blocked",
@@ -822,6 +850,7 @@ def validate_serving(args, case, directory, case_env, base_env):
         if code:
             return dict(
                 status="dependency_blocked",
+                failure_phase="preflight",
                 reason="required operator/API unavailable; see capability.log",
             )
     reference = {
@@ -833,25 +862,47 @@ def validate_serving(args, case, directory, case_env, base_env):
     if case["id"].endswith("dcp-stream-o-proj"):
         reference["env"] = dict(scenario["env"], SGLANG_NPU_STREAM_O_PROJ="False")
         reference_env = dict(base_env, **reference["env"])
-    reference_key = json.dumps(reference, sort_keys=True)
+    reference_key = json.dumps(
+        [
+            reference,
+            case["checkpoint_path"],
+            case["checkpoint_format"],
+            args.tp,
+            args.dcp,
+            args.context_length,
+            args.chunk,
+            args.mem_fraction,
+            getattr(args, "kv_rows", None),
+        ],
+        sort_keys=True,
+    )
     if reference_key in _REFERENCE_FAILURES:
-        return dict(status="blocked", reason=_REFERENCE_FAILURES[reference_key])
+        return dict(_REFERENCE_FAILURES[reference_key])
     if reference_key not in _REFERENCE_RESPONSES:
         reference_case = dict(
             case,
             stage="serve",
             scenario=reference,
-            command=server_command(args, reference),
+            command=server_command(
+                SimpleNamespace(
+                    **dict(
+                        vars(args),
+                        model_path=case["checkpoint_path"],
+                        checkpoint_format=case["checkpoint_format"],
+                    )
+                ),
+                reference,
+            ),
         )
         reference_directory = directory / "reference"
         reference_directory.mkdir()
         try:
             serve(args, reference_case, reference_directory, reference_env)
         except Exception as exc:
-            _REFERENCE_FAILURES[reference_key] = (
-                f"reference {reference_key} failed: {exc} (first occurrence: {case['id']})"
-            )
-            raise
+            (reference_directory / "exception.log").write_text(traceback.format_exc())
+            failure = serving_failure(exc, reference_directory, "reference")
+            _REFERENCE_FAILURES[reference_key] = failure
+            return dict(failure)
         _REFERENCE_RESPONSES[reference_key] = json.loads(
             (reference_directory / "responses.json").read_text()
         )
@@ -860,16 +911,25 @@ def validate_serving(args, case, directory, case_env, base_env):
             artifact.rename(directory / ("reference-" + artifact.name))
         reference_directory.rmdir()
     diagnostic_case = dict(case, stage="serve")
-    result = serve(args, diagnostic_case, directory, case_env)
+    try:
+        result = serve(args, diagnostic_case, directory, case_env)
+    except Exception as exc:
+        (directory / "exception.log").write_text(traceback.format_exc())
+        return serving_failure(exc, directory, "candidate")
     responses = json.loads((directory / "responses.json").read_text())
-    result["parity"] = compare_responses(_REFERENCE_RESPONSES[reference_key], responses)
+    try:
+        result["parity"] = compare_responses(
+            _REFERENCE_RESPONSES[reference_key], responses
+        )
+    except AssertionError as exc:
+        return dict(result, status="fail", failure_phase="parity", error=str(exc))
     result["quality"] = "verified"
     if result["status"] != "inactive" and (
         scenario.get("expected") or not scenario or case["id"].endswith("-baseline")
     ):
         result["status"] = "pass"
     if case["stage"] in ("small", "long"):
-        if result["status"] != "pass":
+        if not benchmark_qualified(result, baseline=case["id"].endswith("-baseline")):
             return dict(result, benchmark="blocked: activation and parity required")
         measured = directory / "measured"
         measured.mkdir()
@@ -1285,6 +1345,15 @@ def main():
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument(
+        "--w8a8-model-path",
+        type=Path,
+        help="Explicit ModelSlim W8A8 checkpoint for FuseEP modes 1/2.",
+    )
+    parser.add_argument(
+        "--kv-rows", type=int,
+        help="Explicit local KV token cap, identical for reference and candidate.",
+    )
     parser.add_argument("--dcp", type=int, default=16)
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--context-length", type=int, default=8192)
@@ -1342,6 +1411,8 @@ def main():
         "--probe-feature", choices=tuple(SCENARIOS), help=argparse.SUPPRESS
     )
     args = parser.parse_args()
+    if args.kv_rows is not None and args.kv_rows <= 0:
+        parser.error("--kv-rows must be positive")
     if args.self_check_workloads:
         from feature_checks import self_check_workloads
 
@@ -1446,7 +1517,10 @@ def main():
     if args.output.exists():
         parser.error("--output already exists; choose a fresh .md file")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="glm53-feature-tests-") as workspace:
+    # Keep full traces and responses: bounded Markdown excerpts cannot diagnose ABI/compile failures.
+    with nullcontext(
+        tempfile.mkdtemp(prefix="glm53-feature-tests-", dir=args.output.parent)
+    ) as workspace:
         env = dict(
             os.environ,
             PYTHONPATH=str(ROOT / "python")
@@ -1487,6 +1561,8 @@ def main():
         for package in (
             "torch",
             "torch-npu",
+            "deep-ep",
+            "cann-ops-transformer",
             "sgl-kernel-npu",
             "sglang",
             "pytest",
@@ -1508,6 +1584,7 @@ def main():
                 )
             ),
             "source_paths": {"root": str(ROOT), "python": str(ROOT / "python")},
+            "artifacts": workspace,
             "tracked_diff_sha256": __import__("hashlib")
             .sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT))
             .hexdigest(),
@@ -1534,7 +1611,7 @@ def main():
             ],
         }
         args.output.write_text(
-            "# GLM-5.3 A3 feature validation\n\n"
+            "# GLM A3 feature validation\n\n"
             + markdown_block(
                 json.dumps(
                     {k: v for k, v in report.items() if k != "results"}, indent=2
@@ -1569,7 +1646,8 @@ def main():
                 ):
                     result.update(
                         status="blocked",
-                        reason=f"checkpoint directory does not exist: {case.get('checkpoint_path')}; set --model-path (or --bf16-model-path for online conversion) to the real local checkpoint",
+                        failure_phase="preflight",
+                        reason=f"checkpoint directory does not exist: {case.get('checkpoint_path')}; set --model-path, --bf16-model-path for online conversion, or --w8a8-model-path for FuseEP modes 1/2",
                     )
                 elif case.get("scenario", {}).get("dcp") and args.dcp == 1:
                     result.update(
@@ -1641,6 +1719,7 @@ def main():
                 "inactive",
                 "dependency_blocked",
                 "capacity_blocked",
+                "smoke_pass",
             }
             else 0
         )

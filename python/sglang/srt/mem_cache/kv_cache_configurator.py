@@ -2885,6 +2885,19 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
+        if self.device == "npu" and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get():
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                runtime_gather_reserve_bytes,
+            )
+
+            # Streamed projection double buffers and gathered rows share runtime slack.
+            tokens = max(
+                get_schedule().chunked_prefill_size or 0,
+                get_schedule().max_prefill_tokens or 0,
+            )
+            slack_gb = max(
+                slack_gb, runtime_gather_reserve_bytes(self.model, tokens) / (1 << 30)
+            )
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.

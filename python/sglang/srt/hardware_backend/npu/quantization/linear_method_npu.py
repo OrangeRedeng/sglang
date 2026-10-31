@@ -141,6 +141,13 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer._npu_online_dense_loader.finish_post_load()
 
+    def logical_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        # MLA post-load splitting needs [out, in], before the kernel transpose.
+        if self.spec.weight_dtype != torch.int8:
+            raise ValueError("Logical dense weights require online INT8")
+        weight = layer.weight.t().float() * layer.weight_scale.float().reshape(-1, 1)
+        return weight.to(layer._npu_online_dense_loader.params_dtype)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -279,6 +286,9 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    def logical_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        return layer.weight.t().float() * layer.weight_scale.float().reshape(-1, 1)
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)

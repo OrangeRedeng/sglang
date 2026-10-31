@@ -1013,6 +1013,7 @@ class ModelRunner:
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        self.prepare_npu_dsa_weights()
         self.init_kv_cache_configurator(draft_parallel_layout)
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
@@ -1164,6 +1165,10 @@ class ModelRunner:
             [self.attn_backend, self.decode_attn_backend]
         )
 
+    def prepare_npu_dsa_weights(self):
+        # Replicas must count as model memory before KV capacity is measured.
+        if getattr(self, "_npu_dsa_weights_prepared", False):
+            return
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
@@ -1172,6 +1177,7 @@ class ModelRunner:
 
         if envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get():
             self._prepare_dsa_cp_token_sharded()
+        self._npu_dsa_weights_prepared = True
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
@@ -1270,10 +1276,20 @@ class ModelRunner:
 
         n_prepared = 0
         total_bytes = 0
+        from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+            prepare_quantized_q_projection,
+            replicated_q_storage_bytes,
+        )
+
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA):
                 continue
             if m.w_kc is None or not m.has_q_b_proj:
+                continue
+            if prepare_quantized_q_projection(m, tp_group):
+                m.w_kc_qrep = tp_group.all_gather(m.w_kc.contiguous(), dim=0)
+                total_bytes += replicated_q_storage_bytes(m)
+                n_prepared += 1
                 continue
             try:
                 w_r = m.q_b_proj(
@@ -1300,7 +1316,7 @@ class ModelRunner:
                     f"world_size {tp_group.world_size}",
                     exc,
                 )
-            total_bytes += m.q_b_proj_qrep_weight.numel() + m.w_kc_qrep.numel()
+            total_bytes += replicated_q_storage_bytes(m)
             n_prepared += 1
         if envs.SGLANG_NPU_DEBUG_DCP.get():
             logger.info(
@@ -1317,6 +1333,9 @@ class ModelRunner:
         # refusal rather than a fallback because a half-enabled rebuild (for
         # example the MoE input gathered under expert parallelism) would not
         # fail loudly -- it would produce plausible garbage.
+        from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+            prepare_quantized_q_projection,
+        )
         from sglang.srt.layers.attention.dsa.dsa_cp import (
             register_o_proj_stream_shard,
         )
@@ -1428,7 +1447,9 @@ class ModelRunner:
             # not exist until built here; q_b_proj_qrep_weight / w_kc_qrep may
             # also be absent when version-B prepare never ran. getattr guards
             # all four so the attribute checks do not raise AttributeError.
-            if getattr(m, "q_b_proj_qrep_weight", None) is None:
+            if getattr(m, "q_b_proj_qrep_weight", None) is None and not prepare_quantized_q_projection(
+                m, tp_group
+            ):
                 w_r = m.q_b_proj(
                     torch.eye(m.q_lora_rank, device=self.device, dtype=self.dtype)
                 )[0]

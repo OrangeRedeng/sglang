@@ -1835,6 +1835,23 @@ class FusedMoE(torch.nn.Module):
                 )
                 and supports_npu_op("npu_moe_init_routing_v2", ("row_idx_type",))
             )
+            if (
+                envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
+                and not self.dispatcher.fuse_gmm2_finalize
+            ):
+                from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+                record(
+                    "tp-finalize-ineligible",
+                    weight_dtype=str(self.w2_weight.dtype),
+                    has_offset=getattr(self, "w2_weight_offset", None) is not None,
+                    has_scale_bias=getattr(self, "w2_scale_bias", None) is not None,
+                    has_weight_bias=getattr(self, "w2_weight_bias", None) is not None,
+                    activation=self.moe_runner_config.activation,
+                    swiglu_limit=self.moe_runner_config.swiglu_limit,
+                    gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                    gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
+                )
         if pre_quant_input is not None and isinstance(
             self.dispatcher, AscendTPDispatcher
         ):

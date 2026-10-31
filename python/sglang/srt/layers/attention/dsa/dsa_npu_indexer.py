@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+    has_forward_context,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
@@ -162,6 +163,32 @@ class _IndexerQueryShard:
         return topk_indices
 
 
+def prepare_graph_indexer_query_shard(forward_batch, cache):
+    parallel = get_parallel()
+    total = forward_batch.input_ids.numel()
+    rows = (total + parallel.attn_tp_size - 1) // parallel.attn_tp_size
+    start = parallel.attn_tp_rank * rows
+    key = (total, forward_batch.batch_size)
+    if key not in cache:
+        device = forward_batch.seq_lens.device
+        cache[key] = _IndexerQueryShard(
+            start,
+            rows,
+            max(0, min(rows, total - start)),
+            total,
+            parallel.attn_tp_size,
+            torch.empty(forward_batch.batch_size, dtype=torch.int32, device=device),
+            torch.empty(forward_batch.batch_size, dtype=torch.int32, device=device),
+        )
+    shard = cache[key]
+    # Refresh captured addresses before replay; request boundaries can change at fixed token count.
+    shard.actual_seq_lengths_q.copy_(
+        (forward_batch.extend_seq_lens.cumsum(0) - start).clamp(min=0, max=rows)
+    )
+    shard.actual_seq_lengths_kv.copy_(forward_batch.seq_lens)
+    return shard
+
+
 def _build_indexer_query_shard(
     forward_batch: ForwardBatch,
 ) -> Optional[_IndexerQueryShard]:
@@ -237,6 +264,11 @@ def _get_indexer_query_shard(
                 "is scattered across the TP group"
             )
         return None
+    backend = get_attn_backend() if has_forward_context() else None
+    if getattr(backend, "graph_mode", False) and hasattr(
+        backend, "npu_graph_indexer_shard"
+    ):
+        return backend.npu_graph_indexer_shard
     if not hasattr(forward_batch, "npu_indexer_query_shard"):
         forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(
             forward_batch

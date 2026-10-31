@@ -8,7 +8,11 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
+import ast
+import importlib.metadata
 import inspect
+import json
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -108,19 +112,90 @@ def _mega_moe_capacity() -> int:
     return capacity
 
 
+def _check_mega_moe_keywords(operator, strategy_source):
+    operator_signature = inspect.signature(operator)
+    source = ast.parse(strategy_source)
+    calls = [
+        node
+        for node in ast.walk(source)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "mega_moe")
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "mega_moe"
+            )
+        )
+    ]
+    if not calls or any(kw.arg is None for call in calls for kw in call.keywords):
+        raise RuntimeError("Cannot verify DeepEP MegaMoE operator keyword contract")
+    keywords = {kw.arg for call in calls for kw in call.keywords}
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in operator_signature.parameters.values()
+    )
+    accepted = {
+        name
+        for name, p in operator_signature.parameters.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    if not accepts_kwargs and keywords - accepted:
+        raise RuntimeError(f"DeepEP passes unsupported mega_moe keywords: {sorted(keywords - accepted)}")
+    return sorted(keywords)
+
+
 @lru_cache(maxsize=1)
 def _check_mega_moe_support() -> None:
     try:
+        import cann_ops_transformer
+        import deep_ep
         from cann_ops_transformer.ops import get_symm_buffer_for_mega_moe, mega_moe
         from deep_ep import Buffer
         from deep_ep.buffer import FuseMode
+        from deep_ep.strategies import fused_strategy
 
         arguments = inspect.signature(Buffer.fused_deep_moe).parameters
+        for name, module, package in (
+            ("deep_ep", deep_ep, "deep-ep"),
+            ("cann_ops_transformer", cann_ops_transformer, "cann-ops-transformer"),
+        ):
+            try:
+                version = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                version = getattr(module, "__version__", None)
+            logging.getLogger(__name__).warning(
+                "MegaMoE package %s: path=%s version=%s", name, module.__file__, version
+            )
+        logging.getLogger(__name__).warning(
+            "MegaMoE signatures: fused_deep_moe%s mega_moe%s",
+            inspect.signature(Buffer.fused_deep_moe),
+            inspect.signature(mega_moe),
+        )
         required = {"fuse_mode", "activation", "l1_bias", "l2_bias"}
         if int(FuseMode.MEGA_MOE) != 3 or not required.issubset(arguments):
             raise RuntimeError("DeepEP does not expose the current MegaMoE API")
         if not callable(mega_moe) or not callable(get_symm_buffer_for_mega_moe):
             raise RuntimeError("ops-transformer does not expose MegaMoE")
+        operator_signature = inspect.signature(mega_moe)
+        keywords = _check_mega_moe_keywords(mega_moe, inspect.getsource(fused_strategy))
+        diagnostic = {
+            "deep_ep": {
+                "path": deep_ep.__file__,
+                "version": getattr(deep_ep, "__version__", None),
+            },
+            "cann_ops_transformer": {
+                "path": cann_ops_transformer.__file__,
+                "version": getattr(cann_ops_transformer, "__version__", None),
+            },
+            "fused_deep_moe_signature": str(inspect.signature(Buffer.fused_deep_moe)),
+            "mega_moe_signature": str(operator_signature),
+            "strategy_path": fused_strategy.__file__,
+            "strategy_keywords": sorted(keywords),
+        }
+        logging.getLogger(__name__).warning(
+            "MegaMoE dependencies: %s", json.dumps(diagnostic)
+        )
     except (
         ImportError,
         AttributeError,
@@ -128,11 +203,12 @@ def _check_mega_moe_support() -> None:
         TypeError,
         ValueError,
         OSError,
+        SyntaxError,
     ) as exc:
         raise RuntimeError(
-            "FuseEP mode 3 requires matching CANN 9.2, ops-transformer and "
+            "FuseEP mode 3 requires matching CANN, ops-transformer and "
             "DeepEP packages exposing FuseMode.MEGA_MOE, activation and bias "
-            "arguments; install the matching operator package and ninja."
+            f"arguments; dependency check failed: {exc}"
         ) from exc
     soc = torch.npu.get_device_name()
     if not soc.startswith("Ascend910_93"):

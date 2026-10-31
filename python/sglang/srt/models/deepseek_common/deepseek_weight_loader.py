@@ -771,6 +771,13 @@ class DeepseekV2WeightLoaderMixin:
             ):
                 w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
+            head_width = self_attn.qk_nope_head_dim + self_attn.v_head_dim
+            if w.ndim != 2 or w.shape[0] % head_width:
+                raise ValueError(
+                    f"kv_b_proj requires logical [out, in] weights with out divisible "
+                    f"by {head_width}, got {tuple(w.shape)} from "
+                    f"{type(self_attn.kv_b_proj.quant_method).__name__}"
+                )
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)

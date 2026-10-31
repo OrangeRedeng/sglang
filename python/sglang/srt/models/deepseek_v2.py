@@ -972,7 +972,10 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = (
-                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                getattr(
+                    self.shared_experts.gate_up_proj.quant_method, "quant_config", None
+                )
+                is not None
                 and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
                 in {
                     "awq",
@@ -2841,7 +2844,13 @@ class DeepseekV2AttentionMLA(
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
     def q_b_proj_replicated_forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.q_b_proj_qrep is not None:
+        if getattr(self, "npu_cp_q_b_proj", None) is not None:
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                full_width_q_projection,
+            )
+
+            q = full_width_q_projection(self, x)
+        elif self.q_b_proj_qrep is not None:
             q = self.q_b_proj_qrep.quant_method.apply(self.q_b_proj_qrep, x)
         else:
             q = torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)

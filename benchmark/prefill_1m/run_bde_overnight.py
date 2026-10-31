@@ -182,6 +182,11 @@ def ais_metrics(text, requests):
 
 def variant_launch(harness, repo, config):
     scenario = harness.SCENARIOS[config["variant"]]
+    checkpoint = config["checkpoint"]
+    if scenario.get("fuseep") in (1, 2):
+        checkpoint = config.get("w8a8_checkpoint")
+        if not checkpoint:
+            raise ValueError("FuseEP modes 1/2 require --w8a8-checkpoint")
     launcher = load_module(
         repo / "benchmark/prefill_1m/launch_bde_v2.py", "night_launch"
     )
@@ -201,7 +206,7 @@ def variant_launch(harness, repo, config):
     args = argparse.Namespace(
         tp=16,
         dcp=16 if scenario.get("dcp") else 1,
-        model_path=config["checkpoint"],
+        model_path=checkpoint,
         real_weights=True,
         context_length=config["context"],
     )
@@ -475,6 +480,14 @@ def main():
     parser.add_argument("--repo", default="/home/swx1199799/megamoe_test/sglang")
     parser.add_argument("--checkpoint", default="/home/weights/GLM5.2-w4a8-int")
     parser.add_argument(
+        "--w8a8-checkpoint",
+        help="Explicit ModelSlim W8A8 checkpoint for FuseEP modes 1/2.",
+    )
+    parser.add_argument(
+        "--feature-kv-rows", type=int,
+        help="Local KV cap shared by each qualification reference/candidate pair.",
+    )
+    parser.add_argument(
         "--ais-dir", default="/home/tbaydasov/aisbench/aisbench_auto_tools_prefix"
     )
     parser.add_argument(
@@ -509,6 +522,8 @@ def main():
     parser.add_argument("--feature-timeout", type=int, default=43200)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.feature_kv_rows is not None and args.feature_kv_rows <= 0:
+        parser.error("--feature-kv-rows must be positive")
     if args.worker:
         return worker()
     args.ais_env = resolve_ais_env(args.ais_env)
@@ -553,6 +568,7 @@ def main():
     common = {
         "repo": args.repo,
         "checkpoint": args.checkpoint,
+        "w8a8_checkpoint": args.w8a8_checkpoint,
         "chunk": args.chunk,
         "memfrac": args.memfrac,
         "maxreq": args.maxreq,
@@ -594,6 +610,10 @@ def main():
             "--output",
             f"{remote}/{stage}/report.md",
         ]
+        if args.w8a8_checkpoint:
+            feature_commands[stage] += ["--w8a8-model-path", args.w8a8_checkpoint]
+        if args.feature_kv_rows is not None:
+            feature_commands[stage] += ["--kv-rows", str(args.feature_kv_rows)]
     ais_args = [
         "--input_len",
         str(args.length),
@@ -730,9 +750,10 @@ def main():
             for variant in variants:
                 gate = qualification.get("serve-" + variant, {})
                 if (
-                    gate.get("status") not in ("pass", "smoke_pass")
+                    gate.get("status") != "pass"
                     or gate.get("quality") != "verified"
                     or gate.get("missing")
+                    or (variant != "baseline" and gate.get("activation") != "verified")
                 ):
                     records.append(
                         {

@@ -634,6 +634,16 @@ class AscendAttnBackend(AttentionBackend):
             # refreshes its contents in place before each NPUGraph replay.
             self.forward_metadata = self.prefill_graph_state["metadata"][bs]
             self.graph_mode = True
+            if self.use_dsa and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get():
+                from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                    prepare_graph_indexer_query_shard,
+                )
+
+                if not hasattr(self, "_indexer_graph_shards"):
+                    self._indexer_graph_shards = {}
+                self.npu_graph_indexer_shard = prepare_graph_indexer_query_shard(
+                    forward_batch, self._indexer_graph_shards
+                )
 
     def _plan_quant_indexer_metadata(self, forward_batch: ForwardBatch) -> None:
         # Pre-plan the quant_lightning_indexer (v2) task list once per
@@ -693,6 +703,13 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        if self.use_dsa and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get():
+            from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                _build_indexer_query_shard,
+            )
+
+            # Piecewise tracing must not enter host planning or device tensor factories.
+            forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(forward_batch)
         # Data-driven branch: take the CPU-mirror path whenever the mirror is
         # present, instead of statically gating on needs_cpu_seq_lens. When the
         # mirror is absent (true mirrorless), fall through to the else branch.
