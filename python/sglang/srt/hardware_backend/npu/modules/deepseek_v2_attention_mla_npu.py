@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -14,6 +13,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.split_qk_norm import fused_split_qk_norm
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (

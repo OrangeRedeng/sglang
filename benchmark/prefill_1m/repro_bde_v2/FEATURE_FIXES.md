@@ -1,5 +1,8 @@
 # GLM A3 feature-fix validation
 
+Latest collected-run analysis and staged retest instructions:
+[2026-10-31 debug report](DEBUG_20261031.md).
+
 Based on the GLM5.2 serving report at `ce785fb100`: 10 pass, 7 smoke-only,
 1 inactive, 21 fail. These changes have CPU regression coverage; A3 acceptance
 and overnight AISBench completion remain pending. A real GLM5.3 checkpoint is

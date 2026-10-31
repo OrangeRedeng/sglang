@@ -634,6 +634,16 @@ class AscendAttnBackend(AttentionBackend):
             # refreshes its contents in place before each NPUGraph replay.
             self.forward_metadata = self.prefill_graph_state["metadata"][bs]
             self.graph_mode = True
+            if self.use_dsa and envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get():
+                from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+                    prepare_graph_token_shard_lens,
+                )
+
+                if not hasattr(self, "_token_shard_graph_lens"):
+                    self._token_shard_graph_lens = {}
+                self.npu_graph_token_shard_lens = prepare_graph_token_shard_lens(
+                    forward_batch, self._token_shard_graph_lens
+                )
             if self.use_dsa and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get():
                 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                     prepare_graph_indexer_query_shard,

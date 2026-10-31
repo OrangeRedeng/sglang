@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _zero_topk_weights_padded_region,
     capture_routed_experts_if_allowed,
+    fused_shared_expert_weight,
     select_experts,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -38,13 +39,8 @@ def fused_topk_npu(
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
     if topk_config.num_shared_topk_slots:
-        if (
-            topk_config.num_shared_topk_slots != 1
-            or not topk_config.apply_routed_scaling_factor_on_output
-        ):
-            raise ValueError(
-                "NPU fused shared routing requires one expert and scaled TopK"
-            )
+        if topk_config.num_shared_topk_slots != 1:
+            raise ValueError("NPU fused shared routing requires one expert")
         routed = fused_topk_npu(
             hidden_states,
             router_logits,
@@ -59,13 +55,21 @@ def fused_topk_npu(
             expert_location_dispatch_info,
             layer_id,
         )
-        shared_weight = topk_config.fused_shared_experts_scaling_factor
+        # Cancel post-MoE routed scaling for the shared column as well.
+        shared_weight = fused_shared_expert_weight(
+            routed_scaling_factor=topk_config.routed_scaling_factor,
+            fused_in_topk=topk_config.apply_routed_scaling_factor_on_output,
+        ) * (
+            1.0
+            if topk_config.fused_shared_experts_scaling_factor is None
+            else topk_config.fused_shared_experts_scaling_factor
+        )
         weights = torch.cat(
             (
                 routed.topk_weights,
                 torch.full_like(
                     routed.topk_weights[:, :1],
-                    1.0 if shared_weight is None else shared_weight,
+                    shared_weight,
                 ),
             ),
             dim=-1,

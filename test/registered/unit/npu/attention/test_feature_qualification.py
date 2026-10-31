@@ -1,5 +1,6 @@
 """Regressions for GLM qualification attribution and graph metadata reuse."""
 
+import contextlib
 import importlib.util
 import json
 import sys
@@ -28,6 +29,153 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_shared_slot_cancels_post_moe_scale(self):
+        from sglang.srt.configs.shared_experts import SharedExpertsConfig
+        from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig
+
+        stub = types.ModuleType("sgl_kernel_npu.norm.l1_norm")
+        stub.l1_norm = lambda x: x / x.sum(-1, keepdim=True)
+        with patch.dict(sys.modules, {"sgl_kernel_npu.norm.l1_norm": stub}):
+            from sglang.srt.hardware_backend.npu.moe import topk
+
+        def kernel(logits, k):
+            weights, ids = logits.softmax(-1).topk(k)
+            return weights, ids, None
+
+        def finalize(**kwargs):
+            return StandardTopKOutput(
+                kwargs["topk_weights"], kwargs["topk_ids"], kwargs["router_logits"]
+            )
+
+        x, logits = torch.ones(2, 4), torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+        expert_outputs = torch.tensor([2.0, 4.0, 8.0, 16.0])
+        with (
+            patch.object(
+                torch.ops.npu, "npu_moe_gating_top_k_softmax", kernel, create=True
+            ),
+            patch.object(topk, "_finalize_topk_npu", side_effect=finalize),
+            patch.object(topk, "l1_norm", side_effect=stub.l1_norm),
+        ):
+            for fused in (False, True):
+                for multiplier in (None, 0.5):
+                    with self.subTest(fused=fused, multiplier=multiplier):
+                        config = TopKConfig(
+                            top_k=3,
+                            shared_experts=SharedExpertsConfig(
+                                num_fused_shared_experts=1
+                            ),
+                            routed_scaling_factor=2.5,
+                            apply_routed_scaling_factor_on_output=fused,
+                            fused_shared_experts_scaling_factor=multiplier,
+                        )
+                        out = topk.fused_topk_npu(x, logits, config)
+                        actual = (
+                            expert_outputs[out.topk_ids.long()] * out.topk_weights
+                        ).sum(-1)
+                        if not fused:
+                            actual *= 2.5
+                        weights, ids = logits.softmax(-1).topk(2)
+                        weights /= weights.sum(-1, keepdim=True)
+                        expected = (weights * expert_outputs[ids]).sum(-1) * 2.5
+                        expected += 16.0 * (1.0 if multiplier is None else multiplier)
+                        torch.testing.assert_close(actual, expected)
+
+    def test_split_qk_norm_launcher_stays_outside_fullgraph_compile(self):
+        from sglang.srt.hardware_backend.npu.attention.split_qk_norm import (
+            _split_qk_norm,
+            fused_split_qk_norm,
+        )
+
+        stub = types.ModuleType("sgl_kernel_npu.norm.fused_split_qk_norm")
+        calls = []
+
+        def external(x, q_norm, k_norm, q_rank, kv_rank, rope_dim, eps):
+            self.assertFalse(torch.compiler.is_compiling())
+            calls.append((q_norm.bias, k_norm.bias, eps))
+            q, k, pe = x.split([q_rank, kv_rank, rope_dim], -1)
+
+            def norm(v, module):
+                v = v * torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
+                return v * module.weight + module.bias
+
+            return (
+                norm(q, q_norm).clone(),
+                norm(k, k_norm).unsqueeze(1).clone(),
+                pe.unsqueeze(1).clone(),
+            )
+
+        stub.fused_split_qk_norm = external
+        q_norm = SimpleNamespace(weight=torch.ones(4), bias=torch.ones(4))
+        k_norm = SimpleNamespace(weight=torch.ones(3), bias=torch.ones(3) * 2)
+
+        def run(x):
+            return fused_split_qk_norm(x, q_norm, k_norm, 4, 3, 2, eps=1e-5)
+
+        with (
+            patch.dict(sys.modules, {"sgl_kernel_npu.norm.fused_split_qk_norm": stub}),
+            contextlib.ExitStack() as stack,
+        ):
+            library = torch.library.Library("sglang", "IMPL", "CPU")
+            stack.callback(library._destroy)
+            library.impl("npu_split_qk_norm", _split_qk_norm.__wrapped__)
+            compiled = torch.compile(run, backend="eager", fullgraph=True)
+            for rows in (1, 2, 7):
+                x = torch.randn(rows, 9)
+                for actual, expected in zip(compiled(x), run(x)):
+                    torch.testing.assert_close(actual, expected)
+        self.assertTrue(calls)
+        self.assertTrue(all(eps == 1e-5 for _, _, eps in calls))
+
+    def test_token_shard_graph_lengths_keep_addresses_across_replay(self):
+        from sglang.srt.layers.attention.dsa import dsa_token_shard as shard
+        from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+            plan_dsa_token_shard,
+        )
+
+        cache = {}
+        batch = SimpleNamespace(
+            input_ids=torch.zeros(8), batch_size=3, seq_lens=torch.zeros(3)
+        )
+        pointers = None
+        for q, k in (([2, 6, 0], [12, 26, 0]), ([6, 0, 2], [16, 0, 32])):
+            plan = plan_dsa_token_shard(q, k, 2, 1)
+            with patch.object(shard, "_build_dsa_token_shard_plan", return_value=plan):
+                shard.prepare_graph_token_shard_lens(batch, cache)
+            buffers = cache[(8, 3)]
+            for name in (
+                "npu_dsa_token_shard_cu_query_lens",
+                "npu_dsa_token_shard_cu_key_lens",
+                "npu_dsa_token_shard_key_lens",
+            ):
+                delattr(batch, name)
+            with (
+                patch.object(shard, "has_forward_context", return_value=True),
+                patch.object(
+                    shard,
+                    "get_attn_backend",
+                    return_value=SimpleNamespace(
+                        graph_mode=True, npu_graph_token_shard_lens=buffers
+                    ),
+                ),
+                patch.object(
+                    shard.torch,
+                    "tensor",
+                    side_effect=AssertionError("copy during capture"),
+                ),
+            ):
+                actual = (
+                    shard.dsa_token_shard_cumulative_query_lens(batch, plan, "cpu"),
+                    shard.dsa_token_shard_cumulative_key_lens(batch, plan, "cpu"),
+                    shard.dsa_token_shard_key_lens(batch, plan, "cpu"),
+                )
+            current = tuple(v.data_ptr() for v in actual)
+            if pointers is not None:
+                self.assertEqual(pointers, current)
+            pointers = current
+            self.assertEqual(actual[0].tolist(), shard.cumulative(plan.query_lens))
+            self.assertEqual(actual[1].tolist(), shard.cumulative(plan.key_lens))
+            self.assertEqual(actual[2].tolist(), plan.key_lens)
+
     def test_megamoe_legacy_swiglu_preserves_biases_and_rejects_other_activations(self):
         import sglang.srt.layers.quantization  # noqa: F401
         from sglang.srt.hardware_backend.npu.moe.fuseep import (

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def load_module(path, name):
     return module
 
 
-def http(path, *, post=False, timeout=10):
+def http(path, *, post=False, timeout=10, expect_json=True):
     request = urllib.request.Request(
         "http://127.0.0.1:30000" + path,
         data=b"{}" if post else None,
@@ -114,6 +115,8 @@ def http(path, *, post=False, timeout=10):
         request, timeout=timeout
     ) as response:
         body = response.read()
+        if not expect_json:
+            return body.decode("utf-8", errors="replace")
         return json.loads(body) if body else None
 
 
@@ -484,7 +487,8 @@ def main():
         help="Explicit ModelSlim W8A8 checkpoint for FuseEP modes 1/2.",
     )
     parser.add_argument(
-        "--feature-kv-rows", type=int,
+        "--feature-kv-rows",
+        type=int,
         help="Local KV cap shared by each qualification reference/candidate pair.",
     )
     parser.add_argument(
@@ -797,11 +801,20 @@ def main():
                         folder=f"{remote}/{variant}",
                     ),
                 )
+                phase = "server-startup"
                 try:
                     job.receive(args.startup_timeout + 30)
                     for repeat in range(1, args.repeats + 1):
                         # Each AISBench invocation performs its own prefix prewarm after this flush.
-                        http("/flush_cache?timeout=60", post=True, timeout=90)
+                        phase = f"cache-flush/{repeat}"
+                        flushed = http(
+                            "/flush_cache?timeout=60",
+                            post=True,
+                            timeout=90,
+                            expect_json=False,
+                        )
+                        (folder / f"cache-flush-{repeat}.txt").write_text(flushed)
+                        phase = f"aisbench/{repeat}"
                         logpath = folder / f"aisbench-{repeat}.log"
                         command = [
                             "bash",
@@ -856,8 +869,15 @@ def main():
                         },
                     )
                 except Exception as exc:  # noqa: BLE001 - retain failures and continue independent cases
+                    (folder / "exception.log").write_text(traceback.format_exc())
                     records.append(
-                        {"case": variant, "status": "fail", "error": str(exc)}
+                        {
+                            "case": variant,
+                            "status": "fail",
+                            "phase": phase,
+                            "error": str(exc),
+                            "log": str(folder / "exception.log"),
+                        }
                     )
                 finally:
                     job.close()

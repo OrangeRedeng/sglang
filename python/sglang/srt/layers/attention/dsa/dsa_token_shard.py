@@ -38,6 +38,10 @@ from sglang.srt.layers.dcp.layout import dcp_crop_free_extend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    has_forward_context,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
@@ -183,12 +187,53 @@ def _build_dsa_token_shard_plan(
     return plan
 
 
+def prepare_graph_token_shard_lens(forward_batch, cache):
+    """Refresh capture-stable lengths before entering NPUGraph capture/replay."""
+    plan = _build_dsa_token_shard_plan(forward_batch)
+    if plan is None:
+        return
+    key = (forward_batch.input_ids.numel(), forward_batch.batch_size)
+    device = forward_batch.seq_lens.device
+    if key not in cache:
+        cache[key] = tuple(
+            torch.empty(len(plan.query_lens), dtype=torch.int32, device=device)
+            for _ in range(3)
+        )
+    values = (
+        cumulative(plan.query_lens),
+        cumulative(plan.key_lens),
+        list(plan.key_lens),
+    )
+    names = (
+        "npu_dsa_token_shard_cu_query_lens",
+        "npu_dsa_token_shard_cu_key_lens",
+        "npu_dsa_token_shard_key_lens",
+    )
+    for name, buffer, value in zip(names, cache[key], values):
+        buffer.copy_(torch.tensor(value, dtype=torch.int32, device=device))
+        setattr(forward_batch, name, buffer)
+    return cache[key]
+
+
+def _graph_token_shard_lens(forward_batch, index):
+    if getattr(forward_batch, "npu_dsa_cp_attention_local", False):
+        return None
+    if has_forward_context():
+        backend = get_attn_backend()
+        buffers = getattr(backend, "npu_graph_token_shard_lens", None)
+        if getattr(backend, "graph_mode", False) and buffers is not None:
+            return buffers[index]
+    return None
+
+
 def dsa_token_shard_cumulative_query_lens(
     forward_batch: "ForwardBatch", plan: DsaTokenShardPlan, device: torch.device
 ) -> torch.Tensor:
     """Cumulative query lengths as an int32 device tensor, built once per
     forward rather than per layer: each build is a blocking H2D copy."""
-    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_query_lens", None)
+    cached = _graph_token_shard_lens(forward_batch, 0)
+    if cached is None:
+        cached = getattr(forward_batch, "npu_dsa_token_shard_cu_query_lens", None)
     if cached is None:
         cached = torch.tensor(
             cumulative(plan.query_lens), dtype=torch.int32, device=device
@@ -202,7 +247,9 @@ def dsa_token_shard_cumulative_key_lens(
 ) -> torch.Tensor:
     """Cumulative key lengths, for a KV layout whose lengths are cumulative (the
     DCP-gathered TND one). Built once per forward, as the query lengths are."""
-    cached = getattr(forward_batch, "npu_dsa_token_shard_cu_key_lens", None)
+    cached = _graph_token_shard_lens(forward_batch, 1)
+    if cached is None:
+        cached = getattr(forward_batch, "npu_dsa_token_shard_cu_key_lens", None)
     if cached is None:
         cached = torch.tensor(
             cumulative(plan.key_lens), dtype=torch.int32, device=device
@@ -219,7 +266,9 @@ def dsa_token_shard_key_lens(
     Paged SFA sparse_mode=3 right-aligns each request to this length.
     A running sum would only match when the forward has one request.
     """
-    cached = getattr(forward_batch, "npu_dsa_token_shard_key_lens", None)
+    cached = _graph_token_shard_lens(forward_batch, 2)
+    if cached is None:
+        cached = getattr(forward_batch, "npu_dsa_token_shard_key_lens", None)
     if cached is None:
         cached = torch.tensor(list(plan.key_lens), dtype=torch.int32, device=device)
         forward_batch.npu_dsa_token_shard_key_lens = cached

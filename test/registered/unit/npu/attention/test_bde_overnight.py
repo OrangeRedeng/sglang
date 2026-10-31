@@ -10,7 +10,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,6 +29,26 @@ class TestBdeOvernight(CustomTestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_http_flush_accepts_text_but_server_info_requires_json(self):
+        module = self.runner()
+        opener = MagicMock()
+        response = opener.open.return_value.__enter__.return_value
+        with patch.object(module.urllib.request, "build_opener", return_value=opener):
+            response.read.return_value = b"Cache flushed.\n"
+            self.assertEqual(
+                module.http("/flush_cache", post=True, expect_json=False),
+                "Cache flushed.\n",
+            )
+            with self.assertRaises(json.JSONDecodeError):
+                module.http("/server_info")
+            response.read.return_value = b'{"max_total_num_tokens": 123}'
+            self.assertEqual(module.http("/server_info")["max_total_num_tokens"], 123)
+            opener.open.side_effect = module.urllib.error.HTTPError(
+                "http://127.0.0.1:30000/flush_cache", 400, "Busy", {}, None
+            )
+            with self.assertRaises(module.urllib.error.HTTPError):
+                module.http("/flush_cache", post=True, expect_json=False)
 
     def test_host_path_detection_and_explicit_missing_path(self):
         module = self.runner()
@@ -141,7 +161,9 @@ class TestBdeOvernight(CustomTestCase):
                 patch.object(
                     module,
                     "http",
-                    side_effect=lambda *args, **kwargs: flushes.append(args[0]),
+                    side_effect=lambda *args, **kwargs: (
+                        flushes.append(args[0]) or "Cache flushed.\n"
+                    ),
                 ),
             ):
                 code = module.main()
