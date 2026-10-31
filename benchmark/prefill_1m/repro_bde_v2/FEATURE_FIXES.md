@@ -18,7 +18,7 @@ a separate acceptance run.
 | INT8 indexer / BDE combination | Retain strict parity gate | Compare scores and top-k against the unquantized indexer before qualifying the combination |
 | TP finalize | Report dtype, bias and activation ineligibility | Compatible INT8 W2/operator ABI; W4A8 W2 is ineligible |
 | FuseEP 1/2 | Require explicit W8A8 checkpoint and inspect its expert schemes | Compatible ModelSlim W8A8 checkpoint, EP16 activation and numerical parity |
-| MegaMoE | Check DeepEP strategy keywords against the installed operator; record package paths, versions and signatures | Matching installed dependency pair; no keyword dropping or automatic dependency upgrade |
+| MegaMoE | Adapt legacy operators only for ordinary SwiGLU with `activation_params=None`; preserve all compensation biases and log `legacy_swiglu_adapter` | A3 numerical parity; non-default activation parameters still require a compatible operator |
 
 Reports retain full logs and responses in the `artifacts` directory recorded
 in the report header. `failure_phase` distinguishes preflight, reference,

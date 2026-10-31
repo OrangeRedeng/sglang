@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,124 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_megamoe_legacy_swiglu_preserves_biases_and_rejects_other_activations(self):
+        import sglang.srt.layers.quantization  # noqa: F401
+        from sglang.srt.hardware_backend.npu.moe.fuseep import (
+            _adapt_mega_moe_operator,
+            _check_mega_moe_keywords,
+        )
+
+        def legacy_operator(x, *, activation="swiglu", l1_bias=None, l2_bias=None):
+            return x + l1_bias + l2_bias
+
+        compatible = _adapt_mega_moe_operator(legacy_operator)
+        source = "def run(x, a, b):\n    return mega_moe(x=x, activation='swiglu', activation_params=None, l1_bias=a, l2_bias=b)\n"
+        self.assertIn("activation_params", _check_mega_moe_keywords(compatible, source))
+        x, first, second = torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([4.0])
+        actual = compatible(
+            x,
+            activation="swiglu",
+            activation_params=None,
+            l1_bias=first,
+            l2_bias=second,
+        )
+        torch.testing.assert_close(actual, torch.tensor([7.0]))
+        for activation, parameters in (
+            ("situglu", None),
+            ("swiglu", {"beta": 4}),
+            ("swiglu", {}),
+        ):
+            with (
+                self.subTest(activation=activation, parameters=parameters),
+                self.assertRaisesRegex(ValueError, "Legacy MegaMoE"),
+            ):
+                compatible(
+                    x,
+                    activation=activation,
+                    activation_params=parameters,
+                    l1_bias=first,
+                    l2_bias=second,
+                )
+        with self.assertRaises(TypeError):
+            compatible(x, activation="swiglu", unknown=None)
+
+    def test_megamoe_modern_api_is_unchanged(self):
+        import sglang.srt.layers.quantization  # noqa: F401
+        from sglang.srt.hardware_backend.npu.moe.fuseep import _adapt_mega_moe_operator
+
+        def modern_operator(x, *, activation, activation_params):
+            return x * activation_params["beta"]
+
+        self.assertIs(_adapt_mega_moe_operator(modern_operator), modern_operator)
+        result = _adapt_mega_moe_operator(modern_operator)(
+            torch.tensor([2.0]), activation="situglu", activation_params={"beta": 4}
+        )
+        torch.testing.assert_close(result, torch.tensor([8.0]))
+
+    def test_megamoe_forward_installs_adapter_only_on_selected_strategy(self):
+        import sglang.srt.layers.quantization  # noqa: F401
+        from sglang.srt.hardware_backend.npu.moe import fuseep
+
+        def operator(x, *, activation="swiglu", l1_bias=None, l2_bias=None):
+            return x + l1_bias + l2_bias, None
+
+        class Strategy:
+            @staticmethod
+            def _load_mega_moe_ops():
+                return None, operator
+
+        class Buffer:
+            def __init__(self):
+                self._fused_strategies = {1: Strategy(), 3: Strategy()}
+
+            def fused_deep_moe(self, **kwargs):
+                _, selected = self._fused_strategies[3]._load_mega_moe_ops()
+                return selected(
+                    kwargs["x"],
+                    activation=kwargs["activation"],
+                    activation_params=None,
+                    l1_bias=kwargs["l1_bias"],
+                    l2_bias=kwargs["l2_bias"],
+                )
+
+        buffer = Buffer()
+        module = types.ModuleType("deep_ep.buffer")
+        module.FuseMode = SimpleNamespace(MEGA_MOE=3)
+        layer = SimpleNamespace(
+            _mega_moe_weights_processed=True,
+            num_experts=2,
+            w13_weight=None,
+            w13_weight_scale=None,
+            w2_weight=None,
+            w2_weight_scale=None,
+            w13_scale_bias=torch.tensor([[2.0]], dtype=torch.bfloat16),
+            w2_scale_bias=torch.tensor([[4.0]], dtype=torch.bfloat16),
+        )
+        topk = SimpleNamespace(
+            topk_ids=torch.tensor([[0]]), topk_weights=torch.tensor([[1.0]])
+        )
+        ops = (None, fuseep._adapt_mega_moe_operator(operator))
+        with (
+            patch.dict(sys.modules, {"deep_ep.buffer": module}),
+            patch.object(fuseep, "_check_mega_moe_support", return_value=ops),
+            patch.object(fuseep, "_get_fuseep_buffer", return_value=buffer),
+            patch.object(fuseep, "_mega_moe_capacity", return_value=4),
+            patch.object(
+                fuseep,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(fuseep_mode=3)),
+            ),
+        ):
+            for _ in range(2):
+                actual = fuseep.forward_fuseep(
+                    layer, torch.tensor([[1.0]], dtype=torch.bfloat16), topk
+                )
+                torch.testing.assert_close(
+                    actual, torch.tensor([[7.0]], dtype=torch.bfloat16)
+                )
+        self.assertIs(buffer._fused_strategies[1]._load_mega_moe_ops()[1], operator)
+        self.assertIs(Strategy._load_mega_moe_ops()[1], operator)
+
     def test_megamoe_rejects_installed_operator_keyword_mismatch(self):
         import sglang.srt.layers.quantization  # noqa: F401
         from sglang.srt.hardware_backend.npu.moe.fuseep import _check_mega_moe_keywords

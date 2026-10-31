@@ -13,7 +13,7 @@ import importlib.metadata
 import inspect
 import json
 import logging
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import TYPE_CHECKING
 
 import torch
@@ -60,7 +60,8 @@ def forward_fuseep(
             )
         if not getattr(layer, "_mega_moe_weights_processed", False):
             raise RuntimeError("FuseEP mode 3 expert weights have not been prepared")
-        hidden_states, _ = _get_fuseep_buffer(layer).fused_deep_moe(
+        buffer = _prepare_mega_moe_buffer(_get_fuseep_buffer(layer))
+        hidden_states, _ = buffer.fused_deep_moe(
             x=hidden_states,
             topk_idx=topk_output.topk_ids.to(torch.int32),
             topk_weights=topk_output.topk_weights.to(torch.float32),
@@ -112,6 +113,60 @@ def _mega_moe_capacity() -> int:
     return capacity
 
 
+def _adapt_mega_moe_operator(operator):
+    signature = inspect.signature(operator)
+    parameters = signature.parameters
+    if "activation_params" in parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    ):
+        return operator
+    if "activation" not in parameters:
+        raise RuntimeError("MegaMoE operator lacks activation selection")
+
+    @wraps(operator)
+    def legacy_swiglu(*args, **kwargs):
+        activation_params = kwargs.pop("activation_params", None)
+        activation = kwargs.get("activation", inspect.Parameter.empty)
+        if activation is inspect.Parameter.empty:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            activation = bound.arguments["activation"]
+        if activation != "swiglu" or activation_params is not None:
+            raise ValueError(
+                "Legacy MegaMoE supports only swiglu with activation_params=None; "
+                "install a matching operator for non-default activation parameters"
+            )
+        return operator(*args, **kwargs)
+
+    # DeepEP sends this optional keyword even for ordinary, unclamped SwiGLU.
+    legacy_swiglu.__signature__ = signature.replace(
+        parameters=[
+            *parameters.values(),
+            inspect.Parameter(
+                "activation_params", inspect.Parameter.KEYWORD_ONLY, default=None
+            ),
+        ]
+    )
+    legacy_swiglu._sglang_legacy_swiglu = True
+    return legacy_swiglu
+
+
+def _prepare_mega_moe_buffer(buffer):
+    ops = _check_mega_moe_support()
+    if not getattr(ops[1], "_sglang_legacy_swiglu", False):
+        return buffer
+    from deep_ep.buffer import FuseMode
+
+    strategy = buffer._fused_strategies[FuseMode.MEGA_MOE]
+    if not getattr(strategy, "_sglang_legacy_swiglu", False):
+        if not callable(getattr(strategy, "_load_mega_moe_ops", None)):
+            raise RuntimeError("DeepEP MegaMoE strategy lacks the operator loader")
+        # Adapt this buffer's mode-3 strategy before its first operator invocation.
+        strategy._load_mega_moe_ops = lambda: ops
+        strategy._sglang_legacy_swiglu = True
+    return buffer
+
+
 def _check_mega_moe_keywords(operator, strategy_source):
     operator_signature = inspect.signature(operator)
     source = ast.parse(strategy_source)
@@ -146,7 +201,7 @@ def _check_mega_moe_keywords(operator, strategy_source):
 
 
 @lru_cache(maxsize=1)
-def _check_mega_moe_support() -> None:
+def _check_mega_moe_support():
     try:
         import cann_ops_transformer
         import deep_ep
@@ -178,7 +233,10 @@ def _check_mega_moe_support() -> None:
         if not callable(mega_moe) or not callable(get_symm_buffer_for_mega_moe):
             raise RuntimeError("ops-transformer does not expose MegaMoE")
         operator_signature = inspect.signature(mega_moe)
-        keywords = _check_mega_moe_keywords(mega_moe, inspect.getsource(fused_strategy))
+        compatible_operator = _adapt_mega_moe_operator(mega_moe)
+        keywords = _check_mega_moe_keywords(
+            compatible_operator, inspect.getsource(fused_strategy)
+        )
         diagnostic = {
             "deep_ep": {
                 "path": deep_ep.__file__,
@@ -192,6 +250,7 @@ def _check_mega_moe_support() -> None:
             "mega_moe_signature": str(operator_signature),
             "strategy_path": fused_strategy.__file__,
             "strategy_keywords": sorted(keywords),
+            "legacy_swiglu_adapter": compatible_operator is not mega_moe,
         }
         logging.getLogger(__name__).warning(
             "MegaMoE dependencies: %s", json.dumps(diagnostic)
@@ -213,6 +272,7 @@ def _check_mega_moe_support() -> None:
     soc = torch.npu.get_device_name()
     if not soc.startswith("Ascend910_93"):
         raise ValueError(f"FuseEP mode 3 currently supports Ascend A3, got {soc}")
+    return get_symm_buffer_for_mega_moe, compatible_operator
 
 
 def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
