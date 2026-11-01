@@ -523,9 +523,19 @@ def main():
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--feature-cases", default="*")
     parser.add_argument(
+        "--long-variants",
+        default="dcp-baseline,dcp-packed-read,dcp-gather-prefetch,dcp-sfa-overlap,dcp-indexer-query-shard,dcp-multistream,dcp-packed-prefetch,dcp-packed-overlap,dcp-prefetch-overlap,dcp-io-combined,dcp-io-indexer,dcp-io-multistream",
+    )
+    parser.add_argument("--long-lengths", default="32768,1000000")
+    parser.add_argument("--long-concurrency", default="1,2")
+    parser.add_argument("--long-requests", type=int, default=2)
+    parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
+    parser.add_argument("--max-hours", type=float)
+    parser.add_argument("--long-kv-rows", type=int, default=131072)
+    parser.add_argument(
         "--feature-stages",
         default="host,npu,serve",
-        help="Comma-separated qualification stages; timing requires serve.",
+        help="Comma-separated host,npu,serve,long stages; AISBench requires serve.",
     )
     parser.add_argument("--features-only", action="store_true")
     parser.add_argument(
@@ -552,8 +562,20 @@ def main():
     args = parser.parse_args()
     if args.feature_kv_rows is not None and args.feature_kv_rows <= 0:
         parser.error("--feature-kv-rows must be positive")
+    try:
+        lengths = [int(x) for x in args.long_lengths.split(",")]
+        concurrencies = [int(x) for x in args.long_concurrency.split(",")]
+    except ValueError:
+        parser.error("Long lengths and concurrency must be comma-separated integers")
+    if min(*lengths, *concurrencies, args.long_requests, args.long_kv_rows) <= 0:
+        parser.error("Long workload settings must be positive")
+    if max(lengths) + 1 > args.context:
+        parser.error("Long prompt must leave space for output in context")
     if args.worker:
         return worker()
+    if args.max_hours is not None and not 0 < args.max_hours <= 24:
+        parser.error("--max-hours must be in (0,24]")
+    args.deadline_unix = time.time() + args.max_hours * 3600 if args.max_hours else None
     args.ais_env = resolve_ais_env(args.ais_env)
     if args.check_paths or not (args.features_only or args.dry_run):
         try:
@@ -566,10 +588,10 @@ def main():
     stages = args.feature_stages.split(",")
     if (
         not stages
-        or set(stages) - {"host", "npu", "serve"}
+        or set(stages) - {"host", "npu", "serve", "long"}
         or len(set(stages)) != len(stages)
     ):
-        parser.error("--feature-stages must select unique host,npu,serve stages")
+        parser.error("--feature-stages must select unique host,npu,serve,long stages")
     if not args.features_only and "serve" not in stages:
         parser.error("Benchmark timing requires serve qualification")
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
@@ -647,9 +669,34 @@ def main():
             "--output",
             f"{remote}/{stage}/report.md",
         ]
+        if args.deadline_unix:
+            feature_commands[stage] += ["--deadline-unix", str(args.deadline_unix)]
         if args.w8a8_checkpoint:
             feature_commands[stage] += ["--w8a8-model-path", args.w8a8_checkpoint]
-        if args.feature_kv_rows is not None:
+        if stage == "long":
+            feature_commands[stage][
+                feature_commands[stage].index("--context-length") + 1
+            ] = str(args.context)
+            feature_commands[stage][feature_commands[stage].index("--chunk") + 1] = str(
+                args.chunk
+            )
+            feature_commands[stage] += [
+                "--benchmark-variants",
+                args.long_variants,
+                "--long-lengths",
+                args.long_lengths,
+                "--long-concurrency",
+                args.long_concurrency,
+                "--long-requests",
+                str(args.long_requests),
+                "--long-warmup",
+                args.long_warmup,
+                "--benchmark-repeats",
+                str(args.repeats),
+                "--kv-rows",
+                str(args.long_kv_rows),
+            ]
+        elif args.feature_kv_rows is not None:
             feature_commands[stage] += ["--kv-rows", str(args.feature_kv_rows)]
     ais_args = [
         "--input_len",
@@ -736,11 +783,29 @@ def main():
             rows.append(
                 f"| {item['case']} | {item['status']} | {ttft / 1000 if ttft is not None else ''} / {p90 / 1000 if p90 is not None else ''} | {metric.get('E2E_time', '')} | {metric.get('qps', '')} | {metric.get('prefill_token_throughput', '')} |"
             )
+        long_cases = [item for item in records if "benchmarks" in item]
+        if long_cases:
+            rows.extend(
+                [
+                    "",
+                    "## Exact-token long-context measurements",
+                    "",
+                    "| Case | Tokens | Concurrency | Cache | Status | TTFT mean / P90 (s) | E2E mean (s) | Run wall mean (s) | Requests/s | Uncached prefill tokens/s |",
+                    "|---|---|---|---|---|---|---|---|---|---|",
+                ]
+            )
+            for item in long_cases:
+                for point in item["benchmarks"]:
+                    rows.append(
+                        f"| {item['case']} | {point.get('length', '')} | {point.get('concurrency', '')} | {point.get('cache', '')} | {point['status']} | "
+                        f"{point.get('mean_ttft_s', '')} / {point.get('p90_ttft_s', '')} | {point.get('mean_e2e_s', '')} | "
+                        f"{point.get('mean_run_wall_s', '')} | {point.get('requests_per_s', '')} | {point.get('uncached_prefill_tokens_per_s', '')} |"
+                    )
         rows.extend(
             [
                 "",
                 "Raw reports and server logs: `container-artifacts/`. Blocked/inactive cases are not passes.",
-                "DCP cases use one output token (TPOT undefined); MoE cases use multi-token outputs. Compare only within a workload group.",
+                "AISBench DCP uses one output token; AISBench MoE uses multiple. Native long cases always use one output token (TPOT undefined). Compare only matched workloads.",
             ]
         )
         (output / "SUMMARY.md").write_text("\n".join(rows) + "\n")
@@ -761,7 +826,10 @@ def main():
                 ),
             )
             try:
-                result = job.receive(args.feature_timeout)
+                timeout = args.feature_timeout
+                if args.deadline_unix:
+                    timeout = min(timeout, max(0, args.deadline_unix - time.time()))
+                result = job.receive(timeout)
                 code = result["returncode"]
                 record = {
                     "case": stage,
@@ -771,14 +839,32 @@ def main():
                     if code == 2
                     else "fail",
                 }
-                if stage == "serve":
+                if stage in ("serve", "long"):
                     report = subprocess.check_output(
-                        [*docker, "cat", f"{remote}/serve/report.md"], text=True
+                        [*docker, "cat", f"{remote}/{stage}/report.md"], text=True
                     )
-                    qualification = report_cases(report)
+                    if stage == "serve":
+                        qualification = report_cases(report)
+                    else:
+                        for case in report_cases(report).values():
+                            if case.get("stage") == "long":
+                                records.append(
+                                    {
+                                        "case": case["id"],
+                                        "status": case["status"],
+                                        "benchmarks": case.get("benchmarks", []),
+                                        "reason": case.get("reason", case.get("error")),
+                                    }
+                                )
                     (folder / "report.md").write_text(report)
             except Exception as exc:  # noqa: BLE001 - retain failures and continue independent cases
-                record = {"case": stage, "status": "fail", "error": str(exc)}
+                record = {
+                    "case": stage,
+                    "status": "budget_blocked"
+                    if args.deadline_unix and time.time() >= args.deadline_unix
+                    else "fail",
+                    "error": str(exc),
+                }
             finally:
                 job.close()
             records.append(record)

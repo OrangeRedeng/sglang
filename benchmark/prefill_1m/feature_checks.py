@@ -206,7 +206,7 @@ def self_check_workloads():
         (directory / "config.json").write_text(json.dumps({"vocab_size": 1024}))
         state = {"prefix": [], "flushed": 0, "measured": []}
 
-        def request(url, *args):
+        def request(url, *args, **kwargs):
             if url.endswith("/get_server_info"):
                 return {
                     "internal_states": [
@@ -226,16 +226,35 @@ def self_check_workloads():
                 state["prefix"] = list(ids)
             if len(ids) == 1000:
                 state["measured"].append(list(ids))
-            return {"ttft_s": 0.1, "e2e_s": 0.2, "cached_tokens": cached}
+            return {
+                "ttft_s": 0.1,
+                "e2e_s": 0.2,
+                "cached_tokens": cached,
+                "prompt_tokens": len(ids),
+            }
 
         with patch("feature_benchmarks.run_one", side_effect=send):
             points = long_matrix(args, "local", request, directory, directory)
         assert len(points) == 4 and all(point["status"] == "pass" for point in points)
         assert state["flushed"] == 8
         assert all(
+            point["p90_ttft_s"] == 0.1 and point["tpot_s"] is None for point in points
+        )
+        assert all(
             len(ids) == 1000 and min(ids) >= 256 and max(ids) < 1024
             for ids in state["measured"]
         )
+        args.long_warmup = "once"
+        args.long_requests = 1
+        args.long_concurrency = [1]
+        args.benchmark_repeats = 3
+        state["flushed"] = 0
+        with patch("feature_benchmarks.run_one", side_effect=send) as calls:
+            once = long_matrix(args, "local", request, directory, directory)
+        assert len(once) == 2 and all(len(point["samples"]) == 3 for point in once)
+        assert state["flushed"] == 6
+        assert calls.call_count == 11  # Two warmups, three primes, six measurements.
+        args.benchmark_repeats = 2
         commands = list(small_commands(args, directory))
         assert len(commands) == 8 and all(
             "--flush-cache" in command and "--tokenize-prompt" in command

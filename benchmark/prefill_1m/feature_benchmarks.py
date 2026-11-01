@@ -91,6 +91,7 @@ def long_matrix(args, base, request, checkpoint, directory):
     if vocab <= 256:
         raise ValueError("invalid model vocabulary")
     server_info = request(base + "/get_server_info")
+    (directory / "server_info.json").write_text(json.dumps(server_info, indent=2))
     capacity = limits(server_info)
     if capacity["max_total_num_tokens"] is None:
         raise CapacityBlocked("server did not expose KV token capacity")
@@ -107,9 +108,9 @@ def long_matrix(args, base, request, checkpoint, directory):
             for cache in ("cold", "prefix99"):
                 # Prime + suffixes share physical prefix KV pages in prefix99 mode.
                 required = (
-                    concurrency * (length + 1)
+                    concurrency * (length + 1) + 4096
                     if cache == "cold"
-                    else length + concurrency * (length - int(length * 0.99) + 1)
+                    else length + concurrency * (length - int(length * 0.99) + 1) + 4096
                 )
                 if required > capacity["max_total_num_tokens"]:
                     results.append(
@@ -130,9 +131,15 @@ def long_matrix(args, base, request, checkpoint, directory):
                     def fresh(count):
                         return [rng.randrange(256, vocab) for _ in range(count)]
 
-                    # One warmup, followed by a cache reset, for every measured repeat.
-                    run_one(base, fresh(length), 1, args.request_timeout)
-                    request(base + "/flush_cache", {}, args.request_timeout)
+                    # The bounded profile warms each cache regime once; flush every repeat.
+                    if repeat == 0 or getattr(args, "long_warmup", "each") == "each":
+                        run_one(base, fresh(length), 1, args.request_timeout)
+                    request(
+                        base + "/flush_cache",
+                        {},
+                        args.request_timeout,
+                        expect_json=False,
+                    )
                     prefix = fresh(int(length * 0.99)) if cache == "prefix99" else []
                     if prefix:
                         run_one(base, prefix, 1, args.request_timeout)
@@ -150,6 +157,10 @@ def long_matrix(args, base, request, checkpoint, directory):
                         )
                     wall = time.perf_counter() - start
                     for item in measured:
+                        if item.get("prompt_tokens") != length:
+                            raise RuntimeError(
+                                f"Expected {length} prompt tokens, got {item.get('prompt_tokens')}"
+                            )
                         cached = item["cached_tokens"]
                         if cached is None:
                             raise RuntimeError(
@@ -162,7 +173,11 @@ def long_matrix(args, base, request, checkpoint, directory):
                                 f"prefix run cached only {cached}/{len(prefix)} tokens"
                             )
                     samples.append(dict(repeat=repeat, wall_s=wall, requests=measured))
+                    (
+                        directory / f"long-{length}-{concurrency}-{cache}-samples.json"
+                    ).write_text(json.dumps(samples, indent=2))
                 ttft = [r["ttft_s"] for sample in samples for r in sample["requests"]]
+                e2e = [r["e2e_s"] for sample in samples for r in sample["requests"]]
                 results.append(
                     dict(
                         length=length,
@@ -170,11 +185,36 @@ def long_matrix(args, base, request, checkpoint, directory):
                         cache=cache,
                         status="pass",
                         median_ttft_s=statistics.median(ttft),
+                        p90_ttft_s=percentile(ttft, 0.90),
                         p95_ttft_s=percentile(ttft, 0.95),
+                        mean_e2e_s=statistics.mean(e2e),
+                        p90_e2e_s=percentile(e2e, 0.90),
+                        mean_run_wall_s=statistics.mean(s["wall_s"] for s in samples),
+                        requests_per_s=statistics.mean(
+                            len(s["requests"]) / s["wall_s"] for s in samples
+                        ),
+                        prompt_tokens_per_s=statistics.mean(
+                            length * len(s["requests"]) / s["wall_s"] for s in samples
+                        ),
+                        uncached_prefill_tokens_per_s=statistics.mean(
+                            sum(length - r["cached_tokens"] for r in s["requests"])
+                            / s["wall_s"]
+                            for s in samples
+                        ),
+                        tpot_s=None,
+                        mean_prefill_batch_size=None,
+                        mean_decode_batch_size=None,
+                        batch_means_status="not exposed by streaming client; inspect server log",
                         mean_ttft_s=statistics.mean(ttft),
                         stdev_ttft_s=statistics.stdev(ttft) if len(ttft) > 1 else 0,
                         samples=samples,
                     )
                 )
+                (directory / "long-results.json").write_text(
+                    json.dumps(results, indent=2)
+                )
+    (directory / "server_info_after.json").write_text(
+        json.dumps(request(base + "/get_server_info"), indent=2)
+    )
     (directory / "long-results.json").write_text(json.dumps(results, indent=2))
     return results

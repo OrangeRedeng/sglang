@@ -9,7 +9,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,6 +29,51 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_long_context_flush_accepts_text_and_metadata_stays_json(self):
+        matrix = load("long_http", "test_glm53_features.py")
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = (
+            b"Cache flushed."
+        )
+        with patch.object(matrix.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(
+                matrix.request("http://local/flush_cache", {}, expect_json=False),
+                "Cache flushed.",
+            )
+            with self.assertRaises(json.JSONDecodeError):
+                matrix.request("http://local/get_server_info")
+
+    def test_combinations_require_matching_component_qualification(self):
+        matrix = load("overnight_combinations", "test_glm53_features.py")
+        combos = matrix._combinations
+        combined = matrix.SCENARIOS["dcp-io-combined"]
+        self.assertEqual(
+            set(combined["expected"]),
+            {"dcp-packed-read", "dcp-gather-prefetch", "dcp-sfa-overlap"},
+        )
+        self.assertTrue(all(value == "True" for value in combined["env"].values()))
+        case = dict(
+            id="long-dcp-io-combined",
+            stage="long",
+            checkpoint_path="/weights",
+            scenario=combined,
+        )
+        qualified = {}
+        self.assertEqual(
+            combos.component_blockers(case, qualified), list(combined["components"])
+        )
+        for component in combined["components"]:
+            qualified[combos.qualification_key(case, component)] = True
+        self.assertEqual(combos.component_blockers(case, qualified), [])
+        for changes in (
+            dict(stage="serve"),
+            dict(checkpoint_path="/different"),
+            dict(scenario=dict(combined, dcp=False)),
+        ):
+            self.assertTrue(combos.component_blockers(dict(case, **changes), qualified))
+        qualified[combos.qualification_key(case, combined["components"][0])] = False
+        self.assertTrue(combos.component_blockers(case, qualified))
+
     def test_int8_finalize_requires_real_nz_storage_and_cann_entrypoint(self):
         from sglang.srt.hardware_backend.npu.moe import tp_fusion
 

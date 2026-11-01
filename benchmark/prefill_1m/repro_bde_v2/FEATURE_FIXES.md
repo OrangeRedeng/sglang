@@ -1,5 +1,7 @@
 # GLM A3 feature-fix validation
 
+[Verified baseline and full overnight 1M queue](OVERNIGHT_1M_20261102.md).
+
 Latest collected-run analysis and staged retest instructions:
 [2026-11-01 baseline retest](DEBUG_20261101.md);
 [2026-10-31 matrix report](DEBUG_20261031.md).

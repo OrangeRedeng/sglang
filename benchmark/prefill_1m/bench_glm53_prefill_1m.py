@@ -61,6 +61,8 @@ def run_one(
     start = time.perf_counter()
     first_token_ts: float | None = None
     cached_tokens = None
+    prompt_tokens = None
+    output_text = None
     with requests.post(
         f"{base_url}/generate", json=payload, stream=True, timeout=timeout
     ) as resp:
@@ -76,6 +78,8 @@ def run_one(
                 raise RuntimeError(data["error"])
             meta = data.get("meta_info", {})
             cached_tokens = meta.get("cached_tokens", cached_tokens)
+            prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
+            output_text = data.get("text", output_text)
             if first_token_ts is None and meta.get("completion_tokens", 0) > 0:
                 first_token_ts = time.perf_counter()
     end = time.perf_counter()
@@ -85,6 +89,8 @@ def run_one(
         "ttft_s": first_token_ts - start,
         "e2e_s": end - start,
         "cached_tokens": cached_tokens,
+        "prompt_tokens": prompt_tokens,
+        "output_text": output_text,
     }
 
 

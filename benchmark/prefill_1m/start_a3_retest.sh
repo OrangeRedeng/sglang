@@ -36,10 +36,21 @@ case "$mode" in
   failures)
     args+=(--features-only --feature-cases 'serve-baseline,serve-w8a8-load,serve-w4a4-mixed-load,serve-online-*,serve-tp-*,serve-indexer-int8,serve-dcp-full-width-q,serve-dcp-legacy-token-shard,serve-dcp-stream-o-proj,serve-bde-v2,serve-graph-*,serve-fuseep-*,serve-megamoe')
     ;;
+  overnight|overnight-core)
+    args+=(--features-only --feature-stages host,npu,serve,long --repeats 3
+           --feature-cases 'serve-baseline,serve-tp-*,serve-multistream,serve-auto-stream-thresholds,serve-auto-hccl,serve-autotune-hccl,serve-indexer-int8,serve-indexer-query-shard,serve-fuseep-*,serve-megamoe,serve-moe-stream-auto,serve-moe-fused-combined'
+           --long-lengths 1000000 --long-concurrency 1 --long-requests 1
+           --long-warmup once --long-kv-rows 81920 --max-hours 9.5
+           --feature-timeout 34200
+           --long-variants 'dcp-baseline,dcp-packed-read,dcp-gather-prefetch,dcp-sfa-overlap,dcp-indexer-query-shard,dcp-multistream,dcp-io-combined')
+    if [[ $mode == overnight-core ]]; then
+      args+=(--long-variants 'dcp-baseline,dcp-packed-read,dcp-gather-prefetch,dcp-sfa-overlap,dcp-io-combined')
+    fi
+    ;;
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|moe|dcp|failures|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"

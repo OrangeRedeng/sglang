@@ -300,6 +300,17 @@ SCENARIOS["indexer-int8"].update(expected=["indexer-int8"], probe="indexer-int8"
 SCENARIOS["indexer-query-shard"]["expected"] = ["indexer-query-shard"]
 for name in ("graph-full", "graph-piecewise"):
     SCENARIOS[name]["expected"] = [name + "-capture", name + "-replay"]
+_combination_spec = importlib.util.spec_from_file_location(
+    "glm_feature_combinations", Path(__file__).with_name("feature_combinations.py")
+)
+_combinations = importlib.util.module_from_spec(_combination_spec)
+_combination_spec.loader.exec_module(_combinations)
+add_combinations = _combinations.add_combinations
+component_blockers = _combinations.component_blockers
+qualification_key = _combinations.qualification_key
+
+add_combinations(SCENARIOS)
+_QUALIFIED_SCENARIOS = {}
 SERVING_STAGES = ("serve", "small", "long")
 
 
@@ -339,7 +350,7 @@ def run(command, log, timeout, env):
             stop(process)
 
 
-def request(url, payload=None, timeout=60):
+def request(url, payload=None, timeout=60, *, expect_json=True):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
@@ -349,6 +360,8 @@ def request(url, payload=None, timeout=60):
         req, timeout=timeout
     ) as response:
         body = response.read()
+        if not expect_json:
+            return body.decode("utf-8", errors="replace")
         return json.loads(body) if body else None
 
 
@@ -566,6 +579,8 @@ def server_command(args, scenario):
         command += ["--quantization", "modelslim"]
     if getattr(args, "kv_rows", None) is not None:
         command += ["--max-total-tokens", str(args.kv_rows)]
+    if getattr(args, "stage", "serve") == "long" and scenario.get("dcp"):
+        command += ["--prefill-max-requests", "1", "--max-running-requests", "64"]
     if scenario.get("graph"):
         command += [
             "--cuda-graph-backend-decode",
@@ -768,7 +783,8 @@ def serve(args, case, directory, env):
             if missing:
                 outcome["failure_phase"] = "activation"
                 outcome["ineligibility"] = [
-                    event for event in events
+                    event
+                    for event in events
                     if event["feature"].endswith("-ineligible")
                 ]
             if case["stage"] == "small":
@@ -822,6 +838,13 @@ def validate_serving(args, case, directory, case_env, base_env):
     )
 
     scenario = case["scenario"]
+    blockers = component_blockers(case, _QUALIFIED_SCENARIOS)
+    if blockers:
+        return dict(
+            status="blocked",
+            failure_phase="components",
+            reason="Components lack matching qualification: " + ", ".join(blockers),
+        )
     if scenario.get("fuseep") in (1, 2):
         schemes = expert_quantization(case["checkpoint_path"])
         if not schemes or not schemes <= {"W8A8", "W8A8_DYNAMIC"}:
@@ -1044,6 +1067,10 @@ def fusion_import_self_check():
 
 
 def plan(args):
+    if getattr(args, "benchmark_variants", "") == "all":
+        args.benchmark_variants = ",".join(
+            name for name in SCENARIOS if name != "baseline"
+        )
     cases = [
         {
             "id": "host-syntax",
@@ -1226,6 +1253,8 @@ def plan(args):
                 "checkpoint_format": checkpoint_format,
             }
         )
+    if benchmark_stage == "long":
+        cases.sort(key=lambda case: not case["id"].endswith("-baseline"))
     return [
         case
         for case in cases
@@ -1351,7 +1380,8 @@ def main():
         help="Explicit ModelSlim W8A8 checkpoint for FuseEP modes 1/2.",
     )
     parser.add_argument(
-        "--kv-rows", type=int,
+        "--kv-rows",
+        type=int,
         help="Explicit local KV token cap, identical for reference and candidate.",
     )
     parser.add_argument("--dcp", type=int, default=16)
@@ -1403,6 +1433,8 @@ def main():
         default=[1, 16],
     )
     parser.add_argument("--long-requests", type=int, default=16)
+    parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
+    parser.add_argument("--deadline-unix", type=float)
     parser.add_argument("--benchmark-repeats", type=int, default=3)
     parser.add_argument(
         "--self-check-workloads", action="store_true", help=argparse.SUPPRESS
@@ -1658,9 +1690,26 @@ def main():
                         status="blocked",
                         reason="distributed prefix/o_proj tests require at least two NPU ranks",
                     )
+                elif (
+                    case["stage"] in SERVING_STAGES
+                    and args.deadline_unix
+                    and time.time() + (3000 if case["stage"] == "long" else 900)
+                    > args.deadline_unix
+                ):
+                    result.update(
+                        status="budget_blocked",
+                        failure_phase="budget",
+                        reason="Insufficient time remains for the next complete case",
+                    )
                 elif case["stage"] in SERVING_STAGES:
                     result.update(
                         validate_serving(args, case, directory, case_env, env)
+                    )
+                    _QUALIFIED_SCENARIOS[qualification_key(case)] = (
+                        result.get("quality") == "verified"
+                        and result.get("activation") == "verified"
+                        and not result.get("missing")
+                        and result.get("failure_phase") not in ("parity", "components")
                     )
                 else:
                     code = run(

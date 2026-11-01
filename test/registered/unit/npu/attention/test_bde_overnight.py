@@ -32,6 +32,70 @@ class TestBdeOvernight(CustomTestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_global_budget_and_single_warmup_reach_container_command(self):
+        module = self.runner()
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "night",
+                    "--dry-run",
+                    "--features-only",
+                    "--feature-stages",
+                    "long",
+                    "--max-hours",
+                    "9.5",
+                    "--long-warmup",
+                    "once",
+                ],
+            ),
+            patch.object(module.time, "time", return_value=1000),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(module.main(), 0)
+        command = json.loads(output.getvalue())["feature_commands"]["long"]
+        self.assertEqual(float(command[command.index("--deadline-unix") + 1]), 35200)
+        self.assertEqual(command[command.index("--long-warmup") + 1], "once")
+
+    def test_overnight_long_plan_uses_explicit_capacity_and_matched_workloads(self):
+        module = self.runner()
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "night",
+                    "--dry-run",
+                    "--features-only",
+                    "--feature-stages",
+                    "long",
+                    "--feature-kv-rows",
+                    "8192",
+                    "--chunk",
+                    "16384",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(module.main(), 0)
+        plan = json.loads(output.getvalue())
+        command = plan["feature_commands"]["long"]
+        for flag, value in (
+            ("--context-length", "1048576"),
+            ("--kv-rows", "131072"),
+            ("--long-lengths", "32768,1000000"),
+            ("--long-concurrency", "1,2"),
+            ("--benchmark-repeats", "3"),
+            ("--chunk", "16384"),
+        ):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        variants = command[command.index("--benchmark-variants") + 1].split(",")
+        self.assertIn("dcp-baseline", variants)
+        self.assertIn("dcp-io-multistream", variants)
+
     def test_aisbench_initializes_conda_before_environment_activation(self):
         module = self.runner()
         with tempfile.TemporaryDirectory() as temporary:
