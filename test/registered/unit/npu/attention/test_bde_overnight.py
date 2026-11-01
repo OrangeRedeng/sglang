@@ -1,6 +1,8 @@
 """Unattended host/container orchestration without devices or a Docker daemon."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -29,6 +31,103 @@ class TestBdeOvernight(CustomTestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_aisbench_initializes_conda_before_environment_activation(self):
+        module = self.runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, ais = root / "bin", root / "ais"
+            binary.mkdir()
+            ais.mkdir()
+            conda = binary / "conda"
+            conda.write_text(
+                "#!/bin/bash\n"
+                "if [[ $1 == shell.bash && $2 == hook ]]; then\n"
+                "  echo 'conda() { export A3_FIXTURE_ACTIVE=1; };'\n"
+                "else\n  echo 'CondaError: initialize before activation' >&2; exit 1\nfi\n"
+            )
+            conda.chmod(0o755)
+            environment = root / "env.sh"
+            environment.write_text("conda activate fixture\n")
+            (ais / "aisbench_test.py").write_text(
+                "import os, sys, json\n"
+                "assert os.environ['A3_FIXTURE_ACTIVE'] == '1'\n"
+                "assert 'HTTP_PROXY' not in os.environ\n"
+                "print(json.dumps(sys.argv[1:]))\n"
+            )
+            for executable_on_path in (True, False):
+                with self.subTest(executable_on_path=executable_on_path):
+                    env = dict(os.environ, HTTP_PROXY="http://invalid:9")
+                    env.pop("CONDA_EXE", None)
+                    env.pop("BASH_FUNC_conda%%", None)
+                    if executable_on_path:
+                        env["PATH"] = str(binary) + os.pathsep + env["PATH"]
+                    else:
+                        env["CONDA_EXE"] = str(conda)
+                    command = [
+                        "bash",
+                        "--noprofile",
+                        "--norc",
+                        "-c",
+                        module.AISBENCH_SHELL,
+                        "aisbench",
+                        str(environment),
+                        str(ais),
+                        "--input_len",
+                        "1024",
+                    ]
+                    result = subprocess.run(
+                        command, env=env, text=True, capture_output=True, timeout=10
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), ["--input_len", "1024"])
+            environment.write_text("conda activate fixture\nfalse\n")
+            result = subprocess.run(
+                command, env=env, text=True, capture_output=True, timeout=10
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_baseline_only_stage_selection_preserves_qualification(self):
+        module = self.runner()
+        for stages, expected in (
+            ("serve", ["serve"]),
+            ("host,npu,serve", ["host", "npu", "serve"]),
+        ):
+            output = io.StringIO()
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "night",
+                        "--dry-run",
+                        "--feature-stages",
+                        stages,
+                        "--feature-cases",
+                        "serve-baseline",
+                        "--variants",
+                        "baseline",
+                    ],
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(module.main(), 0)
+            plan = json.loads(output.getvalue())
+            self.assertEqual(list(plan["feature_commands"]), expected)
+            self.assertEqual(plan["variants"], ["baseline"])
+            command = plan["feature_commands"]["serve"]
+            self.assertEqual(command[command.index("--cases") + 1], "serve-baseline")
+        for stages in ("host,npu", "serve,serve", "serve,invalid", ""):
+            with (
+                self.subTest(stages=stages),
+                patch.object(
+                    sys, "argv", ["night", "--dry-run", "--feature-stages", stages]
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
+                module.main()
+            self.assertEqual(error.exception.code, 2)
 
     def test_http_flush_accepts_text_but_server_info_requires_json(self):
         module = self.runner()

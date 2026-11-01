@@ -23,6 +23,25 @@ import traceback
 import urllib.request
 from pathlib import Path
 
+AISBENCH_SHELL = """\
+set -e
+if ! declare -F conda >/dev/null; then
+    conda_command=${CONDA_EXE:-conda}
+    if ! command -v "$conda_command" >/dev/null; then
+        conda_command=conda
+    fi
+    if command -v "$conda_command" >/dev/null; then
+        conda_hook=$("$conda_command" shell.bash hook)
+        eval "$conda_hook"
+    fi
+fi
+source "$1"
+cd "$2"
+unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy
+export NO_PROXY=localhost,127.0.0.1,::1
+exec python3 aisbench_test.py "${@:3}"
+"""
+
 RELATIVE = "benchmark/prefill_1m/run_bde_overnight.py"
 AIS_ENV_CANDIDATES = (
     "/home/tbaydasov/set_env.sh",
@@ -503,6 +522,11 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--feature-cases", default="*")
+    parser.add_argument(
+        "--feature-stages",
+        default="host,npu,serve",
+        help="Comma-separated qualification stages; timing requires serve.",
+    )
     parser.add_argument("--features-only", action="store_true")
     parser.add_argument(
         "--moe-only",
@@ -539,6 +563,15 @@ def main():
     if args.check_paths:
         print(f"AISBench host paths OK: {args.ais_dir}; environment: {args.ais_env}")
         return 0
+    stages = args.feature_stages.split(",")
+    if (
+        not stages
+        or set(stages) - {"host", "npu", "serve"}
+        or len(set(stages)) != len(stages)
+    ):
+        parser.error("--feature-stages must select unique host,npu,serve stages")
+    if not args.features_only and "serve" not in stages:
+        parser.error("Benchmark timing requires serve qualification")
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
     if args.moe_only and args.feature_cases == "*":
         args.feature_cases = ",".join("serve-" + name for name in MOE_VARIANTS)
@@ -585,7 +618,7 @@ def main():
         "startup_timeout": args.startup_timeout,
     }
     feature_commands = {}
-    for stage in ("host", "npu", "serve"):
+    for stage in stages:
         feature_commands[stage] = [
             "--stage",
             stage,
@@ -821,7 +854,7 @@ def main():
                             "--noprofile",
                             "--norc",
                             "-c",
-                            'set -e; source "$1"; cd "$2"; unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy; export NO_PROXY=localhost,127.0.0.1,::1; exec python3 aisbench_test.py "${@:3}"',
+                            AISBENCH_SHELL,
                             "aisbench",
                             args.ais_env,
                             args.ais_dir,

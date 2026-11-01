@@ -1816,11 +1816,14 @@ class FusedMoE(torch.nn.Module):
     ) -> DispatchOutput:
         if isinstance(self.dispatcher, AscendTPDispatcher):
             from sglang.srt.environ import envs
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import supports_npu_op
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                supports_int8_gmm2_finalize,
+                supports_npu_op,
+            )
 
             self.dispatcher.fuse_gmm2_finalize = (
                 envs.SGLANG_NPU_TP_MOE_FUSE_GMM2_FINALIZE.get()
-                and self.w2_weight.dtype == torch.int8
+                and supports_int8_gmm2_finalize(self.w2_weight)
                 and getattr(self, "w2_weight_offset", None) is None
                 and getattr(self, "w2_scale_bias", None) is None
                 and getattr(self, "w2_weight_bias", None) is None

@@ -29,6 +29,40 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_int8_finalize_requires_real_nz_storage_and_cann_entrypoint(self):
+        from sglang.srt.hardware_backend.npu.moe import tp_fusion
+
+        native = SimpleNamespace(get_npu_format=lambda weight: weight.storage_format)
+        weight = SimpleNamespace(
+            dtype=torch.int8,
+            ndim=3,
+            device=SimpleNamespace(type="npu"),
+            storage_format=2,
+        )
+        with patch.dict(sys.modules, {"torch_npu": native}):
+            for available in (
+                set(),
+                {"aclnnGroupedMatmulFinalizeRoutingWeightNz"},
+                {"aclnnGroupedMatmulFinalizeRoutingWeightNzV2"},
+            ):
+                with patch.object(
+                    tp_fusion,
+                    "supports_cann_symbol",
+                    side_effect=lambda name: name in available,
+                ):
+                    for storage_format in (2, 29, 50):
+                        weight.storage_format = storage_format
+                        with self.subTest(
+                            symbols=available, storage_format=storage_format
+                        ):
+                            self.assertEqual(
+                                tp_fusion.supports_int8_gmm2_finalize(weight),
+                                bool(available) and storage_format in (29, 50),
+                            )
+            for dtype, device in ((torch.int32, "npu"), (torch.int8, "cpu")):
+                weight.dtype, weight.device = dtype, SimpleNamespace(type=device)
+                self.assertFalse(tp_fusion.supports_int8_gmm2_finalize(weight))
+
     def test_shared_slot_cancels_post_moe_scale(self):
         from sglang.srt.configs.shared_experts import SharedExpertsConfig
         from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig

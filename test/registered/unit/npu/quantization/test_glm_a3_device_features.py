@@ -1,7 +1,6 @@
 """Device parity for the INT contracts used by the GLM feature matrix."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 from sglang.srt.utils import is_npu
@@ -55,7 +54,6 @@ class TestIntegerFeatureParity(CustomTestCase):
                 q, scale = torch.ops.npu.npu_dynamic_quant(x)
                 # Reference uses the exact stored quantized values, not the pre-quantization weight.
                 import torch_npu
-                from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
                 stored = torch_npu.npu_format_cast(layer.weight, 2).cpu().float()
                 reference = (
@@ -184,6 +182,13 @@ class TestIntegerFeatureParity(CustomTestCase):
             "npu_grouped_matmul_finalize_routing", ("row_index", "output_bs")
         ) or not supports_npu_op("npu_moe_init_routing_v2", ("row_idx_type",)):
             self.skipTest("fused GMM2 ABI unavailable")
+        from sglang.srt.hardware_backend.npu.utils import (
+            init_npu_backend,
+            npu_format_cast,
+        )
+
+        # Standalone tests must enable the same internal formats as serving.
+        init_npu_backend()
         rows = 7
         hidden = 6144
         intermediate = 2048
@@ -203,7 +208,10 @@ class TestIntegerFeatureParity(CustomTestCase):
         ws = ws.to(torch.bfloat16)
         import torch_npu
 
-        w = torch_npu.npu_format_cast(w.transpose(1, 2).contiguous(), 29)
+        w = npu_format_cast(w.transpose(1, 2).contiguous())
+        self.assertIn(
+            torch_npu.get_npu_format(w), (29, 50), "INT8 finalize needs NZ storage"
+        )
         grouped = torch.ops.npu.npu_grouped_matmul(
             x=[q],
             weight=[w],

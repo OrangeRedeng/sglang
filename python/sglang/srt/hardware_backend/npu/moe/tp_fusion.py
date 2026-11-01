@@ -548,6 +548,18 @@ def validate_tp_expert_weights(layer, *, prepared=True):
                 tensor._npu_shared_loaded_shards = set()
 
 
+def supports_int8_gmm2_finalize(weight):
+    if weight.dtype != torch.int8 or weight.ndim != 3 or weight.device.type != "npu":
+        return False
+    import torch_npu
+
+    # op-plugin selects WeightNz by storage format; ND INT8 selects the INT4 ABI.
+    return torch_npu.get_npu_format(weight) in (29, 50) and (
+        supports_cann_symbol("aclnnGroupedMatmulFinalizeRoutingWeightNzV2")
+        or supports_cann_symbol("aclnnGroupedMatmulFinalizeRoutingWeightNz")
+    )
+
+
 def fused_gmm2_finalize(
     x,
     x_scale,
@@ -563,6 +575,10 @@ def fused_gmm2_finalize(
         pack_finalize_routing,
     )
 
+    if not supports_int8_gmm2_finalize(weight):
+        raise ValueError(
+            "INT8 GMM2 finalize requires NZ weights and a WeightNz CANN operator"
+        )
     rows, logits = pack_finalize_routing(expanded_row_idx, topk_weights)
     result = torch.ops.npu.npu_grouped_matmul_finalize_routing(
         x,

@@ -22,7 +22,7 @@ if [[ -n ${W8A8_MODEL_PATH:-} ]]; then
 fi
 case "$mode" in
   quick)
-    args+=(--feature-cases serve-baseline --variants baseline --repeats 1
+    args+=(--feature-stages serve --feature-cases serve-baseline --variants baseline --repeats 1
            --requests 2 --moe-length 1024 --moe-output-len 16 --moe-kv-rows 8192)
     ;;
   moe)
@@ -52,5 +52,8 @@ bash "$scratch/start.sh" "${args[@]}" --output "$out/results" "$@"
 code=$?
 set -e
 docker exec "$container" npu-smi info > "$out/npu-smi-after.txt" || true
-printf 'Runner exit: %s\nResults: %s/results/SUMMARY.md\n' "$code" "$out"
+cp "$out/driver.log" "$out/driver-snapshot.log"
+tar -czf "$out.tar.gz" --exclude="$(basename "$out")/driver.log" \
+  -C "$(dirname "$out")" "$(basename "$out")"
+printf 'Runner exit: %s\nResults: %s/results/SUMMARY.md\nArchive: %s.tar.gz\n' "$code" "$out" "$out"
 exit "$code"
