@@ -643,6 +643,109 @@ class TestFeatureQualification(CustomTestCase):
                 result = harness.validate_serving(args, case, path, {}, {})
             self.assertEqual(result["status"], "dependency_blocked")
 
+    def test_megamoe_reference_separates_shared_experts_and_unfused_ep(self):
+        harness = load("matched_moe_reference", "test_glm53_features.py")
+        args = SimpleNamespace(
+            model_path="weights",
+            checkpoint_format="modelslim",
+            tp=16,
+            dcp=1,
+            context_length=8192,
+            chunk=4096,
+            mem_fraction=0.88,
+            port=31000,
+        )
+        for name in ("moe-baseline", "moe-ep-baseline", "megamoe"):
+            command = harness.server_command(args, harness.SCENARIOS[name])
+            self.assertIn("--disable-shared-experts-fusion", command)
+            self.assertNotIn("--dcp-size", command)
+            if name != "moe-baseline":
+                self.assertEqual(command[command.index("--ep-size") + 1], "16")
+        ep = harness.server_command(args, harness.SCENARIOS["moe-ep-baseline"])
+        self.assertEqual(ep[ep.index("--moe-a2a-backend") + 1], "deepep")
+        self.assertNotIn("--fuseep-mode", ep)
+
+    def test_complete_parity_failure_report_keeps_original_tolerance(self):
+        checks = load("parity_diagnostics", "feature_checks.py")
+        reference = [{"meta_info": {"input_token_logprobs": [[-3.0, 1], [-4.0, 2]]}}]
+        actual = [{"meta_info": {"input_token_logprobs": [[-3.3, 1], [-4.5, 2]]}}]
+        with self.assertRaises(checks.ParityError) as caught:
+            checks.compare_responses(reference, actual)
+        report = caught.exception.report
+        self.assertEqual(report["compared"], 2)
+        self.assertEqual(report["failed"], 2)
+        self.assertEqual(report["max_abs_error"], 0.5)
+        self.assertEqual(report["atol"], 0.01)
+        self.assertEqual(report["failures"][1]["token_index"], 1)
+
+    def test_diagnostic_megamoe_timing_never_qualifies_failed_parity(self):
+        checks = load("diagnostic_checks", "feature_checks.py")
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                harness = load("diagnostic_harness", "test_glm53_features.py")
+                args = SimpleNamespace(
+                    model_path="weights",
+                    checkpoint_format="modelslim",
+                    tp=16,
+                    dcp=1,
+                    context_length=8192,
+                    chunk=4096,
+                    mem_fraction=0.88,
+                    port=31000,
+                    diagnostic_megamoe=enabled,
+                )
+                case = dict(
+                    id="long-megamoe",
+                    stage="long",
+                    scenario={"fuseep": 3},
+                    checkpoint_path="weights",
+                    checkpoint_format="modelslim",
+                )
+                timed = []
+
+                def serve(args, case, directory, env):
+                    if directory.name == "measured":
+                        timed.append(True)
+                        points = [dict(status="pass", mean_ttft_s=1.0)]
+                        (directory / "long-results.json").write_text(json.dumps(points))
+                        return dict(status="pass", benchmarks=points)
+                    value = -3.0 if directory.name == "reference" else -3.3
+                    (directory / "responses.json").write_text(
+                        json.dumps(
+                            [{"meta_info": {"input_token_logprobs": [[value, 1]]}}]
+                        )
+                    )
+                    return dict(
+                        status="smoke_pass", activation="verified", quality="unverified"
+                    )
+
+                directory = Path(temporary)
+                with (
+                    patch.dict(sys.modules, feature_checks=checks),
+                    patch.object(
+                        sys, "path", [str(ROOT / "benchmark/prefill_1m"), *sys.path]
+                    ),
+                    patch.object(harness, "serve", side_effect=serve),
+                ):
+                    result = harness.validate_serving(args, case, directory, {}, {})
+                self.assertEqual(result["status"], "fail")
+                self.assertEqual(result["failure_phase"], "parity")
+                self.assertEqual(result["quality"], "unverified")
+                self.assertEqual(len(timed), int(enabled))
+                self.assertFalse(checks.benchmark_qualified(result))
+                self.assertEqual(
+                    json.loads((directory / "parity.json").read_text())["failed"], 1
+                )
+                if enabled:
+                    points = json.loads(
+                        (directory / "measured-long-results.json").read_text()
+                    )
+                    self.assertEqual(points[0]["status"], "unqualified-parity")
+                    self.assertFalse(result["performance_qualified"])
+
     def test_candidate_crash_and_numerical_failure_are_distinct(self):
         checks = load("checks", "feature_checks.py")
         for phase in ("candidate", "parity"):

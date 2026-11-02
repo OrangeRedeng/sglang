@@ -51,6 +51,9 @@ class TestBdeOvernight(CustomTestCase):
                     "prefix99",
                     "--long-warmup",
                     "once",
+                    "--long-dcp-size",
+                    "1",
+                    "--diagnostic-megamoe",
                 ],
             ),
             patch.object(module.time, "time", return_value=1000),
@@ -61,6 +64,8 @@ class TestBdeOvernight(CustomTestCase):
         self.assertEqual(float(command[command.index("--deadline-unix") + 1]), 35200)
         self.assertEqual(command[command.index("--long-warmup") + 1], "once")
         self.assertEqual(command[command.index("--long-cache-modes") + 1], "prefix99")
+        self.assertEqual(command[command.index("--dcp") + 1], "1")
+        self.assertIn("--diagnostic-megamoe", command)
 
     def test_overnight_long_plan_uses_explicit_capacity_and_matched_workloads(self):
         module = self.runner()

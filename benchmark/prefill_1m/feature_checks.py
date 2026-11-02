@@ -121,11 +121,21 @@ def evidence(log):
     return events
 
 
+class ParityError(AssertionError):
+    def __init__(self, report):
+        self.report = report
+        first = report["failures"][0]
+        super().__init__(
+            f"input logprob parity failed: {first['reference']} versus {first['actual']}"
+        )
+
+
 def compare_responses(reference, actual, atol=0.01, rtol=0.01):
     if len(reference) != len(actual):
         raise AssertionError("parity response count differs")
     errors = []
-    for before, after in zip(reference, actual):
+    failures, failed = [], 0
+    for response_index, (before, after) in enumerate(zip(reference, actual)):
         if "meta_info" not in before:
             continue
         a = before["meta_info"].get("input_token_logprobs")
@@ -133,7 +143,7 @@ def compare_responses(reference, actual, atol=0.01, rtol=0.01):
         if not a or not b or len(a) != len(b):
             raise AssertionError("teacher-forced input logprobs missing or mismatched")
         compared = 0
-        for left, right in zip(a, b):
+        for token_index, (left, right) in enumerate(zip(a, b)):
             if left[0] is None and right[0] is None:
                 continue
             if left[1] != right[1] or left[0] is None or right[0] is None:
@@ -143,14 +153,29 @@ def compare_responses(reference, actual, atol=0.01, rtol=0.01):
                 raise AssertionError("non-finite logprob")
             error = abs(x - y)
             if error > atol + rtol * abs(x):
-                raise AssertionError(f"input logprob parity failed: {x} versus {y}")
+                failed += 1
+                if len(failures) < 32:
+                    failures.append(
+                        dict(
+                            response_index=response_index,
+                            token_index=token_index,
+                            token_id=left[1],
+                            reference=x,
+                            actual=y,
+                            abs_error=error,
+                            tolerance=atol + rtol * abs(x),
+                        )
+                    )
             errors.append(error)
             compared += 1
         if not compared:
             raise AssertionError("no comparable teacher-forced logprobs")
     if not errors:
         raise AssertionError("no numerical parity evidence")
-    return dict(compared=len(errors), max_abs_error=max(errors), atol=atol, rtol=rtol)
+    report = dict(compared=len(errors), max_abs_error=max(errors), atol=atol, rtol=rtol)
+    if failed:
+        raise ParityError(dict(report, failed=failed, failures=failures))
+    return report
 
 
 def bounded_log(text, max_lines=180):

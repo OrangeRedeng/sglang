@@ -298,6 +298,8 @@ for mode in (1, 2, 3):
     }
 # GLM5.2 A3 EP16, dispatch capacity 4096: native tiling requires at least 603 MiB.
 SCENARIOS["megamoe"]["env"]["DEEPEP_HCCL_BUFFSIZE"] = "768"
+SCENARIOS["moe-baseline"] = {"separate_shared": True}
+SCENARIOS["moe-ep-baseline"] = {"separate_shared": True, "unfused_ep": True}
 SCENARIOS["indexer-int8"].update(expected=["indexer-int8"], probe="indexer-int8")
 SCENARIOS["indexer-query-shard"]["expected"] = ["indexer-query-shard"]
 for name in ("graph-full", "graph-piecewise"):
@@ -611,6 +613,15 @@ def server_command(args, scenario):
             str(args.tp),
             "--deepep-mode",
             "low_latency",
+        ]
+    if scenario.get("unfused_ep"):
+        command += [
+            "--moe-a2a-backend",
+            "deepep",
+            "--ep-size",
+            str(args.tp),
+            "--deepep-mode",
+            "normal",
         ]
     if scenario.get("dcp"):
         command += ["--dcp-size", str(args.dcp)]
@@ -948,19 +959,38 @@ def validate_serving(args, case, directory, case_env, base_env):
         (directory / "exception.log").write_text(traceback.format_exc())
         return serving_failure(exc, directory, "candidate")
     responses = json.loads((directory / "responses.json").read_text())
+    diagnostic = False
     try:
         result["parity"] = compare_responses(
             _REFERENCE_RESPONSES[reference_key], responses
         )
     except AssertionError as exc:
-        return dict(result, status="fail", failure_phase="parity", error=str(exc))
-    result["quality"] = "verified"
-    if result["status"] != "inactive" and (
-        scenario.get("expected") or not scenario or case["id"].endswith("-baseline")
+        result.update(status="fail", failure_phase="parity", error=str(exc))
+        (directory / "parity.json").write_text(
+            json.dumps(getattr(exc, "report", dict(error=str(exc))), indent=2)
+        )
+        diagnostic = (
+            getattr(args, "diagnostic_megamoe", False)
+            and scenario.get("fuseep") == 3
+            and result.get("activation") == "verified"
+            and case["stage"] == "long"
+        )
+        if not diagnostic:
+            return result
+    if not diagnostic:
+        result["quality"] = "verified"
+    if (
+        not diagnostic
+        and result["status"] != "inactive"
+        and (
+            scenario.get("expected") or not scenario or case["id"].endswith("-baseline")
+        )
     ):
         result["status"] = "pass"
     if case["stage"] in ("small", "long"):
-        if not benchmark_qualified(result, baseline=case["id"].endswith("-baseline")):
+        if not diagnostic and not benchmark_qualified(
+            result, baseline=case["id"].endswith("-baseline")
+        ):
             return dict(result, benchmark="blocked: activation and parity required")
         measured = directory / "measured"
         measured.mkdir()
@@ -983,6 +1013,15 @@ def validate_serving(args, case, directory, case_env, base_env):
             )
             result.update(failure_phase="benchmark", error=str(exc))
         result["benchmarks"] = timed.get("benchmarks", [])
+        if diagnostic:
+            result["performance_qualified"] = False
+            for point in result["benchmarks"]:
+                point["validation_status"] = point["status"]
+                point["status"] = "unqualified-parity"
+                point["quality"] = "unverified"
+            completed = measured / "long-results.json"
+            if completed.exists():
+                completed.write_text(json.dumps(result["benchmarks"], indent=2))
         if timed["status"] in ("capacity_blocked", "fail"):
             result["status"] = timed["status"]
         for artifact in measured.iterdir():
@@ -1392,6 +1431,11 @@ def main():
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument(
+        "--diagnostic-megamoe",
+        action="store_true",
+        help="Measure activated MegaMoE after parity failure; retain failure and mark timings unqualified.",
+    )
     parser.add_argument(
         "--w8a8-model-path",
         type=Path,

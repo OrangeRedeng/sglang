@@ -14,7 +14,7 @@ scratch=$(mktemp -d /tmp/sglang-a3-retest.XXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 
 docker exec -w "$repo" "$container" git log -1 --format='%H %s' | tee "$out/commit.txt"
-docker exec -w "$repo" "$container" git diff --stat > "$out/source-diff.txt"
+docker exec -w "$repo" "$container" git diff --binary HEAD > "$out/source-diff.txt"
 docker exec "$container" npu-smi info > "$out/npu-smi-before.txt"
 args=(--feature-kv-rows 8192 --chunk 16384)
 if [[ -n ${W8A8_MODEL_PATH:-} ]]; then
@@ -28,6 +28,14 @@ case "$mode" in
   megamoe)
     args+=(--features-only --feature-stages serve --feature-cases serve-baseline,serve-megamoe
            --max-hours 1 --feature-timeout 3600)
+    ;;
+  megamoe-measure)
+    args+=(--features-only --feature-stages long --diagnostic-megamoe
+           --long-variants moe-baseline,moe-ep-baseline,megamoe --long-dcp-size 1
+           --length 1024 --long-lengths 1024 --long-concurrency 1,2 --long-requests 2
+           --long-cache-modes cold,prefix99 --long-warmup once
+           --long-kv-rows 8192 --context 8192 --chunk 4096 --repeats 3
+           --max-hours 2 --feature-timeout 7200)
     ;;
   fix-check)
     args+=(--features-only --feature-stages serve,long
@@ -61,7 +69,7 @@ case "$mode" in
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|megamoe|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|megamoe|megamoe-measure|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"
@@ -75,6 +83,16 @@ code=$?
 set -e
 docker exec "$container" npu-smi info > "$out/npu-smi-after.txt" || true
 cp "$out/driver.log" "$out/driver-snapshot.log"
+python3 - "$out" <<'PYLOGS'
+import json
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+empty = [path for path in sorted(root.rglob("*")) if path.is_file() and path.stat().st_size == 0]
+(root / "removed-empty-files.json").write_text(json.dumps([str(path.relative_to(root)) for path in empty], indent=2) + "\n")
+for path in empty:
+    path.unlink()
+PYLOGS
 tar -czf "$out.tar.gz" --exclude="$(basename "$out")/driver.log" \
   -C "$(dirname "$out")" "$(basename "$out")"
 printf 'Runner exit: %s\nResults: %s/results/SUMMARY.md\nArchive: %s.tar.gz\n' "$code" "$out" "$out"

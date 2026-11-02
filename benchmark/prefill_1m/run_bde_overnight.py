@@ -474,6 +474,8 @@ class ContainerJob:
                 f"Container worker exited: {self.process.poll()}; see worker.log"
             )
         result = json.loads(line)
+        self.log.write(json.dumps(dict(worker_response=result)) + "\n")
+        self.log.flush()
         if result["status"] == "error":
             raise RuntimeError(result["error"])
         return result
@@ -529,6 +531,8 @@ def main():
     parser.add_argument("--long-lengths", default="32768,1000000")
     parser.add_argument("--long-concurrency", default="1,2")
     parser.add_argument("--long-requests", type=int, default=2)
+    parser.add_argument("--long-dcp-size", type=int, choices=(1, 16), default=16)
+    parser.add_argument("--diagnostic-megamoe", action="store_true")
     parser.add_argument("--long-cache-modes", default="cold,prefix99")
     parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
     parser.add_argument("--max-hours", type=float)
@@ -675,6 +679,11 @@ def main():
         if args.w8a8_checkpoint:
             feature_commands[stage] += ["--w8a8-model-path", args.w8a8_checkpoint]
         if stage == "long":
+            feature_commands[stage][feature_commands[stage].index("--dcp") + 1] = str(
+                args.long_dcp_size
+            )
+            if args.diagnostic_megamoe:
+                feature_commands[stage] += ["--diagnostic-megamoe"]
             feature_commands[stage][
                 feature_commands[stage].index("--context-length") + 1
             ] = str(args.context)
@@ -848,6 +857,17 @@ def main():
                     )
                     if stage == "serve":
                         qualification = report_cases(report)
+                        for case in qualification.values():
+                            if case.get("stage") == "serve":
+                                records.append(
+                                    dict(
+                                        case=case["id"],
+                                        status=case["status"],
+                                        activation=case.get("activation"),
+                                        quality=case.get("quality"),
+                                        reason=case.get("reason", case.get("error")),
+                                    )
+                                )
                     else:
                         for case in report_cases(report).values():
                             if case.get("stage") == "long":
