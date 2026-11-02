@@ -29,6 +29,174 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_dcp_cache_geometry_and_chunk_aware_probe(self):
+        checks = load("cache_geometry", "feature_checks.py")
+        info = dict(
+            page_size=128,
+            dcp_size=16,
+            chunked_prefill_size=16384,
+            context_length=1048576,
+        )
+        self.assertEqual(checks.cache_page_size(info), 2048)
+        self.assertEqual(checks.minimum_cached_prefix(990000, info), 989184)
+        self.assertEqual(checks.dcp_probe_lengths(info), (18432, 1024, 16384))
+        prime, cached = list(checks.dcp_probe_payloads(info))
+        from sglang.srt.managers.schedule_batch import Req
+
+        request_state = SimpleNamespace(
+            dllm_config=None,
+            return_logprob=True,
+            logprob_start_len=0,
+            is_dllm=lambda: False,
+        )
+        self.assertEqual(
+            Req._compute_max_prefix_len(request_state, len(cached["input_ids"])), 0
+        )
+        request_state.logprob_start_len = cached["logprob_start_len"]
+        self.assertEqual(
+            Req._compute_max_prefix_len(request_state, len(cached["input_ids"])),
+            len(prime["input_ids"]),
+        )
+        self.assertEqual(prime["logprob_start_len"], 0)
+        self.assertEqual(cached["logprob_start_len"], len(prime["input_ids"]))
+        self.assertGreater(
+            cached["logprob_start_len"],
+            checks.minimum_cached_prefix(len(prime["input_ids"]), info),
+        )
+        self.assertEqual(len(cached["input_ids"]) - len(prime["input_ids"]), 1024)
+        short = dict(info, chunked_prefill_size=4096, context_length=8192)
+        self.assertEqual(checks.dcp_probe_lengths(short), (6144, 1024, 4096))
+        with self.assertRaises(ValueError):
+            checks.cache_page_size({"page_size": 128})
+        with self.assertRaises(ValueError):
+            checks.dcp_probe_lengths(dict(short, context_length=4096))
+
+    def test_failed_cached_validation_keeps_raw_timing_and_completed_cold_point(self):
+        bench_path = str(ROOT / "benchmark/prefill_1m")
+        with patch.object(sys, "path", [bench_path, *sys.path]):
+            bench = load("sample_retention", "feature_benchmarks.py")
+        args = SimpleNamespace(
+            long_lengths=[10000],
+            long_concurrency=[1],
+            long_requests=1,
+            benchmark_repeats=2,
+            context_length=10032,
+            request_timeout=30,
+            long_warmup="once",
+        )
+        state = {"primed": False}
+
+        def request(url, *args, **kwargs):
+            if url.endswith("/get_server_info"):
+                return {
+                    "page_size": 128,
+                    "dcp_size": 16,
+                    "max_total_num_tokens": 1000000,
+                }
+            state["primed"] = False
+
+        def send(base, ids, *args):
+            cached = 6144 if state["primed"] and len(ids) == 10000 else 0
+            if len(ids) == 9900:
+                state["primed"] = True
+            return dict(
+                ttft_s=42.0, e2e_s=43.0, cached_tokens=cached, prompt_tokens=len(ids)
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "config.json").write_text(json.dumps({"vocab_size": 2048}))
+            with (
+                patch.object(bench, "run_one", side_effect=send),
+                self.assertRaisesRegex(RuntimeError, "cached only"),
+            ):
+                bench.long_matrix(args, "local", request, directory, directory)
+            samples = json.loads(
+                (directory / "long-10000-1-prefix99-samples.json").read_text()
+            )
+            self.assertEqual(samples[0]["requests"][0]["ttft_s"], 42.0)
+            self.assertEqual(samples[0]["validation_status"], "fail")
+            cold = json.loads((directory / "long-results.json").read_text())
+            self.assertEqual(len(cold), 1)
+            self.assertEqual(cold[0]["cache"], "cold")
+            self.assertEqual(cold[0]["status"], "pass")
+
+    def test_timed_failure_returns_completed_points_to_summary(self):
+        harness = load("partial_results", "test_glm53_features.py")
+        checks = load("partial_checks", "feature_checks.py")
+        args = SimpleNamespace(
+            model_path="weights",
+            checkpoint_format="modelslim",
+            tp=16,
+            dcp=16,
+            context_length=1048576,
+            chunk=16384,
+            mem_fraction=0.88,
+            port=31000,
+        )
+        case = dict(
+            id="long-dcp-baseline",
+            stage="long",
+            scenario={"dcp": True},
+            checkpoint_path="weights",
+            checkpoint_format="modelslim",
+        )
+        response = [{"meta_info": {"input_token_logprobs": [[None, 1], [0.2, 2]]}}]
+        point = {"length": 1000000, "cache": "cold", "status": "pass"}
+
+        def serve(args, case, destination, env):
+            (destination / "responses.json").write_text(json.dumps(response))
+            if case["stage"] == "long":
+                (destination / "long-results.json").write_text(json.dumps([point]))
+                raise RuntimeError("fixture cached phase failed")
+            return dict(status="smoke_pass", activation="unverified", missing=[])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(harness, "serve", side_effect=serve),
+                patch.object(
+                    sys, "path", [str(ROOT / "benchmark/prefill_1m"), *sys.path]
+                ),
+                patch.dict(sys.modules, feature_checks=checks),
+            ):
+                result = harness.validate_serving(args, case, Path(temporary), {}, {})
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["failure_phase"], "benchmark")
+            self.assertEqual(result["benchmarks"], [point])
+            self.assertTrue((Path(temporary) / "measured-exception.log").exists())
+
+    def test_megamoe_comm_buffer_override_reaches_moe_but_not_dcp_group(self):
+        from sglang.srt.distributed import parallel_state
+
+        matrix = load("megamoe_buffer", "test_glm53_features.py")
+        megamoe = matrix.SCENARIOS["megamoe"]["env"]
+        self.assertEqual(megamoe["DEEPEP_HCCL_BUFFSIZE"], "768")
+        self.assertNotIn("DEEPEP_HCCL_BUFFSIZE", matrix.SCENARIOS["fuseep-1"]["env"])
+        native = SimpleNamespace(
+            _C=SimpleNamespace(
+                _distributed_c10d=SimpleNamespace(
+                    ProcessGroupHCCL=SimpleNamespace(Options=lambda: SimpleNamespace())
+                )
+            )
+        )
+        with (
+            patch.object(parallel_state, "_is_npu", True),
+            patch.dict(sys.modules, {"torch_npu": native}),
+            patch.dict("os.environ", dict(megamoe, HCCL_BUFFSIZE="200")),
+        ):
+            self.assertEqual(
+                parallel_state.get_torch_distributed_pg_options("moe_ep").hccl_config[
+                    "hccl_buffer_size"
+                ],
+                768,
+            )
+            self.assertEqual(
+                parallel_state.get_torch_distributed_pg_options("dcp").hccl_config[
+                    "hccl_buffer_size"
+                ],
+                200,
+            )
+
     def test_long_context_flush_accepts_text_and_metadata_stays_json(self):
         matrix = load("long_http", "test_glm53_features.py")
         opener = MagicMock()

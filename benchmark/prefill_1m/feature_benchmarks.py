@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from bench_glm53_prefill_1m import run_one
+from feature_checks import cache_page_size, minimum_cached_prefix
 
 
 class CapacityBlocked(RuntimeError):
@@ -92,6 +93,7 @@ def long_matrix(args, base, request, checkpoint, directory):
         raise ValueError("invalid model vocabulary")
     server_info = request(base + "/get_server_info")
     (directory / "server_info.json").write_text(json.dumps(server_info, indent=2))
+    page = cache_page_size(server_info)
     capacity = limits(server_info)
     if capacity["max_total_num_tokens"] is None:
         raise CapacityBlocked("server did not expose KV token capacity")
@@ -105,7 +107,7 @@ def long_matrix(args, base, request, checkpoint, directory):
             )
             continue
         for concurrency in args.long_concurrency:
-            for cache in ("cold", "prefix99"):
+            for cache in getattr(args, "long_cache_modes", ("cold", "prefix99")):
                 # Prime + suffixes share physical prefix KV pages in prefix99 mode.
                 required = (
                     concurrency * (length + 1) + 4096
@@ -156,26 +158,44 @@ def long_matrix(args, base, request, checkpoint, directory):
                             )
                         )
                     wall = time.perf_counter() - start
-                    for item in measured:
-                        if item.get("prompt_tokens") != length:
-                            raise RuntimeError(
-                                f"Expected {length} prompt tokens, got {item.get('prompt_tokens')}"
-                            )
-                        cached = item["cached_tokens"]
-                        if cached is None:
-                            raise RuntimeError(
-                                "cache reuse cannot be verified: cached_tokens missing"
-                            )
-                        if cache == "cold" and cached > max(64, length * 0.001):
-                            raise RuntimeError(f"cold run reused {cached} tokens")
-                        if cache == "prefix99" and cached < max(0, len(prefix) - 128):
-                            raise RuntimeError(
-                                f"prefix run cached only {cached}/{len(prefix)} tokens"
-                            )
-                    samples.append(dict(repeat=repeat, wall_s=wall, requests=measured))
-                    (
+                    sample = dict(
+                        repeat=repeat,
+                        wall_s=wall,
+                        requests=measured,
+                        validation_status="pending",
+                        cache_page_size=page,
+                    )
+                    samples.append(sample)
+                    sample_path = (
                         directory / f"long-{length}-{concurrency}-{cache}-samples.json"
-                    ).write_text(json.dumps(samples, indent=2))
+                    )
+                    # Preserve client timing before a validation error can abort the point.
+                    sample_path.write_text(json.dumps(samples, indent=2))
+                    try:
+                        for item in measured:
+                            if item.get("prompt_tokens") != length:
+                                raise RuntimeError(
+                                    f"Expected {length} prompt tokens, got {item.get('prompt_tokens')}"
+                                )
+                            cached = item["cached_tokens"]
+                            if cached is None:
+                                raise RuntimeError(
+                                    "cache reuse cannot be verified: cached_tokens missing"
+                                )
+                            if cache == "cold" and cached > max(64, length * 0.001):
+                                raise RuntimeError(f"cold run reused {cached} tokens")
+                            if cache == "prefix99" and cached < minimum_cached_prefix(
+                                len(prefix), server_info
+                            ):
+                                raise RuntimeError(
+                                    f"prefix run cached only {cached}/{len(prefix)} tokens"
+                                )
+                        sample["validation_status"] = "verified"
+                    except Exception as exc:
+                        sample.update(validation_status="fail", error=str(exc))
+                        raise
+                    finally:
+                        sample_path.write_text(json.dumps(samples, indent=2))
                 ttft = [r["ttft_s"] for sample in samples for r in sample["requests"]]
                 e2e = [r["e2e_s"] for sample in samples for r in sample["requests"]]
                 results.append(

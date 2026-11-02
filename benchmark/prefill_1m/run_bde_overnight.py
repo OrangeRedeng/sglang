@@ -529,6 +529,7 @@ def main():
     parser.add_argument("--long-lengths", default="32768,1000000")
     parser.add_argument("--long-concurrency", default="1,2")
     parser.add_argument("--long-requests", type=int, default=2)
+    parser.add_argument("--long-cache-modes", default="cold,prefix99")
     parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
     parser.add_argument("--max-hours", type=float)
     parser.add_argument("--long-kv-rows", type=int, default=131072)
@@ -689,6 +690,8 @@ def main():
                 args.long_concurrency,
                 "--long-requests",
                 str(args.long_requests),
+                "--long-cache-modes",
+                args.long_cache_modes,
                 "--long-warmup",
                 args.long_warmup,
                 "--benchmark-repeats",

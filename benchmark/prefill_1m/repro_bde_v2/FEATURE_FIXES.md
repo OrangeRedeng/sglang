@@ -1,5 +1,7 @@
 # GLM A3 feature-fix validation
 
+[Current cached-prefix/MegaMoE repair and short commands](REPAIR_CHECK_20261102.md).
+
 [Verified baseline and full overnight 1M queue](OVERNIGHT_1M_20261102.md).
 
 Latest collected-run analysis and staged retest instructions:

@@ -296,6 +296,8 @@ for mode in (1, 2, 3):
         "separate_shared": True,
         "env": {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
     }
+# GLM5.2 A3 EP16, dispatch capacity 4096: native tiling requires at least 603 MiB.
+SCENARIOS["megamoe"]["env"]["DEEPEP_HCCL_BUFFSIZE"] = "768"
 SCENARIOS["indexer-int8"].update(expected=["indexer-int8"], probe="indexer-int8")
 SCENARIOS["indexer-query-shard"]["expected"] = ["indexer-query-shard"]
 for name in ("graph-full", "graph-piecewise"):
@@ -691,22 +693,28 @@ def serve(args, case, directory, env):
                     raise RuntimeError(f"empty chat response: {chat}")
                 responses.append(chat)
             if scenario.get("dcp"):
-                prefix = [1] * 6144
-                for ids in (prefix, prefix + [2] * 32):
-                    responses.append(
-                        request(
-                            base + "/generate",
-                            {
-                                "input_ids": ids,
-                                "sampling_params": {
-                                    "temperature": 0,
-                                    "max_new_tokens": 1,
-                                },
-                                "return_logprob": True,
-                                "logprob_start_len": 0,
-                            },
-                            args.request_timeout,
-                        )
+                from feature_checks import dcp_probe_lengths, dcp_probe_payloads
+
+                probe_info = request(base + "/get_server_info")
+                prefix_len, suffix_len, expected_cached = dcp_probe_lengths(probe_info)
+                for payload in dcp_probe_payloads(probe_info):
+                    response = request(
+                        base + "/generate", payload, args.request_timeout
+                    )
+                    responses.append(response)
+                cached = response.get("meta_info", {}).get("cached_tokens")
+                probe = dict(
+                    prefix_tokens=prefix_len,
+                    suffix_tokens=suffix_len,
+                    minimum_cached_tokens=expected_cached,
+                    cached_tokens=cached,
+                )
+                (directory / "dcp-prefix-probe.json").write_text(
+                    json.dumps(probe, indent=2)
+                )
+                if cached is None or cached < expected_cached:
+                    raise RuntimeError(
+                        f"DCP activation probe did not reuse its aligned prefix: {probe}"
                     )
             from concurrent.futures import ThreadPoolExecutor
 
@@ -964,9 +972,19 @@ def validate_serving(args, case, directory, case_env, base_env):
         except CapacityBlocked as exc:
             timed = dict(status="capacity_blocked", reason=str(exc))
             result["reason"] = str(exc)
+        except Exception as exc:
+            (measured / "exception.log").write_text(traceback.format_exc())
+            completed = measured / "long-results.json"
+            timed = dict(
+                status="fail",
+                benchmarks=json.loads(completed.read_text())
+                if completed.exists()
+                else [],
+            )
+            result.update(failure_phase="benchmark", error=str(exc))
         result["benchmarks"] = timed.get("benchmarks", [])
-        if timed["status"] == "capacity_blocked":
-            result["status"] = "capacity_blocked"
+        if timed["status"] in ("capacity_blocked", "fail"):
+            result["status"] = timed["status"]
         for artifact in measured.iterdir():
             artifact.rename(directory / ("measured-" + artifact.name))
         measured.rmdir()
@@ -1433,6 +1451,9 @@ def main():
         default=[1, 16],
     )
     parser.add_argument("--long-requests", type=int, default=16)
+    parser.add_argument(
+        "--long-cache-modes", type=lambda s: s.split(","), default=["cold", "prefix99"]
+    )
     parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
     parser.add_argument("--deadline-unix", type=float)
     parser.add_argument("--benchmark-repeats", type=int, default=3)
@@ -1443,6 +1464,12 @@ def main():
         "--probe-feature", choices=tuple(SCENARIOS), help=argparse.SUPPRESS
     )
     args = parser.parse_args()
+    if (
+        not args.long_cache_modes
+        or set(args.long_cache_modes) - {"cold", "prefix99"}
+        or len(set(args.long_cache_modes)) != len(args.long_cache_modes)
+    ):
+        parser.error("--long-cache-modes must select unique cold,prefix99 modes")
     if args.kv_rows is not None and args.kv_rows <= 0:
         parser.error("--kv-rows must be positive")
     if args.self_check_workloads:
@@ -1709,7 +1736,8 @@ def main():
                         result.get("quality") == "verified"
                         and result.get("activation") == "verified"
                         and not result.get("missing")
-                        and result.get("failure_phase") not in ("parity", "components")
+                        and result.get("failure_phase")
+                        not in ("parity", "components", "benchmark")
                     )
                 else:
                     code = run(

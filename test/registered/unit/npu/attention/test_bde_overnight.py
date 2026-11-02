@@ -47,6 +47,8 @@ class TestBdeOvernight(CustomTestCase):
                     "long",
                     "--max-hours",
                     "9.5",
+                    "--long-cache-modes",
+                    "prefix99",
                     "--long-warmup",
                     "once",
                 ],
@@ -58,6 +60,7 @@ class TestBdeOvernight(CustomTestCase):
         command = json.loads(output.getvalue())["feature_commands"]["long"]
         self.assertEqual(float(command[command.index("--deadline-unix") + 1]), 35200)
         self.assertEqual(command[command.index("--long-warmup") + 1], "once")
+        self.assertEqual(command[command.index("--long-cache-modes") + 1], "prefix99")
 
     def test_overnight_long_plan_uses_explicit_capacity_and_matched_workloads(self):
         module = self.runner()

@@ -25,6 +25,17 @@ case "$mode" in
     args+=(--feature-stages serve --feature-cases serve-baseline --variants baseline --repeats 1
            --requests 2 --moe-length 1024 --moe-output-len 16 --moe-kv-rows 8192)
     ;;
+  megamoe)
+    args+=(--features-only --feature-stages serve --feature-cases serve-baseline,serve-megamoe
+           --max-hours 1 --feature-timeout 3600)
+    ;;
+  fix-check)
+    args+=(--features-only --feature-stages serve,long
+           --feature-cases serve-baseline,serve-megamoe,serve-dcp-packed-read,serve-dcp-gather-prefetch,serve-dcp-sfa-overlap
+           --long-variants dcp-baseline --long-lengths 1000000 --long-concurrency 1
+           --long-requests 1 --long-cache-modes prefix99 --long-warmup once
+           --long-kv-rows 81920 --repeats 3 --max-hours 2 --feature-timeout 7200)
+    ;;
   moe)
     args+=(--feature-cases 'serve-baseline,serve-multistream,serve-auto-stream-thresholds,serve-auto-hccl,serve-autotune-hccl'
            --variants baseline,multistream,auto-stream-thresholds,auto-hccl,autotune-hccl --repeats 3)
@@ -50,7 +61,7 @@ case "$mode" in
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|megamoe|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"

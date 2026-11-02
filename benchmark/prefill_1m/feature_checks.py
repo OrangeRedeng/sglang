@@ -7,6 +7,46 @@ import re
 from pathlib import Path
 
 
+def cache_page_size(info):
+    resolved = info.get("server_args", info)
+    page, dcp = resolved.get("page_size"), resolved.get("dcp_size")
+    if not isinstance(page, int) or not isinstance(dcp, int) or min(page, dcp) < 1:
+        raise ValueError(
+            "Resolved page_size and dcp_size are required for cache validation"
+        )
+    return page * dcp
+
+
+def minimum_cached_prefix(prefix_tokens, info):
+    page = cache_page_size(info)
+    # Sampling can leave the final input token out of the reusable radix key.
+    return max(0, prefix_tokens - 1) // page * page
+
+
+def dcp_probe_lengths(info):
+    resolved = info.get("server_args", info)
+    page = cache_page_size(info)
+    chunk, context = resolved["chunked_prefill_size"], resolved["context_length"]
+    prefix, suffix = chunk + page, max(32, page // 2)
+    if chunk < 1 or prefix + suffix + 1 > context:
+        raise ValueError(
+            "DCP activation probe needs room for a full chunk and cached suffix"
+        )
+    return prefix, suffix, minimum_cached_prefix(prefix, info)
+
+
+def dcp_probe_payloads(info):
+    prefix_len, suffix_len, _ = dcp_probe_lengths(info)
+    prefix = [1] * prefix_len
+    for ids, logprob_start in ((prefix, 0), (prefix + [2] * suffix_len, prefix_len)):
+        yield {
+            "input_ids": ids,
+            "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            "return_logprob": True,
+            "logprob_start_len": logprob_start,
+        }
+
+
 def checkpoint_identity(model_path):
     root = Path(model_path)
     hashes = {}
@@ -209,9 +249,11 @@ def self_check_workloads():
         def request(url, *args, **kwargs):
             if url.endswith("/get_server_info"):
                 return {
+                    "page_size": 128,
+                    "dcp_size": 1,
                     "internal_states": [
                         {"max_total_num_tokens": 10000, "max_req_input_len": 1032}
-                    ]
+                    ],
                 }
             state["prefix"] = []
             state["flushed"] += 1
