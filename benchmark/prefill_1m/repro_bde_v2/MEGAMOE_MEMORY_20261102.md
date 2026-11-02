@@ -8,9 +8,12 @@ This is different from the earlier HCCL buffer-capacity failure.
 
 ## Changes
 
-The pilot uses dispatch capacity 1024 instead of 4096, with chunk 1024 on both
-baseline and MegaMoE. Lowering dispatch capacity is intended to reduce the
-operator's capacity-dependent workspace; the actual workspace reduction requires
+The pilot uses per-rank dispatch capacity 1024 instead of 4096, with global
+scheduler chunk 16384 on both baseline and MegaMoE. Under the ordinary padded
+TP16 sparse-MoE layout, row sharding maps that chunk to 1024 input rows per rank.
+The existing runtime guard still rejects actual input rows above capacity.
+Lowering dispatch capacity is intended to reduce the operator's capacity-dependent
+workspace; the actual workspace reduction requires
 A3 verification. HCCL remains 768 MB. Weight packing, compensation, quantization
 and parity tolerances are unchanged. This is a memory mitigation experiment,
 not a verified numerical or workspace fix.
@@ -27,8 +30,8 @@ is excluded from TTFT; queueing is included. TPOT is undefined.
 | Launcher mode | Input tokens | Local KV slots | Aggregate KV slots | Chunk / MegaMoE dispatch | Variants |
 |---|---:|---:|---:|---|---|
 | baseline-repro | 1,000,000 | 81,920 | 1,310,720 | 16,384 / unused | dcp-baseline |
-| megamoe-500k | 500,000 | 39,936 | 638,976 | 1,024 / 1,024 | moe-baseline, megamoe |
-| megamoe-measure | 1,000,000 | 74,752 | 1,196,032 | 1,024 / 1,024 | moe-baseline, megamoe |
+| megamoe-500k | 500,000 | 39,936 | 638,976 | 16,384 / 1,024 | moe-baseline, megamoe |
+| megamoe-measure | 1,000,000 | 74,752 | 1,196,032 | 16,384 / 1,024 | moe-baseline, megamoe |
 
 At DCP16 the effective page is 2048 tokens. For 1M, the reusable prefix is 989184;
 16 suffixes each need 12288 slots. Required capacity including 4096 headroom is
@@ -45,8 +48,9 @@ new logs must confirm actual memory and operator workspace.
 removing the chunk-4096/separate-shared changes from the 79.54 s run. It targets
 the earlier 24.589 s workload, but cannot promise that latency: current source,
 client and hardware conditions differ from the historical measurement. Its result
-must not be used as a matched speedup denominator for chunk-1024 MegaMoE. The
-`moe-baseline` inside each MegaMoE profile is the matched comparison.
+differs from the MegaMoE comparison in shared-expert policy and KV sizing. The
+`moe-baseline` inside each MegaMoE profile is the matched comparison; the
+historical 24.589 s latency is not guaranteed.
 
 ## Execution order
 
@@ -65,7 +69,7 @@ screen -dmS "a3-megamoe-500k-$(date +%Y%m%d-%H%M%S)" bash /tmp/start_a3_retest.s
 
 Use `baseline-repro` for a separate historical-baseline reproduction, or
 `megamoe-measure` for the trimmed 1M pilot. Each profile has a two-hour budget;
-smaller chunks can increase warmup/priming time substantially. The 500k run is
+warmup/priming and full-weight reloads dominate the short test. The 500k run is
 intended to be the first memory test, not proof that the 1M path will fit.
 
 MegaMoE remains failed/unqualified if the existing parity test fails. Diagnostic
@@ -73,3 +77,18 @@ TTFT may then be recorded as `unqualified-parity`; it does not establish an
 accepted optimization. Preserve SUMMARY.md, full raw server logs, runtime
 identities, resolved arguments, sample token counts, peak memory evidence and
 parity.json before deciding the next step.
+
+## Verify the per-rank shape
+
+Qualification logs now emit `megamoe-input-rows-<N>` before buffer creation and
+native execution. Each distinct row count is logged once per process with
+input_shape, dispatch_capacity, ep_size and moe_tp_size. This diagnostic metadata
+is not activation evidence: `megamoe` is recorded only after a successful native
+call. The full-chunk probe should show input_shape [1024, 6144], capacity 1024.
+If another topology produces more rows, the guard fails before DeepEP buffer
+creation; retain the logs rather than increasing capacity blindly.
+
+The old A3 workspace formula predicts approximately 4.52 GiB for capacity 1024,
+versus the observed 18.02 GiB at 4096. This keeps a large scheduler chunk while
+reducing capacity-driven workspace, without changing native kernels or relaxing
+parity. Verify these predictions on the target device.

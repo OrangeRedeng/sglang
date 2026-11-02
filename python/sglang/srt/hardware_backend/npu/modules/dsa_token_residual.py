@@ -16,6 +16,33 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_forward, get_parallel
 
 
+def supports_token_sharded_ep(parallel, backend, fuseep_mode):
+    return (
+        backend.is_ascend_fuseep()
+        and fuseep_mode == 3
+        and parallel.moe_tp_size == 1
+        and parallel.moe_ep_size
+        == parallel.attn_tp_size
+        == parallel.attn_dcp_size
+        == 16
+        and parallel.moe_ep_group.ranks == parallel.attn_tp_group.ranks
+    )
+
+
+def forward_token_sharded_ep(layer, hidden, batch, input_ids_global=None):
+    # Match the TP path's input quantization without gathering other ranks' rows.
+    if hidden.shape[0]:
+        import torch_npu
+
+        quantized, scale = torch_npu.npu_dynamic_quant(hidden, dst_type=torch.int8)
+        hidden = quantized.to(hidden.dtype) * scale.unsqueeze(-1).to(hidden.dtype)
+    output = layer.forward_deepep(hidden, batch, input_ids_global=input_ids_global)
+    if output.shape != hidden.shape:
+        raise RuntimeError("Token-sharded EP must preserve this rank's input rows")
+    record("dsa-ep-moe-local")
+    return output
+
+
 def pad_extend_batch(batch, runner):
     """Align the complete token grid before eager buffers and KV metadata are built."""
     parallel = get_parallel()
@@ -146,7 +173,8 @@ def decoder_forward(
         if layer.is_layer_sparse
         else layer.mlp.down_proj.reduce_results
     )
-    if not reduce_results:
+    ep_local = layer.is_layer_sparse and getattr(layer.mlp, "_enable_a2a_moe", False)
+    if not reduce_results and not ep_local:
         output = dsa_cp_reduce_scatter_tokens(output)
     if output.shape[0] != plan.rows:
         raise RuntimeError("DSA-CP FFN must return this rank's local residual rows")

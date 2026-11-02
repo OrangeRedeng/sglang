@@ -57,6 +57,7 @@ DCP_VARIANTS = (
     "dcp-stream-o-proj",
     "dcp-decode-q-preissue",
     "bde-v2",
+    "historical-bde",
 )
 MOE_VARIANTS = (
     "baseline",
@@ -72,6 +73,9 @@ MOE_VARIANTS = (
     "fuseep-1",
     "fuseep-2",
     "megamoe",
+    "indexer-fp16",
+    "moe-stream-auto",
+    "moe-fused-combined",
 )
 VARIANTS = DCP_VARIANTS + MOE_VARIANTS
 
@@ -203,7 +207,23 @@ def ais_metrics(text, requests):
 
 
 def variant_launch(harness, repo, config):
-    scenario = harness.SCENARIOS[config["variant"]]
+    scenario = harness.scenario_for(
+        config["variant"], config.get("reference_recipe", "ordinary")
+    )
+    config = dict(config)
+    for source, target in (
+        ("chunk", "chunk"),
+        ("mem_fraction", "memfrac"),
+        ("kv_rows", "kv_rows"),
+        ("max_running_requests", "maxreq"),
+        ("context_length", "context"),
+    ):
+        if source in scenario.get("launch_overrides", {}):
+            config[target] = scenario["launch_overrides"][source]
+    if scenario.get("fuseep") == 3:
+        scenario["env"]["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+            config.get("megamoe_dispatch_tokens", 4096)
+        )
     checkpoint = config["checkpoint"]
     if scenario.get("fuseep") in (1, 2):
         checkpoint = config.get("w8a8_checkpoint")
@@ -523,6 +543,9 @@ def main():
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--variants", default=",".join(VARIANTS))
+    parser.add_argument(
+        "--reference-recipe", choices=("ordinary", "historical-bde"), default="ordinary"
+    )
     parser.add_argument("--feature-cases", default="*")
     parser.add_argument(
         "--long-variants",
@@ -634,6 +657,8 @@ def main():
     remote = f"/tmp/sglang-bde-night-{stamp}-{os.getpid()}"
     common = {
         "repo": args.repo,
+        "reference_recipe": args.reference_recipe,
+        "megamoe_dispatch_tokens": args.megamoe_dispatch_tokens,
         "checkpoint": args.checkpoint,
         "w8a8_checkpoint": args.w8a8_checkpoint,
         "chunk": args.chunk,
@@ -658,6 +683,8 @@ def main():
             args.checkpoint,
             "--checkpoint-format",
             "modelslim",
+            "--reference-recipe",
+            args.reference_recipe,
             "--megamoe-dispatch-tokens",
             str(args.megamoe_dispatch_tokens),
             "--tp",
@@ -761,6 +788,15 @@ def main():
             )
         )
         return 0
+
+    def remaining_timeout(limit):
+        if not args.deadline_unix:
+            return limit
+        remaining = args.deadline_unix - time.time()
+        if remaining <= 0:
+            raise TimeoutError("Overnight time budget exhausted")
+        return min(limit, remaining)
+
     require_free_port()
     lock = open("/tmp/sglang-bde-overnight.lock", "w")  # noqa: SIM115 - held for the driver lifetime
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -899,6 +935,16 @@ def main():
             persist()
         if not args.features_only:
             for variant in variants:
+                if args.deadline_unix and time.time() + 900 > args.deadline_unix:
+                    records.append(
+                        dict(
+                            case=variant,
+                            status="budget_blocked",
+                            reason="Less than 15 minutes remain for a complete benchmark",
+                        )
+                    )
+                    persist()
+                    continue
                 gate = qualification.get("serve-" + variant, {})
                 if (
                     gate.get("status") != "pass"
@@ -920,7 +966,7 @@ def main():
                 print(f"AISBench {variant}, {args.repeats} repeats", flush=True)
                 settings = dict(common)
                 variant_ais_args = list(ais_args)
-                if variant in MOE_VARIANTS:
+                if variant in MOE_VARIANTS and args.reference_recipe == "ordinary":
                     settings.update(
                         length=args.moe_length,
                         output_len=args.moe_output_len,
@@ -950,14 +996,14 @@ def main():
                 )
                 phase = "server-startup"
                 try:
-                    job.receive(args.startup_timeout + 30)
+                    job.receive(remaining_timeout(args.startup_timeout + 30))
                     for repeat in range(1, args.repeats + 1):
                         # Each AISBench invocation performs its own prefix prewarm after this flush.
                         phase = f"cache-flush/{repeat}"
                         flushed = http(
                             "/flush_cache?timeout=60",
                             post=True,
-                            timeout=90,
+                            timeout=remaining_timeout(90),
                             expect_json=False,
                         )
                         (folder / f"cache-flush-{repeat}.txt").write_text(flushed)
@@ -982,7 +1028,9 @@ def main():
                                 start_new_session=True,
                             )
                             try:
-                                code = process.wait(timeout=args.benchmark_timeout)
+                                code = process.wait(
+                                    timeout=remaining_timeout(args.benchmark_timeout)
+                                )
                             finally:
                                 stop_owned(process, include_exited=True)
                         if code:

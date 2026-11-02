@@ -29,6 +29,12 @@ case "$mode" in
     args+=(--features-only --feature-stages serve --feature-cases serve-baseline,serve-megamoe
            --max-hours 1 --feature-timeout 3600)
     ;;
+  historical-repro)
+    args+=(--feature-stages serve --reference-recipe historical-bde --feature-cases serve-historical-bde --variants historical-bde
+           --length 1000000 --requests 16 --maxreq 1 --chunk 32768
+           --kv-rows 67584 --context 1048576 --memfrac 0.85 --repeats 1
+           --max-hours 2 --feature-timeout 7200)
+    ;;
   baseline-repro)
     args+=(--features-only --feature-stages long --long-variants dcp-baseline
            --length 1000000 --long-lengths 1000000 --long-concurrency 16 --long-requests 16
@@ -41,7 +47,7 @@ case "$mode" in
            --long-variants moe-baseline,megamoe --long-dcp-size 16
            --length 500000 --long-lengths 500000 --long-concurrency 16 --long-requests 16
            --long-cache-modes prefix99 --long-warmup once --megamoe-dispatch-tokens 1024
-           --long-kv-rows 39936 --context 524288 --chunk 1024 --repeats 1
+           --long-kv-rows 39936 --context 524288 --chunk 16384 --repeats 1
            --max-hours 2 --feature-timeout 7200)
     ;;
   megamoe-measure)
@@ -49,7 +55,7 @@ case "$mode" in
            --long-variants moe-baseline,megamoe --long-dcp-size 16
            --length 1000000 --long-lengths 1000000 --long-concurrency 16 --long-requests 16
            --long-cache-modes prefix99 --long-warmup once
-           --long-kv-rows 74752 --context 1048576 --chunk 1024 --repeats 1
+           --long-kv-rows 74752 --context 1048576 --chunk 16384 --repeats 1
            --megamoe-dispatch-tokens 1024
            --max-hours 2 --feature-timeout 7200)
     ;;
@@ -71,6 +77,15 @@ case "$mode" in
   failures)
     args+=(--features-only --feature-cases 'serve-baseline,serve-w8a8-load,serve-w4a4-mixed-load,serve-online-*,serve-tp-*,serve-indexer-int8,serve-dcp-full-width-q,serve-dcp-legacy-token-shard,serve-dcp-stream-o-proj,serve-bde-v2,serve-graph-*,serve-fuseep-*,serve-megamoe')
     ;;
+  overnight-repair)
+    args+=(--feature-stages host,npu,serve --reference-recipe historical-bde --repeats 1
+           --feature-cases 'serve-baseline,serve-tp-*,serve-indexer-int8,serve-indexer-fp16,serve-megamoe,serve-graph-*,serve-auto-stream-thresholds,serve-auto-hccl,serve-autotune-hccl,serve-moe-stream-auto,serve-moe-fused-combined'
+           --variants 'baseline,megamoe,tp-routed-scale,tp-finalize,tp-prequant,tp-shared,tp-shared-activation,indexer-fp16,auto-stream-thresholds,auto-hccl,autotune-hccl,moe-stream-auto,moe-fused-combined'
+           --length 1000000 --requests 16 --maxreq 1 --chunk 32768
+           --kv-rows 67584 --context 1048576 --memfrac 0.85
+           --megamoe-dispatch-tokens 2048 --startup-timeout 1200
+           --max-hours 9.5 --feature-timeout 34200)
+    ;;
   overnight|overnight-core)
     args+=(--features-only --feature-stages host,npu,serve,long --repeats 3
            --feature-cases 'serve-baseline,serve-tp-*,serve-multistream,serve-auto-stream-thresholds,serve-auto-hccl,serve-autotune-hccl,serve-indexer-int8,serve-indexer-query-shard,serve-fuseep-*,serve-megamoe,serve-moe-stream-auto,serve-moe-fused-combined'
@@ -85,7 +100,7 @@ case "$mode" in
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|megamoe|baseline-repro|megamoe-500k|megamoe-measure|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|megamoe|historical-repro|baseline-repro|megamoe-500k|megamoe-measure|fix-check|moe|dcp|failures|overnight-repair|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"

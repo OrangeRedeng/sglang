@@ -25,6 +25,10 @@ def minimum_cached_prefix(prefix_tokens, info):
 
 def long_working_set(length, concurrency, cache, info):
     page = cache_page_size(info)
+    resolved = info.get("server_args", info)
+    running = resolved.get("max_running_requests")
+    if isinstance(running, int) and running > 0:
+        concurrency = min(concurrency, running)
 
     def rounded(tokens):
         return (tokens + page - 1) // page * page
@@ -37,6 +41,7 @@ def long_working_set(length, concurrency, cache, info):
     required = max(rounded(length + 1), cached + concurrency * request_slots) + 4096
     return dict(
         required_tokens=required,
+        max_active_requests=concurrency,
         cached_prefix_tokens=cached,
         per_request_slots=request_slots,
         cache_page_size=page,

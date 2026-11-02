@@ -51,6 +51,16 @@ def forward_fuseep(
     mode = get_exec().moe.fuseep_mode
     if mode == 3:
         capacity = _mega_moe_capacity()
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        # Report rank-local geometry even if the capacity guard or native op fails.
+        record(
+            f"megamoe-input-rows-{hidden_states.shape[0]}",
+            input_shape=list(hidden_states.shape),
+            dispatch_capacity=capacity,
+            ep_size=getattr(layer, "moe_ep_size", None),
+            moe_tp_size=getattr(layer, "moe_tp_size", None),
+        )
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError("FuseEP mode 3 requires BF16 hidden states")
         if hidden_states.shape[0] > capacity:
@@ -77,8 +87,6 @@ def forward_fuseep(
             l1_bias=getattr(layer, "w13_scale_bias", None),
             l2_bias=getattr(layer, "w2_scale_bias", None),
         )
-        from sglang.srt.hardware_backend.npu.feature_evidence import record
-
         record("megamoe")
         return hidden_states
 

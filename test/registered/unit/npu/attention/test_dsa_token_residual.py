@@ -2,6 +2,8 @@
 
 import ast
 import importlib.util
+import itertools
+import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -255,11 +257,56 @@ class TestDsaTokenResidual(CustomTestCase):
         )
         return namespace["forward"]
 
+    def test_ep16_requires_matching_rank_ownership(self):
+        parallel = SimpleNamespace(
+            moe_tp_size=1,
+            moe_ep_size=16,
+            attn_tp_size=16,
+            attn_dcp_size=16,
+            moe_ep_group=SimpleNamespace(ranks=list(range(16))),
+            attn_tp_group=SimpleNamespace(ranks=list(range(16))),
+        )
+        backend = SimpleNamespace(is_ascend_fuseep=lambda: True)
+        self.assertTrue(residual.supports_token_sharded_ep(parallel, backend, 3))
+        self.assertFalse(residual.supports_token_sharded_ep(parallel, backend, 2))
+        parallel.moe_ep_group.ranks.reverse()
+        self.assertFalse(residual.supports_token_sharded_ep(parallel, backend, 3))
+        parallel.moe_ep_group.ranks.reverse()
+        parallel.moe_tp_size = 2
+        self.assertFalse(residual.supports_token_sharded_ep(parallel, backend, 3))
+
+    def test_ep_dispatch_preserves_local_and_empty_rows(self):
+        calls = []
+
+        def quantize(value, **kwargs):
+            return value.to(torch.int8), torch.full((value.shape[0],), 0.5)
+
+        def forward(value, batch, **kwargs):
+            calls.append(value.clone())
+            return value + 1
+
+        layer = SimpleNamespace(forward_deepep=forward)
+        stub = SimpleNamespace(npu_dynamic_quant=quantize)
+        with (
+            patch.dict(sys.modules, {"torch_npu": stub}),
+            patch.object(residual, "record"),
+        ):
+            for rows in (0, 1, 3):
+                hidden = torch.full((rows, 4), 2.0)
+                output = residual.forward_token_sharded_ep(layer, hidden, None)
+                self.assertEqual(output.shape, hidden.shape)
+                torch.testing.assert_close(output, torch.full_like(hidden, 2.0))
+        self.assertEqual([value.shape[0] for value in calls], [0, 1, 3])
+
     def test_decoder_stream_and_last_rows_match_full_width(self):
         native_forward = self._native_decoder_forward()
-        for dtype in (torch.float32, torch.bfloat16):
+        for dtype, ep_local in itertools.product(
+            (torch.float32, torch.bfloat16), (False, True)
+        ):
             for lengths, padded in (([5], 6), ([3, 4], 8), ([5], 16)):
-                with self.subTest(dtype=dtype, lengths=lengths, padded=padded):
+                with self.subTest(
+                    dtype=dtype, ep_local=ep_local, lengths=lengths, padded=padded
+                ):
                     world, local = World(2), threading.local()
                     hidden = (
                         torch.arange(padded * 4).reshape(padded, 4).float() / 31
@@ -304,15 +351,17 @@ class TestDsaTokenResidual(CustomTestCase):
 
                         class Mlp:
                             down_proj = SimpleNamespace(reduce_results=False)
+                            reduce_results = False
+                            _enable_a2a_moe = ep_local
 
                             def __call__(self, value, *unused):
-                                return F.linear(value, wf / 2)
+                                return F.linear(value, wf if ep_local else wf / 2)
 
                         layer = SimpleNamespace(
                             self_attn=Attention(),
                             input_layernorm=norm,
                             post_attention_layernorm=norm,
-                            is_layer_sparse=False,
+                            is_layer_sparse=ep_local,
                             mlp=Mlp(),
                         )
                         output = hidden.clone()

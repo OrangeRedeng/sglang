@@ -29,6 +29,102 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_historical_recipe_is_optimized_and_preserves_original_launch(self):
+        harness = load("historical_recipe", "test_glm53_features.py")
+        args = SimpleNamespace(
+            stage="long",
+            model_path="weights",
+            checkpoint_format="modelslim",
+            tp=16,
+            dcp=16,
+            context_length=1048576,
+            chunk=16384,
+            mem_fraction=0.88,
+            kv_rows=74752,
+            port=31000,
+        )
+        scenario = harness.SCENARIOS["historical-bde"]
+        command = harness.server_command(args, scenario)
+        for flag, value in [
+            ("--chunked-prefill-size", "32768"),
+            ("--mem-fraction-static", "0.85"),
+            ("--max-total-tokens", "67584"),
+            ("--max-running-requests", "1"),
+            ("--prefill-max-requests", "1"),
+        ]:
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertNotIn("--disable-shared-experts-fusion", command)
+        for name in [
+            "SGLANG_NPU_INDEXER_INT8",
+            "SGLANG_NPU_SFA_KV_8BIT",
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED",
+            "SGLANG_NPU_ENABLE_DCP_PACKED_READ",
+            "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH",
+            "SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP",
+            "SGLANG_NPU_STREAM_O_PROJ",
+            "SGLANG_NPU_USE_MULTI_STREAM",
+        ]:
+            self.assertIn(scenario["env"][name].lower(), ("true", "1"))
+        self.assertEqual(args.chunk, 16384)
+        args.stage = "serve"
+        serving = harness.server_command(args, scenario)
+        self.assertEqual(serving[serving.index("--max-running-requests") + 1], "1")
+        self.assertEqual(serving[serving.index("--prefill-max-requests") + 1], "1")
+        checks = load("historical_capacity", "feature_checks.py")
+        working = checks.long_working_set(
+            1000000,
+            16,
+            "prefix99",
+            dict(page_size=128, dcp_size=16, max_running_requests=1),
+        )
+        self.assertEqual(working["max_active_requests"], 1)
+        self.assertEqual(working["required_tokens"], 1005568)
+        self.assertLessEqual(working["required_tokens"], 67584 * 16)
+
+    def test_historical_candidates_preserve_baseline_and_ep_activation(self):
+        harness = load("historical_overlay", "test_glm53_features.py")
+        baseline = harness.scenario_for("baseline", "historical-bde")
+        megamoe = harness.scenario_for("megamoe", "historical-bde")
+        self.assertEqual(megamoe["fuseep"], 3)
+        self.assertEqual(megamoe["launch_overrides"], baseline["launch_overrides"])
+        for key, value in baseline["env"].items():
+            self.assertEqual(megamoe["env"][key], value)
+        self.assertIn("dsa-ep-moe-local", megamoe["expected"])
+        fp16 = harness.scenario_for("indexer-fp16", "historical-bde")
+        self.assertEqual(fp16["env"]["SGLANG_NPU_INDEXER_INT8"], "False")
+        self.assertNotIn("indexer-int8", fp16["expected"])
+        self.assertIn(
+            "unsupported", harness.scenario_for("indexer-int8", "historical-bde")
+        )
+        self.assertTrue(baseline["dcp"])
+
+    def test_long_plan_preserves_requested_priorities_after_baselines(self):
+        harness = load("long_priority", "test_glm53_features.py")
+        args = SimpleNamespace(
+            stage="long",
+            cases="*",
+            model_path="weights",
+            checkpoint_format="modelslim",
+            tp=16,
+            dcp=16,
+            context_length=1048576,
+            chunk=16384,
+            mem_fraction=0.88,
+            kv_rows=74752,
+            port=31000,
+            benchmark_variants="dcp-baseline,moe-baseline,megamoe,indexer-int8,tp-shared",
+        )
+        self.assertEqual(
+            [case["id"] for case in harness.plan(args)],
+            [
+                "long-dcp-baseline",
+                "long-moe-baseline",
+                "long-megamoe",
+                "long-indexer-int8",
+                "long-tp-shared",
+            ],
+        )
+
     def test_long_capacity_counts_page_rounded_outstanding_suffixes(self):
         checks = load("working_set", "feature_checks.py")
         info = dict(page_size=128, dcp_size=16)
@@ -494,6 +590,68 @@ class TestFeatureQualification(CustomTestCase):
             torch.tensor([2.0]), activation="situglu", activation_params={"beta": 4}
         )
         torch.testing.assert_close(result, torch.tensor([8.0]))
+
+    def test_megamoe_rank_capacity_and_geometry_do_not_mark_failed_calls_active(self):
+        import sglang.srt.layers.quantization  # noqa: F401
+        from sglang.srt.hardware_backend.npu.moe import fuseep
+        from sglang.srt.hardware_backend.npu import feature_evidence
+
+        layer = SimpleNamespace(
+            _mega_moe_weights_processed=True,
+            moe_ep_size=16,
+            moe_tp_size=1,
+            num_experts=256,
+            w13_weight=None,
+            w13_weight_scale=None,
+            w2_weight=None,
+            w2_weight_scale=None,
+        )
+        buffer = MagicMock()
+        buffer.fused_deep_moe.side_effect = lambda **kwargs: (kwargs["x"], None)
+        with (
+            patch.object(
+                fuseep,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(fuseep_mode=3)),
+            ),
+            patch.object(fuseep, "_mega_moe_capacity", return_value=1024),
+            patch.object(
+                fuseep, "_get_fuseep_buffer", return_value=buffer
+            ) as get_buffer,
+            patch.object(fuseep, "_prepare_mega_moe_buffer", return_value=buffer),
+            patch.object(feature_evidence, "record") as record,
+        ):
+            for rows in (1024, 1025):
+                with self.subTest(rows=rows):
+                    record.reset_mock()
+                    get_buffer.reset_mock()
+                    buffer.reset_mock()
+                    x = torch.zeros(rows, 16, dtype=torch.bfloat16)
+                    topk = SimpleNamespace(
+                        topk_ids=torch.zeros(rows, 8, dtype=torch.int64),
+                        topk_weights=torch.ones(rows, 8),
+                    )
+                    if rows == 1024:
+                        self.assertIs(fuseep.forward_fuseep(layer, x, topk), x)
+                        call = buffer.fused_deep_moe.call_args.kwargs
+                        self.assertEqual(call["num_max_dispatch_tokens_per_rank"], 1024)
+                        self.assertEqual(record.call_args.args, ("megamoe",))
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "1025 tokens, exceeding"
+                        ):
+                            fuseep.forward_fuseep(layer, x, topk)
+                        get_buffer.assert_not_called()
+                        buffer.fused_deep_moe.assert_not_called()
+                        self.assertNotIn(
+                            "megamoe", [call.args[0] for call in record.call_args_list]
+                        )
+                    self.assertEqual(
+                        record.call_args_list[0].kwargs["input_shape"], [rows, 16]
+                    )
+                    self.assertEqual(
+                        record.call_args_list[0].kwargs["dispatch_capacity"], 1024
+                    )
 
     def test_megamoe_forward_installs_adapter_only_on_selected_strategy(self):
         import sglang.srt.layers.quantization  # noqa: F401

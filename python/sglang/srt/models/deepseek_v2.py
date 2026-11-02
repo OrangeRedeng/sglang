@@ -1156,6 +1156,14 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if _is_npu and get_forward().npu_dsa_cp_token_sharded:
+            if self._enable_a2a_moe:
+                from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                    forward_token_sharded_ep,
+                )
+
+                return forward_token_sharded_ep(
+                    self, hidden_states, forward_batch, input_ids_global
+                )
             # This path owns the quantized token gather before expert dispatch.
             return self.forward_normal(
                 hidden_states,

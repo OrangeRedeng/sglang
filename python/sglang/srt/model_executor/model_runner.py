@@ -1329,12 +1329,11 @@ class ModelRunner:
             )
 
     def _prepare_dsa_cp_token_sharded(self) -> None:
-        # DSA-CP token sharding (D1v3): the full rebuild. The gate is a hard
-        # refusal rather than a fallback because a half-enabled rebuild (for
-        # example the MoE input gathered under expert parallelism) would not
-        # fail loudly -- it would produce plausible garbage.
+        # TP experts gather rows; EP experts own local rows after combine.
+        # Reject layouts that cannot preserve residual ownership.
         from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
             prepare_quantized_q_projection,
+            supports_token_sharded_ep,
         )
         from sglang.srt.layers.attention.dsa.dsa_cp import (
             register_o_proj_stream_shard,
@@ -1356,13 +1355,12 @@ class ModelRunner:
                 "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but the attention-TP "
                 "size is 1; there is no token grid to shard"
             )
-        if not get_moe_a2a_backend().is_none():
+        backend = get_moe_a2a_backend()
+        ep_local = supports_token_sharded_ep(parallel, backend, get_exec().moe.fuseep_mode)
+        if not backend.is_none() and not ep_local:
             raise ValueError(
-                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED requires the MoE to run "
-                "tensor-parallel (a2a backend none/ascend_tp): the rebuild "
-                "gathers the quantized MoE input back to full width before "
-                "the dispatch, which expert parallelism replaces with a token "
-                "dispatch -- a different design"
+                "DSA token-sharded MoE requires TP experts or FuseEP mode 3 with "
+                "matching TP16/DCP16/EP16 rank order and MoE TP1"
             )
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             raise ValueError(
@@ -1389,7 +1387,7 @@ class ModelRunner:
                 "SGLANG_NPU_USE_MLAPO: the fused MLA preprocess runs the q "
                 "path this rebuild does not provide"
             )
-        if envs.SGLANG_SHARED_EXPERT_TP1.get():
+        if envs.SGLANG_SHARED_EXPERT_TP1.get() and not ep_local:
             raise ValueError(
                 "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but "
                 "SGLANG_SHARED_EXPERT_TP1 is on; the TP1 shared expert is "

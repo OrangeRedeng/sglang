@@ -301,6 +301,7 @@ SCENARIOS["megamoe"]["env"]["DEEPEP_HCCL_BUFFSIZE"] = "768"
 SCENARIOS["moe-baseline"] = {"separate_shared": True}
 SCENARIOS["moe-ep-baseline"] = {"separate_shared": True, "unfused_ep": True}
 SCENARIOS["indexer-int8"].update(expected=["indexer-int8"], probe="indexer-int8")
+SCENARIOS["indexer-fp16"] = {"env": {"SGLANG_NPU_INDEXER_INT8": "False"}, "dcp": True}
 SCENARIOS["indexer-query-shard"]["expected"] = ["indexer-query-shard"]
 for name in ("graph-full", "graph-piecewise"):
     SCENARIOS[name]["expected"] = [name + "-capture", name + "-replay"]
@@ -312,6 +313,11 @@ _combination_spec.loader.exec_module(_combinations)
 add_combinations = _combinations.add_combinations
 component_blockers = _combinations.component_blockers
 qualification_key = _combinations.qualification_key
+
+
+def scenario_for(name, reference_recipe="ordinary"):
+    return _combinations.scenario_for(SCENARIOS, name, reference_recipe)
+
 
 add_combinations(SCENARIOS)
 _QUALIFIED_SCENARIOS = {}
@@ -545,6 +551,8 @@ def case_checkpoint(args, scenario):
 
 
 def server_command(args, scenario):
+    if scenario.get("launch_overrides"):
+        args = SimpleNamespace(**dict(vars(args), **scenario["launch_overrides"]))
     model_path, checkpoint_format = case_checkpoint(args, scenario)
     context_length = args.context_length
     config_path = Path(model_path) / "config.json" if model_path else None
@@ -583,8 +591,16 @@ def server_command(args, scenario):
         command += ["--quantization", "modelslim"]
     if getattr(args, "kv_rows", None) is not None:
         command += ["--max-total-tokens", str(args.kv_rows)]
-    if getattr(args, "stage", "serve") == "long" and scenario.get("dcp"):
-        command += ["--prefill-max-requests", "1", "--max-running-requests", "64"]
+    if scenario.get("dcp") and (
+        getattr(args, "stage", "serve") == "long"
+        or "max_running_requests" in scenario.get("launch_overrides", {})
+    ):
+        command += [
+            "--prefill-max-requests",
+            "1",
+            "--max-running-requests",
+            str(getattr(args, "max_running_requests", 64)),
+        ]
     if scenario.get("graph"):
         command += [
             "--cuda-graph-backend-decode",
@@ -895,12 +911,16 @@ def validate_serving(args, case, directory, case_env, base_env):
                 failure_phase="preflight",
                 reason="required operator/API unavailable; see capability.log",
             )
-    reference = {
-        key: value
-        for key, value in scenario.items()
-        if key in ("quant", "dcp", "separate_shared")
-    }
-    reference_env = base_env
+    reference = (
+        scenario_for("historical-bde")
+        if getattr(args, "reference_recipe", "ordinary") == "historical-bde"
+        else {
+            key: value
+            for key, value in scenario.items()
+            if key in ("quant", "dcp", "separate_shared", "launch_overrides")
+        }
+    )
+    reference_env = dict(base_env, **reference.get("env", {}))
     if case["id"].endswith("dcp-stream-o-proj"):
         reference["env"] = dict(scenario["env"], SGLANG_NPU_STREAM_O_PROJ="False")
         reference_env = dict(base_env, **reference["env"])
@@ -1291,7 +1311,7 @@ def plan(args):
         SCENARIOS[name].get("dcp") for name in selected_names
     )
     for name, scenario in SCENARIOS.items():
-        scenario = dict(scenario)
+        scenario = scenario_for(name, getattr(args, "reference_recipe", "ordinary"))
         stage = args.stage if args.stage in ("small", "long") else "serve"
         if stage in ("small", "long") and args.cases == "*":
             if name not in getattr(args, "benchmark_variants", "baseline").split(","):
@@ -1311,7 +1331,18 @@ def plan(args):
             }
         )
     if benchmark_stage == "long":
-        cases.sort(key=lambda case: not case["id"].endswith("-baseline"))
+        order = {
+            name: i
+            for i, name in enumerate(
+                getattr(args, "benchmark_variants", "baseline").split(",")
+            )
+        }
+        cases.sort(
+            key=lambda case: (
+                not case["id"].endswith("-baseline"),
+                order.get(case["id"].removeprefix("long-"), len(order)),
+            )
+        )
     return [
         case
         for case in cases
@@ -1431,6 +1462,9 @@ def main():
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument(
+        "--reference-recipe", choices=("ordinary", "historical-bde"), default="ordinary"
+    )
     parser.add_argument("--megamoe-dispatch-tokens", type=int, default=4096)
     parser.add_argument(
         "--diagnostic-megamoe",

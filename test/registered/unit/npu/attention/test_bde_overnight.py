@@ -423,6 +423,35 @@ class TestBdeOvernight(CustomTestCase):
                 if variant == "auto-hccl":
                     self.assertNotIn("HCCL_BUFFSIZE", env)
 
+    def test_historical_megamoe_timing_keeps_dispatch_capacity(self):
+        module = self.runner()
+        repo = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            repo / "benchmark/prefill_1m/test_glm53_features.py", "historical_timing"
+        )
+        config = dict(
+            variant="megamoe",
+            reference_recipe="historical-bde",
+            checkpoint="/tmp/weights",
+            chunk=16384,
+            context=1048576,
+            memfrac=0.85,
+            maxreq=64,
+            kv_rows=67584,
+            megamoe_dispatch_tokens=2048,
+        )
+        command, env = module.variant_launch(harness, repo, config)
+        for flag, value in [
+            ("--chunked-prefill-size", "32768"),
+            ("--max-running-requests", "1"),
+            ("--dcp-size", "16"),
+            ("--ep-size", "16"),
+        ]:
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertEqual(env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "True")
+        self.assertEqual(env["SGLANG_NPU_INDEXER_INT8"], "True")
+        self.assertEqual(env["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"], "2048")
+
     def test_worker_disconnect_stops_owned_feature_process(self):
         module = self.runner()
         try:
