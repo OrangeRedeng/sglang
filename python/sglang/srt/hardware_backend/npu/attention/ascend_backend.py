@@ -110,6 +110,7 @@ class ForwardMetadata:
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
+    mtp_bsnd_masks: dict[tuple[int, int, int, int], torch.Tensor] | None = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
@@ -2546,22 +2547,34 @@ class AscendAttnBackend(AttentionBackend):
             # costs a mask build plus a full FIA host launch per request per
             # layer, which dominates eager verify host time.
             bs = len(ends)
-            positions = (
-                torch.as_tensor(kv_lens[:bs], dtype=torch.long, device=query.device)[
-                    :, None
-                ]
-                - width
-                + torch.arange(width, device=query.device)[None, :]
-            )
-            keys = torch.arange(
-                block_table.shape[1] * self.page_size, device=query.device
-            )
-            mask = keys[None, None, :] > positions[:, :, None]
-            if layer.sliding_window_size != -1:
-                mask = mask | (
-                    keys[None, None, :]
-                    < positions[:, :, None] - layer.sliding_window_size
+            masks = None
+            if self.reuse_fia_metadata:
+                masks = self.forward_metadata.mtp_bsnd_masks
+                if masks is None:
+                    masks = self.forward_metadata.mtp_bsnd_masks = {}
+            mask_key = (bs, width, block_table.shape[1], layer.sliding_window_size)
+            mask = masks.get(mask_key) if masks is not None else None
+            if mask is None:
+                # All layers share committed lengths; cache only within the
+                # fresh eager-batch metadata, never across graph replays.
+                positions = (
+                    torch.as_tensor(
+                        kv_lens[:bs], dtype=torch.long, device=query.device
+                    )[:, None]
+                    - width
+                    + torch.arange(width, device=query.device)[None, :]
                 )
+                keys = torch.arange(
+                    block_table.shape[1] * self.page_size, device=query.device
+                )
+                mask = keys[None, None, :] > positions[:, :, None]
+                if layer.sliding_window_size != -1:
+                    mask = mask | (
+                        keys[None, None, :]
+                        < positions[:, :, None] - layer.sliding_window_size
+                    )
+                if masks is not None:
+                    masks[mask_key] = mask
             result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query.reshape(bs, width, layer.tp_q_head_num, layer.qk_head_dim),
                 k_cache,

@@ -13,7 +13,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative import frozen_kv_mtp_worker_v2 as worker_mod
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
+from sglang.srt.speculative.frozen_kv_mtp_utils import set_frozen_kv_positions
 from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
     FrozenKVMTPDraftWorker,
     FrozenKVMTPWorkerV2,
@@ -36,6 +38,60 @@ class TestFrozenKVMTPForward(CustomTestCase):
                 )
             )
         return stack
+
+    def test_recurrent_draft_reuses_seed_positions_without_advancing_prefix(self):
+        for lengths in ([7, 9], [1, 1025]):
+            with self.subTest(lengths=lengths):
+                spec = object.__new__(FrozenKVMTPDraftInput)
+                spec.bonus_tokens = torch.tensor([2, 3])
+                spec.hidden_states = torch.ones(2, 4)
+                batch = SimpleNamespace(
+                    spec_info=spec,
+                    seq_lens=torch.tensor(lengths),
+                    positions=torch.zeros(2, dtype=torch.int64),
+                    needs_forward_metadata_init=lambda: False,
+                )
+                observations = []
+
+                def forward(fb, observations=observations):
+                    observations.append(fb.positions.clone())
+                    return SimpleNamespace(
+                        logits_output=SimpleNamespace(
+                            next_token_logits=torch.tensor(
+                                [[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]]
+                            ),
+                            hidden_states=fb.spec_info.hidden_states + 1,
+                        )
+                    )
+
+                def choose(i, probs, indices, hidden, scores, topk):
+                    return indices.flatten(), hidden, probs, (probs, indices, indices)
+
+                worker = SimpleNamespace(
+                    topk=1,
+                    speculative_num_steps=3,
+                    speculative_num_draft_tokens=4,
+                    draft_attn_backend=object(),
+                    draft_model_runner=SimpleNamespace(forward=forward),
+                    _set_positions=Mock(
+                        side_effect=lambda fb: set_frozen_kv_positions(fb, 1)
+                    ),
+                    _target_kv_pool_view=lambda fb: nullcontext(),
+                )
+                with (
+                    patch.object(worker_mod, "select_top_k_tokens", side_effect=choose),
+                    patch.object(worker_mod, "fast_topk", side_effect=torch.topk),
+                    patch.object(
+                        worker_mod, "organize_draft_results", return_value="tree"
+                    ),
+                ):
+                    result = FrozenKVMTPDraftWorker.draft_forward(worker, batch)
+                self.assertEqual(result, "tree")
+                self.assertEqual(len(observations), 3)
+                for positions in observations:
+                    torch.testing.assert_close(positions, torch.tensor(lengths) - 1)
+                torch.testing.assert_close(batch.seq_lens, torch.tensor(lengths))
+                worker._set_positions.assert_called_once_with(batch)
 
     def test_draft_uses_cpu_lengths_and_retains_device_fallback(self):
         for use_cpu in (True, False):
