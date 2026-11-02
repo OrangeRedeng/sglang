@@ -533,6 +533,7 @@ def main():
     parser.add_argument("--long-requests", type=int, default=2)
     parser.add_argument("--long-dcp-size", type=int, choices=(1, 16), default=16)
     parser.add_argument("--diagnostic-megamoe", action="store_true")
+    parser.add_argument("--megamoe-dispatch-tokens", type=int, default=4096)
     parser.add_argument("--long-cache-modes", default="cold,prefix99")
     parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
     parser.add_argument("--max-hours", type=float)
@@ -565,6 +566,8 @@ def main():
     parser.add_argument("--feature-timeout", type=int, default=43200)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if not 1 <= args.megamoe_dispatch_tokens <= 4096:
+        parser.error("--megamoe-dispatch-tokens must be in [1,4096]")
     if args.feature_kv_rows is not None and args.feature_kv_rows <= 0:
         parser.error("--feature-kv-rows must be positive")
     try:
@@ -655,6 +658,8 @@ def main():
             args.checkpoint,
             "--checkpoint-format",
             "modelslim",
+            "--megamoe-dispatch-tokens",
+            str(args.megamoe_dispatch_tokens),
             "--tp",
             "16",
             "--dcp",

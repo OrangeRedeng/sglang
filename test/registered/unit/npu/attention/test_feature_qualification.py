@@ -29,6 +29,24 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_long_capacity_counts_page_rounded_outstanding_suffixes(self):
+        checks = load("working_set", "feature_checks.py")
+        info = dict(page_size=128, dcp_size=16)
+        full = checks.long_working_set(1000000, 16, "prefix99", info)
+        half = checks.long_working_set(500000, 16, "prefix99", info)
+        self.assertEqual(full["cached_prefix_tokens"], 989184)
+        self.assertEqual(full["per_request_slots"], 12288)
+        self.assertEqual(full["required_tokens"], 1189888)
+        self.assertEqual(half["required_tokens"], 628736)
+        # The old nominal-99% estimate undercounted both sets of rounded tails.
+        self.assertGreater(full["required_tokens"], 1000000 + 16 * 10001 + 4096)
+        self.assertLessEqual(full["required_tokens"], 74752 * 16)
+        self.assertLessEqual(half["required_tokens"], 39936 * 16)
+        self.assertEqual(
+            checks.long_working_set(1000000, 1, "cold", info)["required_tokens"],
+            1005568,
+        )
+
     def test_dcp_cache_geometry_and_chunk_aware_probe(self):
         checks = load("cache_geometry", "feature_checks.py")
         info = dict(

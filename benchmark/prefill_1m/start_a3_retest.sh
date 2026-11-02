@@ -29,12 +29,28 @@ case "$mode" in
     args+=(--features-only --feature-stages serve --feature-cases serve-baseline,serve-megamoe
            --max-hours 1 --feature-timeout 3600)
     ;;
+  baseline-repro)
+    args+=(--features-only --feature-stages long --long-variants dcp-baseline
+           --length 1000000 --long-lengths 1000000 --long-concurrency 16 --long-requests 16
+           --long-cache-modes prefix99 --long-warmup once
+           --long-kv-rows 81920 --context 1048576 --chunk 16384 --repeats 1
+           --max-hours 2 --feature-timeout 7200)
+    ;;
+  megamoe-500k)
+    args+=(--features-only --feature-stages long --diagnostic-megamoe
+           --long-variants moe-baseline,megamoe --long-dcp-size 16
+           --length 500000 --long-lengths 500000 --long-concurrency 16 --long-requests 16
+           --long-cache-modes prefix99 --long-warmup once --megamoe-dispatch-tokens 1024
+           --long-kv-rows 39936 --context 524288 --chunk 1024 --repeats 1
+           --max-hours 2 --feature-timeout 7200)
+    ;;
   megamoe-measure)
     args+=(--features-only --feature-stages long --diagnostic-megamoe
            --long-variants moe-baseline,megamoe --long-dcp-size 16
            --length 1000000 --long-lengths 1000000 --long-concurrency 16 --long-requests 16
            --long-cache-modes prefix99 --long-warmup once
-           --long-kv-rows 81920 --context 1048576 --chunk 4096 --repeats 1
+           --long-kv-rows 74752 --context 1048576 --chunk 1024 --repeats 1
+           --megamoe-dispatch-tokens 1024
            --max-hours 2 --feature-timeout 7200)
     ;;
   fix-check)
@@ -69,7 +85,7 @@ case "$mode" in
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|megamoe|megamoe-measure|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|megamoe|baseline-repro|megamoe-500k|megamoe-measure|fix-check|moe|dcp|failures|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"

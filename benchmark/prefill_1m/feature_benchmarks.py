@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from bench_glm53_prefill_1m import run_one
-from feature_checks import cache_page_size, minimum_cached_prefix
+from feature_checks import cache_page_size, long_working_set, minimum_cached_prefix
 
 
 class CapacityBlocked(RuntimeError):
@@ -108,12 +108,10 @@ def long_matrix(args, base, request, checkpoint, directory):
             continue
         for concurrency in args.long_concurrency:
             for cache in getattr(args, "long_cache_modes", ("cold", "prefix99")):
-                # Prime + suffixes share physical prefix KV pages in prefix99 mode.
-                required = (
-                    concurrency * (length + 1) + 4096
-                    if cache == "cold"
-                    else length + concurrency * (length - int(length * 0.99) + 1) + 4096
+                working_set = long_working_set(
+                    length, min(concurrency, args.long_requests), cache, server_info
                 )
+                required = working_set["required_tokens"]
                 if required > capacity["max_total_num_tokens"]:
                     results.append(
                         dict(
@@ -122,6 +120,7 @@ def long_matrix(args, base, request, checkpoint, directory):
                             cache=cache,
                             status="capacity_blocked",
                             required_tokens=required,
+                            working_set=working_set,
                             capacity=capacity,
                         )
                     )
@@ -203,6 +202,8 @@ def long_matrix(args, base, request, checkpoint, directory):
                         length=length,
                         concurrency=concurrency,
                         cache=cache,
+                        working_set=working_set,
+                        capacity=capacity,
                         status="pass",
                         median_ttft_s=statistics.median(ttft),
                         p90_ttft_s=percentile(ttft, 0.90),

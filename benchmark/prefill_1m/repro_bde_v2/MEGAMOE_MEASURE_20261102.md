@@ -1,3 +1,6 @@
+> Updated memory profiles and launch commands: [MEGAMOE_MEMORY_20261102.md](MEGAMOE_MEMORY_20261102.md).
+> The settings below describe the earlier f8b4f71991 experiment, which exhausted MegaMoE workspace.
+
 # MegaMoE parity and matched TTFT retest
 
 The supplied fix-check run at 0b21b037e5 confirms that the 768 MB HCCL buffer

@@ -23,6 +23,27 @@ def minimum_cached_prefix(prefix_tokens, info):
     return max(0, prefix_tokens - 1) // page * page
 
 
+def long_working_set(length, concurrency, cache, info):
+    page = cache_page_size(info)
+
+    def rounded(tokens):
+        return (tokens + page - 1) // page * page
+
+    cached = (
+        minimum_cached_prefix(int(length * 0.99), info) if cache == "prefix99" else 0
+    )
+    # Each outstanding suffix needs its own rounded pages, including its output.
+    request_slots = rounded(length + 1 - cached)
+    required = max(rounded(length + 1), cached + concurrency * request_slots) + 4096
+    return dict(
+        required_tokens=required,
+        cached_prefix_tokens=cached,
+        per_request_slots=request_slots,
+        cache_page_size=page,
+        headroom_tokens=4096,
+    )
+
+
 def dcp_probe_lengths(info):
     resolved = info.get("server_args", info)
     page = cache_page_size(info)

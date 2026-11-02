@@ -1431,6 +1431,7 @@ def main():
         help="Optional BF16 source for online-conversion cases when the primary checkpoint is ModelSlim.",
     )
     parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--megamoe-dispatch-tokens", type=int, default=4096)
     parser.add_argument(
         "--diagnostic-megamoe",
         action="store_true",
@@ -1508,6 +1509,11 @@ def main():
         "--probe-feature", choices=tuple(SCENARIOS), help=argparse.SUPPRESS
     )
     args = parser.parse_args()
+    if not 1 <= args.megamoe_dispatch_tokens <= 4096:
+        parser.error("--megamoe-dispatch-tokens must be in [1,4096]")
+    SCENARIOS["megamoe"]["env"]["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+        args.megamoe_dispatch_tokens
+    )
     if (
         not args.long_cache_modes
         or set(args.long_cache_modes) - {"cold", "prefix99"}
