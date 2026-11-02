@@ -10,11 +10,12 @@ import logging
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 import numpy as np
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
@@ -113,6 +114,33 @@ def frozen_kv_fia_v2(query, key, value, *, output_dim, **kwargs):
     return output, lse
 
 
+def _release_capture_workspaces(graph):
+    """Let the graph pool reuse workspace blocks between captured shapes.
+
+    Keep strong owners until capture_end has finished. Afterwards, as with
+    the other captured tensor arguments, retain non-owning tensor handles.
+    Keeping workspace tensors alive here pins one allocation per shape even
+    though the shapes share a graph pool and are replayed sequentially.
+    """
+    workspaces = {
+        id(workspace): _borrow(workspace)
+        for workspace in graph._frozen_fia_resources.values()
+    }
+    graph._frozen_fia_tasks = tuple(
+        replace(
+            task,
+            kwargs=MappingProxyType(
+                {**task.kwargs, "workspace": workspaces[id(task.kwargs["workspace"])]}
+            ),
+        )
+        for task in graph._frozen_fia_tasks
+    )
+    graph._frozen_fia_resources = {
+        signature: workspaces[id(workspace)]
+        for signature, workspace in graph._frozen_fia_resources.items()
+    }
+
+
 class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
     _auto_dispatch_capture = False
 
@@ -122,6 +150,8 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         self._inflight = deque()
         self._failed = False
         self._logged_replay = False
+        self._debug_graph_sync = envs.SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC.get()
+        self._debugged_shapes = set()
         self._role = (
             "draft"
             if getattr(getattr(runner, "model_runner", None), "is_draft_worker", False)
@@ -143,6 +173,7 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         super().capture_one(shape_key, *args, **kwargs)
         if not self._graphs[shape_key]._frozen_fia_tasks:
             raise ValueError("Frozen-KV graph captured no FIA update tasks")
+        _release_capture_workspaces(self._graphs[shape_key])
         logger.info(
             "Frozen-KV NPU %s bucket %s captured %d FIA tasks.",
             self._role,
@@ -170,6 +201,42 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         while self._inflight and self._inflight[0][0].query():
             self._inflight.popleft()
         stream = self._device_module.current_stream()
+        if self._debug_graph_sync:
+            # Tensor metadata only: do not copy tensors to CPU or add waits here.
+            logger.info(
+                "Frozen-KV NPU %s replay submit: bucket=%s tasks=%s "
+                "kv_lens=%s compute_stream=%s update_stream=%s",
+                self._role,
+                shape_key.size,
+                len(tasks),
+                resolved[0]["actual_seq_kvlen"],
+                stream,
+                self._update_stream,
+            )
+            if shape_key not in self._debugged_shapes:
+                for index, params in enumerate(resolved):
+                    logger.info(
+                        "Frozen-KV NPU %s FIA task %s: bucket=%s layout=%s "
+                        "q_shape=%s q_stride=%s q_dtype=%s k_shape=%s "
+                        "v_shape=%s block_table_shape=%s mask_shape=%s "
+                        "q_lens=%s workspace_bytes=%s",
+                        self._role,
+                        index,
+                        shape_key.size,
+                        params.get("input_layout"),
+                        tuple(params["query"].shape),
+                        tuple(params["query"].stride()),
+                        params["query"].dtype,
+                        tuple(params["key"].shape),
+                        tuple(params["value"].shape),
+                        tuple(params["block_table"].shape)
+                        if params.get("block_table") is not None else None,
+                        tuple(params["atten_mask"].shape)
+                        if params.get("atten_mask") is not None else None,
+                        params.get("actual_seq_qlen"),
+                        params["workspace"].numel() * params["workspace"].element_size(),
+                    )
+                self._debugged_shapes.add(shape_key)
         self._update_stream.wait_stream(stream)
         done = self._device_module.Event()
         # Keep the snapshots even if submission fails: a partial graph cannot be retried.
@@ -185,6 +252,13 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                     self._device_module.graph_task_update_end(self._update_stream)
                     task.event.record(self._update_stream)
             done.record(stream)
+            if self._debug_graph_sync:
+                logger.info(
+                    "Frozen-KV NPU %s replay submitted: bucket=%s updates=%s",
+                    self._role,
+                    shape_key.size,
+                    len(tasks),
+                )
         except Exception:
             self._failed = True
             raise
