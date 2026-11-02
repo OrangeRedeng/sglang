@@ -50,9 +50,14 @@ class _FIATask:
         if set(update) != {"actual_seq_kvlen"}:
             raise ValueError("Frozen-KV graphs only update actual_seq_kvlen")
         lengths = update["actual_seq_kvlen"]
+        length_name = (
+            "actual_seq_kvlen"
+            if "actual_seq_kvlen" in self.kwargs
+            else "actual_seq_lengths_kv"
+        )
         if (
             not isinstance(lengths, (list, tuple))
-            or len(lengths) != len(self.kwargs["actual_seq_kvlen"])
+            or len(lengths) != len(self.kwargs[length_name])
             or any(type(n) is not int or n < 0 for n in lengths)
         ):
             raise ValueError("Invalid Frozen-KV graph KV lengths")
@@ -63,8 +68,9 @@ class _FIATask:
                 raise ValueError("Frozen-KV graph KV length exceeds its block table")
         # Each replay owns its host arrays until the compute completion event.
         kwargs = dict(self.kwargs)
-        kwargs["actual_seq_kvlen"] = list(lengths)
-        kwargs["actual_seq_qlen"] = list(kwargs["actual_seq_qlen"])
+        kwargs[length_name] = list(lengths)
+        if kwargs.get("actual_seq_qlen") is not None:
+            kwargs["actual_seq_qlen"] = list(kwargs["actual_seq_qlen"])
         kwargs["out"] = list(kwargs["out"])
         return kwargs
 
@@ -107,6 +113,55 @@ def frozen_kv_fia_v2(query, key, value, *, output_dim, **kwargs):
     event.reset(stream)
     torch.npu.graph_task_group_begin(stream)
     operation = torch_npu.npu_fused_infer_attention_score_v2.out
+    operation(**params)
+    handle = torch.npu.graph_task_group_end(stream)
+    captured = {k: v if k == "workspace" else _borrow(v) for k, v in params.items()}
+    tasks.append(_FIATask(operation, MappingProxyType(captured), handle, event))
+    return output, lse
+
+
+def frozen_kv_fia_v1(query, key, value, *, output_dim, **kwargs):
+    """Capture the BSH FIA used by ordinary single-token NPU decode.
+
+    Frozen draft also consumes one query per request. Keep the same operator
+    and layout as ordinary decode for full-attention layers; only its host
+    KV-length argument needs rebinding by the explicit graph task protocol.
+    """
+    import torch_npu
+
+    state = _capture.get()
+    if state is None:
+        return torch_npu.npu_fused_infer_attention_score(query, key, value, **kwargs)
+    tasks, resources = state
+    if kwargs.get("input_layout") != "BSH":
+        raise ValueError("Frozen-KV FIA v1 graphs require BSH")
+    if isinstance(kwargs.get("actual_seq_lengths_kv"), np.ndarray):
+        kwargs["actual_seq_lengths_kv"] = kwargs["actual_seq_lengths_kv"].tolist()
+    params = dict(query=query, key=key, value=value, **kwargs)
+    signature = ("fia_v1",) + tuple(
+        (
+            name,
+            (tuple(v.shape), v.dtype, tuple(v.stride()))
+            if isinstance(v, torch.Tensor)
+            else tuple(v)
+            if isinstance(v, list)
+            else v,
+        )
+        for name, v in params.items()
+    )
+    if signature not in resources:
+        resources[signature] = (
+            torch_npu._npu_fused_infer_attention_score_get_max_workspace(**params)
+        )
+    output = query.new_empty((*query.shape[:-1], output_dim))
+    lse = query.new_empty(1)
+    params.update(workspace=resources[signature], out=[output, lse])
+    stream = torch.npu.current_stream()
+    event = torch.npu.ExternalEvent()
+    event.wait(stream)
+    event.reset(stream)
+    torch.npu.graph_task_group_begin(stream)
+    operation = torch_npu.npu_fused_infer_attention_score.out
     operation(**params)
     handle = torch.npu.graph_task_group_end(stream)
     captured = {k: v if k == "workspace" else _borrow(v) for k, v in params.items()}
@@ -209,7 +264,9 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                 self._role,
                 shape_key.size,
                 len(tasks),
-                resolved[0]["actual_seq_kvlen"],
+                resolved[0].get(
+                    "actual_seq_kvlen", resolved[0].get("actual_seq_lengths_kv")
+                ),
                 stream,
                 self._update_stream,
             )

@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_backend import (
+    frozen_kv_fia_v1,
     frozen_kv_fia_v2,
     reject_unhandled_fia_capture,
 )
@@ -3283,21 +3284,22 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             bs = q.shape[0]
-            result, _ = frozen_kv_fia_v2(
-                q.reshape(bs, 1, layer.tp_q_head_num, layer.qk_head_dim),
+            # Frozen full-attention draft has the same one-query geometry as
+            # ordinary decode. Reuse its BSH FIA path (not BSND/v2) while
+            # keeping explicit graph metadata updates for the frozen prefix.
+            result, _ = frozen_kv_fia_v1(
+                q.reshape(bs, 1, layer.tp_q_head_num * layer.qk_head_dim),
                 k_cache,
                 v_cache,
-                output_dim=layer.v_head_dim,
+                output_dim=layer.tp_q_head_num * layer.v_head_dim,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                num_query_heads=layer.tp_q_head_num,
+                num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSND",
-                softmax_scale=layer.scaling,
-                actual_seq_qlen=[1] * bs,
-                actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
+                input_layout="BSH",
+                scale=layer.scaling,
+                actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_list,
                 sparse_mode=0,
-                learnable_sink=sinks,
             )
             return result.reshape(bs, layer.tp_q_head_num * layer.v_head_dim)
 
