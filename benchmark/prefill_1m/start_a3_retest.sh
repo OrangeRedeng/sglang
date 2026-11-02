@@ -31,10 +31,10 @@ case "$mode" in
     ;;
   megamoe-measure)
     args+=(--features-only --feature-stages long --diagnostic-megamoe
-           --long-variants moe-baseline,moe-ep-baseline,megamoe --long-dcp-size 1
-           --length 1024 --long-lengths 1024 --long-concurrency 1,2 --long-requests 2
-           --long-cache-modes cold,prefix99 --long-warmup once
-           --long-kv-rows 8192 --context 8192 --chunk 4096 --repeats 3
+           --long-variants moe-baseline,megamoe --long-dcp-size 16
+           --length 1000000 --long-lengths 1000000 --long-concurrency 16 --long-requests 16
+           --long-cache-modes prefix99 --long-warmup once
+           --long-kv-rows 81920 --context 1048576 --chunk 4096 --repeats 1
            --max-hours 2 --feature-timeout 7200)
     ;;
   fix-check)
