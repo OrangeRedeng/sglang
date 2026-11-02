@@ -631,7 +631,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
             forward_batch.input_ids = input_ids
             forward_batch.spec_info.hidden_states = hidden_states
-            self._set_positions(forward_batch)
+            # Frozen prefix positions are unchanged after the seed forward.
 
             with (
                 self._target_kv_pool_view(forward_batch),

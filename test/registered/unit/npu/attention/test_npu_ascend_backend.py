@@ -32,6 +32,7 @@ for _ in (
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
+    ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
@@ -410,6 +411,72 @@ class TestMTPAttentionLayout(unittest.TestCase):
         ):
             result = backend.forward_mtp(query, None, None, layer, batch, False)
         torch.testing.assert_close(result, query)
+
+    def test_eager_verify_mask_cache_preserves_windows_and_batch_lifetime(self):
+        for reuse in (False, True):
+            backend = object.__new__(AscendAttnBackend)
+            backend.graph_mode = False
+            backend.reuse_fia_metadata = reuse
+            backend.speculative_num_draft_tokens = 3
+            backend.page_size = 8
+            layer = SimpleNamespace(
+                tp_q_head_num=1,
+                tp_k_head_num=1,
+                qk_head_dim=512,
+                v_head_dim=512,
+                sliding_window_size=-1,
+                scaling=512**-0.5,
+            )
+            query = torch.randn(6, 1, 512)
+            cache = torch.zeros(8, 8, 512)
+            for lengths in ([3, 19], [5, 19], [7, 21]):
+                backend.forward_metadata = ForwardMetadata()
+                seen = []
+
+                def fia(
+                    q, key, value, lengths=lengths, seen=seen, layer=layer, **kwargs
+                ):
+                    mask = kwargs["atten_mask"]
+                    capacity = kwargs["block_table"].shape[1] * 8
+                    window = layer.sliding_window_size
+                    expected = torch.tensor(
+                        [
+                            [
+                                [
+                                    k > length - 3 + row
+                                    or (window != -1 and k < length - 3 + row - window)
+                                    for k in range(capacity)
+                                ]
+                                for row in range(3)
+                            ]
+                            for length in lengths
+                        ]
+                    )
+                    torch.testing.assert_close(mask, expected)
+                    self.assertEqual(kwargs["actual_seq_kvlen"], lengths)
+                    seen.append(mask)
+                    return q.clone(), None
+
+                with patch(
+                    "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                    "torch_npu.npu_fused_infer_attention_score_v2",
+                    side_effect=fia,
+                ):
+                    for window, columns in ((-1, 4), (-1, 4), (8, 4), (8, 5)):
+                        layer.sliding_window_size = window
+                        blocks = torch.zeros(2, columns, dtype=torch.int32)
+                        result = backend._forward_mtp_bsnd(
+                            query, cache, cache, blocks, [3, 6], lengths, layer, None
+                        )
+                        torch.testing.assert_close(result, query)
+                if reuse:
+                    self.assertIs(seen[0], seen[1])
+                    self.assertEqual(len(backend.forward_metadata.mtp_bsnd_masks), 3)
+                else:
+                    self.assertIsNot(seen[0], seen[1])
+                    self.assertIsNone(backend.forward_metadata.mtp_bsnd_masks)
+                self.assertIsNot(seen[1], seen[2])
+                self.assertIsNot(seen[2], seen[3])
 
     def test_verify_graph_mask_tracks_device_prefix_and_keeps_bsnd_batch(self):
         backend = object.__new__(AscendAttnBackend)

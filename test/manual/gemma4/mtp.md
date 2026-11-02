@@ -275,15 +275,29 @@ must preserve the committed CPU lengths, including int32 inputs.
 These changes do not enable draft graphs or change draft sampling probabilities.
 NPU replay, output parity and end-to-end performance still require validation.
 
-## Frozen-KV graph update ordering
+## Frozen-KV graph lifecycle
 
-Frozen-KV draft and target verification now finish host-side FIA updates before
-submitting graph replay. This follows the TorchNPU update-then-replay lifecycle
-and propagates update errors before launching a graph that waits for its external
-events. Other speculative families retain their existing scheduling. The previous
-replay fence is retained to protect host length bindings.
+The current Frozen-KV backend uses explicit FIA task handles and external
+events, with auto-dispatch capture disabled. Each backend owns an update stream;
+all host bindings are validated before launch and each replay retains its host
+snapshots until its completion event. The update stream first waits for prior
+compute work, then replay is submitted and task updates signal its external
+events. This replaces the earlier generic update-future ordering patch.
 
-This is a host-tested ordering fix, not confirmation that the observed NPU stall
-is resolved. Keep the draft graph disabled by default until a target-NPU smoke
-request completes with both graph switches set to0 and steps greater than1.
-Then check greedy output/logprob parity and changing batch buckets before timing.
+Do not infer replay correctness from capture or CPU tests. Start from eager
+draft/verification; test target-only, draft-only and then both graphs with a
+short request and unchanged inputs before benchmarking. Draft capture requires
+steps greater than1. Retain diagnostic sync only for isolating a stall.
+
+## Eager verification mask reuse
+
+With `SGLANG_ENABLE_NPU_FIA_METADATA_REUSE=1`, uniform-width eager verification
+also reuses its BSND causal masks across layers within one batch. Different
+sliding windows and paged capacities have separate entries. Fresh batch metadata
+invalidates the cache; graph replay retains its dynamic device-length masks.
+This removes repeated length transfers and mask launches, but does not change
+ragged prefill routing or establish an NPU throughput improvement.
+
+Frozen-KV draft steps reuse the seed's RoPE positions because their committed
+prefix does not advance. Recurrent steps no longer resubmit the same position
+calculation/copy. Draft probabilities and target KV updates are unchanged.
