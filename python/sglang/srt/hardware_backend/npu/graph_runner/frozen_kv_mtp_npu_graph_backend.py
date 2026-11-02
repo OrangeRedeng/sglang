@@ -7,6 +7,8 @@ https://github.com/vllm-project/vllm-ascend/blob/0f515fe1e246a967dc41c9aa3d4e8ec
 """
 
 import logging
+import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -196,6 +198,50 @@ def _release_capture_workspaces(graph):
     }
 
 
+def _watch_replay_progress(device_module, device_id, role, bucket, ready, markers, done):
+    """Observe stream progress without synchronizing or changing graph dependencies.
+
+    Update markers measure update-stream progress, not completion of individual
+    FIA kernels inside the compute graph. Keep event owners alive until the
+    observer exits; normal replays return without emitting a progress warning.
+    """
+    try:
+        with device_module.device(device_id):
+            started = time.monotonic()
+            report_at = 1.0
+            reported = False
+            while True:
+                if done.query():
+                    if reported:
+                        logger.warning(
+                            "Frozen-KV NPU %s replay progress: bucket=%s "
+                            "complete after %.1fs",
+                            role,
+                            bucket,
+                            time.monotonic() - started,
+                        )
+                    return
+                elapsed = time.monotonic() - started
+                if elapsed >= report_at:
+                    logger.warning(
+                        "Frozen-KV NPU %s replay progress: bucket=%s elapsed=%.1fs "
+                        "inputs_ready=%s update_markers=%s graph_done=False",
+                        role,
+                        bucket,
+                        elapsed,
+                        ready.query(),
+                        [event.query() for event in markers],
+                    )
+                    reported = True
+                    # Bounded diagnostic: do not retain one observer per slow replay.
+                    if elapsed >= 30.0:
+                        return
+                    report_at = {1.0: 3.0, 3.0: 10.0, 10.0: 30.0}[report_at]
+                time.sleep(0.1)
+    except Exception:
+        logger.exception("Frozen-KV NPU %s replay progress observer failed", role)
+
+
 class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
     _auto_dispatch_capture = False
 
@@ -294,6 +340,11 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                         params["workspace"].numel() * params["workspace"].element_size(),
                     )
                 self._debugged_shapes.add(shape_key)
+        debug_ready = None
+        debug_markers = []
+        if self._debug_graph_sync:
+            debug_ready = self._device_module.Event()
+            debug_ready.record(stream)
         self._update_stream.wait_stream(stream)
         done = self._device_module.Event()
         # Keep the snapshots even if submission fails: a partial graph cannot be retried.
@@ -308,7 +359,26 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                     task.operation(**params)
                     self._device_module.graph_task_update_end(self._update_stream)
                     task.event.record(self._update_stream)
+                    if self._debug_graph_sync:
+                        marker = self._device_module.Event()
+                        marker.record(self._update_stream)
+                        debug_markers.append(marker)
             done.record(stream)
+            if self._debug_graph_sync:
+                threading.Thread(
+                    target=_watch_replay_progress,
+                    args=(
+                        self._device_module,
+                        self._device_id,
+                        self._role,
+                        shape_key.size,
+                        debug_ready,
+                        tuple(debug_markers),
+                        done,
+                    ),
+                    name=f"frozen-kv-{self._role}-progress",
+                    daemon=True,
+                ).start()
             if self._debug_graph_sync:
                 logger.info(
                     "Frozen-KV NPU %s replay submitted: bucket=%s updates=%s",
