@@ -198,6 +198,83 @@ def _release_capture_workspaces(graph):
     }
 
 
+def _debug_check_fia_inputs(role, bucket, index, params):
+    """Inspect real replay bindings, outside capture and only in sync debug mode.
+
+    The block-table CPU copy synchronizes preceding work. This diagnostic must
+    not be enabled when measuring latency. Prefix SWA entries may be evicted;
+    report them without treating those entries as a proven input violation.
+    """
+    workspace = params["workspace"]
+    workspace_start = workspace.data_ptr()
+    workspace_end = workspace_start + workspace.numel() * workspace.element_size()
+
+    def check_overlap(name, value):
+        if isinstance(value, (list, tuple)):
+            for child_index, child in enumerate(value):
+                check_overlap(f"{name}[{child_index}]", child)
+        elif isinstance(value, torch.Tensor) and value.numel():
+            if value.device != workspace.device:
+                return
+            start = value.data_ptr()
+            span = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(value.shape, value.stride())
+            )
+            end = start + span * value.element_size()
+            if start < workspace_end and workspace_start < end:
+                raise RuntimeError(
+                    f"Frozen-KV {role} bucket={bucket} FIA task={index}: "
+                    f"workspace overlaps {name}; workspace=[{workspace_start:#x}, "
+                    f"{workspace_end:#x}) tensor=[{start:#x}, {end:#x})"
+                )
+
+    for name, value in params.items():
+        if name != "workspace":
+            check_overlap(name, value)
+
+    table = params.get("block_table")
+    if table is None:
+        return
+    lengths = params.get("actual_seq_kvlen", params.get("actual_seq_lengths_kv"))
+    block_size = params["block_size"]
+    rows = table.detach().cpu().tolist()
+    cache_pages = min(params["key"].shape[0], params["value"].shape[0])
+    pages = [
+        row[: (length + block_size - 1) // block_size]
+        for row, length in zip(rows, lengths)
+    ]
+    invalid = [
+        (row_id, column, page)
+        for row_id, row in enumerate(pages)
+        for column, page in enumerate(row)
+        if page < 0 or page >= cache_pages
+    ]
+    logger.info(
+        "Frozen-KV NPU %s FIA input check: bucket=%s task=%s "
+        "workspace=%s bytes=%s overlap=False cache_pages=%s "
+        "kv_lens=%s sparse_mode=%s pre_tokens=%s next_tokens=%s "
+        "prefix_page_ids=%s invalid_prefix_pages=%s",
+        role,
+        bucket,
+        index,
+        hex(workspace_start),
+        workspace_end - workspace_start,
+        cache_pages,
+        lengths,
+        params.get("sparse_mode"),
+        params.get("pre_tokens"),
+        params.get("next_tokens"),
+        pages,
+        invalid,
+    )
+    if invalid and params.get("sparse_mode", 0) == 0:
+        raise RuntimeError(
+            f"Frozen-KV {role} bucket={bucket} FIA task={index}: "
+            f"full-attention block table contains invalid pages: {invalid}"
+        )
+
+
 def _watch_replay_progress(device_module, device_id, role, bucket, ready, markers, done):
     """Observe stream progress without synchronizing or changing graph dependencies.
 
@@ -316,8 +393,15 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                 stream,
                 self._update_stream,
             )
-            if shape_key not in self._debugged_shapes:
+            lengths = resolved[0].get(
+                "actual_seq_kvlen", resolved[0].get("actual_seq_lengths_kv")
+            )
+            # Recheck when context crosses a power of two: startup's short
+            # warmup must not suppress diagnostics for the real long prompt.
+            debug_key = (shape_key, max(lengths, default=0).bit_length())
+            if debug_key not in self._debugged_shapes:
                 for index, params in enumerate(resolved):
+                    _debug_check_fia_inputs(self._role, shape_key.size, index, params)
                     logger.info(
                         "Frozen-KV NPU %s FIA task %s: bucket=%s layout=%s "
                         "q_shape=%s q_stride=%s q_dtype=%s k_shape=%s "
@@ -339,7 +423,7 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                         params.get("actual_seq_qlen"),
                         params["workspace"].numel() * params["workspace"].element_size(),
                     )
-                self._debugged_shapes.add(shape_key)
+                self._debugged_shapes.add(debug_key)
         debug_ready = None
         debug_markers = []
         if self._debug_graph_sync:
