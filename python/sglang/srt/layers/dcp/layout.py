@@ -877,7 +877,13 @@ def dcp_packed_kv_lens(forward_batch, plan: DcpPackedReadPlan, device) -> torch.
     same mistake was already made and fixed once on the DSA-CP path.
     """
     cached = getattr(forward_batch, "npu_dcp_packed_kv_lens", None)
-    if cached is None:
-        cached = torch.tensor([plan.rows], dtype=torch.int32, device=device)
+    if (
+        cached is None
+        or getattr(forward_batch, "npu_dcp_packed_kv_rows", None) != plan.rows
+        or cached.device != torch.device(device)
+    ):
+        # Device fill avoids a blocking host copy between asynchronous collectives.
+        cached = torch.full((1,), plan.rows, dtype=torch.int32, device=device)
         forward_batch.npu_dcp_packed_kv_lens = cached
+        forward_batch.npu_dcp_packed_kv_rows = plan.rows
     return cached

@@ -182,6 +182,19 @@ def report_cases(text):
     return results
 
 
+def benchmark_admitted(gate, *, baseline=False, allow_parity_failure=False):
+    if gate.get("missing") or (not baseline and gate.get("activation") != "verified"):
+        return False
+    if gate.get("status") == "pass" and gate.get("quality") == "verified":
+        return True
+    return bool(
+        allow_parity_failure
+        and gate.get("status") == "fail"
+        and gate.get("failure_phase") == "parity"
+        and gate.get("activation") == "verified"
+    )
+
+
 def ais_metrics(text, requests):
     metrics = None
     for line in text.splitlines():
@@ -266,7 +279,9 @@ def variant_launch(harness, repo, config):
         env[name] = "False"
     env.update(scenario.get("env", {}))
     env.update(
-        SGLANG_NPU_FEATURE_EVIDENCE="False",
+        SGLANG_NPU_FEATURE_EVIDENCE="True"
+        if config.get("performance_only")
+        else "False",
         SGLANG_DEBUG_STAGE_LATENCY="False",
         SGLANG_NPU_DEBUG_DCP="False",
     )
@@ -286,6 +301,57 @@ def variant_launch(harness, repo, config):
         env.pop("HCCL_BUFFSIZE", None)
         env.pop("DEEPEP_HCCL_BUFFSIZE", None)
     return command, env
+
+
+def validate_variant_topology(harness, config, resolved):
+    scenario = harness.scenario_for(
+        config["variant"], config.get("reference_recipe", "ordinary")
+    )
+    overrides = scenario.get("launch_overrides", {})
+    for key, expected in (
+        ("tp_size", 16),
+        ("dcp_size", 16 if scenario.get("dcp") else 1),
+        (
+            "max_running_requests",
+            overrides.get("max_running_requests", config["maxreq"]),
+        ),
+        ("quantization", "modelslim"),
+        ("cuda_graph_backend_prefill", "disabled"),
+        ("cuda_graph_backend_decode", "disabled"),
+    ):
+        if resolved.get(key) != expected:
+            raise RuntimeError(
+                f"Unexpected {key}: {resolved.get(key)}; expected {expected}"
+            )
+    if scenario.get("dcp") and resolved.get("prefill_max_requests") != 1:
+        raise RuntimeError("DCP timing requires prefill_max_requests=1")
+    fuseep = scenario.get("fuseep")
+    if fuseep and (
+        resolved.get("ep_size", resolved.get("moe_ep_size")) != 16
+        or resolved.get("fuseep_mode") != fuseep
+        or resolved.get("moe_a2a_backend") != "ascend_fuseep"
+    ):
+        raise RuntimeError("Resolved FuseEP topology/mode differs from launch")
+
+
+def timed_activation(log, variant):
+    features = set()
+    for line in log.splitlines():
+        if "NPU_FEATURE_EVIDENCE " not in line:
+            continue
+        try:
+            features.add(
+                json.loads(line.split("NPU_FEATURE_EVIDENCE ", 1)[1])["feature"]
+            )
+        except (ValueError, KeyError, TypeError):
+            continue
+    required = {"dsa-residual-shard"}
+    if variant == "megamoe":
+        required |= {"megamoe", "dsa-ep-moe-local"}
+    missing = sorted(required - features)
+    if missing:
+        raise RuntimeError("Timed workload missing activation: " + ", ".join(missing))
+    return sorted(features)
 
 
 def worker():
@@ -385,33 +451,7 @@ def worker():
                 raise TimeoutError("Server startup timed out")
             save(folder / "server_info.json", info)
             resolved = info.get("server_args", info)
-            for key, expected in (
-                ("tp_size", 16),
-                (
-                    "dcp_size",
-                    16 if harness.SCENARIOS[config["variant"]].get("dcp") else 1,
-                ),
-                ("max_running_requests", config["maxreq"]),
-                ("quantization", "modelslim"),
-                ("cuda_graph_backend_prefill", "disabled"),
-                ("cuda_graph_backend_decode", "disabled"),
-            ):
-                if resolved.get(key) != expected:
-                    raise RuntimeError(f"Unexpected {key}: {resolved.get(key)}")
-            if (
-                harness.SCENARIOS[config["variant"]].get("dcp")
-                and resolved.get("prefill_max_requests") != 1
-            ):
-                raise RuntimeError("DCP timing requires prefill_max_requests=1")
-            fuseep = harness.SCENARIOS[config["variant"]].get("fuseep")
-            if fuseep and (
-                resolved.get("moe_ep_size") != 16
-                or resolved.get("fuseep_mode") != fuseep
-                or resolved.get("moe_a2a_backend") != "ascend_fuseep"
-            ):
-                raise RuntimeError(
-                    "Resolved FuseEP topology/mode differs from qualification"
-                )
+            validate_variant_topology(harness, config, resolved)
             overrides = resolved.get("json_model_override_args") or {}
             if isinstance(overrides, str):
                 overrides = json.loads(overrides)
@@ -556,6 +596,16 @@ def main():
     parser.add_argument("--long-requests", type=int, default=2)
     parser.add_argument("--long-dcp-size", type=int, choices=(1, 16), default=16)
     parser.add_argument("--diagnostic-megamoe", action="store_true")
+    parser.add_argument(
+        "--performance-only",
+        action="store_true",
+        help="Skip separate qualification launches; label timings diagnostic with numerical quality unchecked",
+    )
+    parser.add_argument(
+        "--allow-parity-failure",
+        action="store_true",
+        help="Time activated variants despite numerical parity failure; retain failed quality in reports",
+    )
     parser.add_argument("--megamoe-dispatch-tokens", type=int, default=4096)
     parser.add_argument("--long-cache-modes", default="cold,prefix99")
     parser.add_argument("--long-warmup", choices=("once", "each"), default="each")
@@ -616,6 +666,8 @@ def main():
     if args.check_paths:
         print(f"AISBench host paths OK: {args.ais_dir}; environment: {args.ais_env}")
         return 0
+    if args.performance_only and args.features_only:
+        parser.error("--performance-only cannot be combined with --features-only")
     stages = args.feature_stages.split(",")
     if (
         not stages
@@ -625,6 +677,15 @@ def main():
         parser.error("--feature-stages must select unique host,npu,serve,long stages")
     if not args.features_only and "serve" not in stages:
         parser.error("Benchmark timing requires serve qualification")
+    if args.performance_only:
+        if (
+            args.reference_recipe != "historical-bde"
+            or args.variants != "baseline,megamoe"
+        ):
+            parser.error(
+                "--performance-only requires historical-bde and --variants baseline,megamoe"
+            )
+        stages = []
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
     if args.moe_only and args.feature_cases == "*":
         args.feature_cases = ",".join("serve-" + name for name in MOE_VARIANTS)
@@ -658,6 +719,7 @@ def main():
     common = {
         "repo": args.repo,
         "reference_recipe": args.reference_recipe,
+        "performance_only": args.performance_only,
         "megamoe_dispatch_tokens": args.megamoe_dispatch_tokens,
         "checkpoint": args.checkpoint,
         "w8a8_checkpoint": args.w8a8_checkpoint,
@@ -858,7 +920,8 @@ def main():
             [
                 "",
                 "Raw reports and server logs: `container-artifacts/`. Blocked/inactive cases are not passes.",
-                "AISBench DCP uses one output token; AISBench MoE uses multiple. Native long cases always use one output token (TPOT undefined). Compare only matched workloads.",
+                "Historical-baseline AISBench comparisons use one output token (TPOT undefined); ordinary MoE workloads use multiple. Compare only matched workloads.",
+                "diagnostic-parity-failed means numerical quality failed; diagnostic-unqualified means it was not checked. Neither is a qualified pass.",
             ]
         )
         (output / "SUMMARY.md").write_text("\n".join(rows) + "\n")
@@ -906,6 +969,7 @@ def main():
                                         status=case["status"],
                                         activation=case.get("activation"),
                                         quality=case.get("quality"),
+                                        failure_phase=case.get("failure_phase"),
                                         reason=case.get("reason", case.get("error")),
                                     )
                                 )
@@ -946,11 +1010,10 @@ def main():
                     persist()
                     continue
                 gate = qualification.get("serve-" + variant, {})
-                if (
-                    gate.get("status") != "pass"
-                    or gate.get("quality") != "verified"
-                    or gate.get("missing")
-                    or (variant != "baseline" and gate.get("activation") != "verified")
+                if not args.performance_only and not benchmark_admitted(
+                    gate,
+                    baseline=variant == "baseline",
+                    allow_parity_failure=args.allow_parity_failure,
                 ):
                     records.append(
                         {
@@ -961,6 +1024,21 @@ def main():
                     )
                     persist()
                     continue
+                diagnostic = gate.get("failure_phase") == "parity"
+                measurement_status = (
+                    "diagnostic-unqualified"
+                    if args.performance_only
+                    else "diagnostic-parity-failed"
+                    if diagnostic
+                    else "pass"
+                )
+                measurement_quality = (
+                    "not_checked"
+                    if args.performance_only
+                    else "failed"
+                    if diagnostic
+                    else gate.get("quality")
+                )
                 folder = output / variant
                 folder.mkdir()
                 print(f"AISBench {variant}, {args.repeats} repeats", flush=True)
@@ -1043,10 +1121,21 @@ def main():
                             shutil.copyfile(
                                 csv, folder / f"aisbench-results-{repeat}.csv"
                             )
+                        if args.performance_only:
+                            log = subprocess.check_output(
+                                [*docker, "cat", f"{remote}/{variant}/server.log"],
+                                text=True,
+                            )
+                            features = timed_activation(log, variant)
+                            save(folder / "activation.json", features)
                         records.append(
                             {
                                 "case": f"{variant}/{repeat}",
-                                "status": "pass",
+                                "status": measurement_status,
+                                "quality": measurement_quality,
+                                "qualification_failure": gate.get("error")
+                                if diagnostic
+                                else None,
                                 "metrics": metrics,
                             }
                         )
@@ -1054,13 +1143,21 @@ def main():
                     values = [
                         r["metrics"]["TTFT avg"]
                         for r in records
-                        if r["case"].startswith(variant + "/") and r["status"] == "pass"
+                        if r["case"].startswith(variant + "/")
+                        and r["status"]
+                        in (
+                            "pass",
+                            "diagnostic-parity-failed",
+                            "diagnostic-unqualified",
+                        )
                     ]
                     save(
                         folder / "aggregate.json",
                         {
                             "median_ttft_ms": statistics.median(values),
                             "runs": len(values),
+                            "status": measurement_status,
+                            "quality": measurement_quality,
                         },
                     )
                 except Exception as exc:  # noqa: BLE001 - retain failures and continue independent cases

@@ -364,6 +364,103 @@ class TestBdeOvernight(CustomTestCase):
             self.assertEqual(len(events.read_text().splitlines()), 6)
             self.assertIn("bde-v2/2", (output / "SUMMARY.md").read_text())
 
+    def test_historical_topology_validation_uses_composed_recipe_and_ep_size(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "composed_topology"
+        )
+        config = dict(variant="baseline", reference_recipe="historical-bde", maxreq=1)
+        resolved = dict(
+            tp_size=16,
+            dcp_size=16,
+            max_running_requests=1,
+            prefill_max_requests=1,
+            quantization="modelslim",
+            cuda_graph_backend_prefill="disabled",
+            cuda_graph_backend_decode="disabled",
+        )
+        module.validate_variant_topology(harness, config, resolved)
+        with self.assertRaisesRegex(RuntimeError, "dcp_size"):
+            module.validate_variant_topology(
+                harness, config, dict(resolved, dcp_size=1)
+            )
+        config["variant"] = "megamoe"
+        resolved.update(ep_size=16, fuseep_mode=3, moe_a2a_backend="ascend_fuseep")
+        module.validate_variant_topology(harness, config, resolved)
+        with self.assertRaisesRegex(RuntimeError, "FuseEP"):
+            module.validate_variant_topology(harness, config, dict(resolved, ep_size=1))
+
+    def test_performance_only_has_no_qualification_launches(self):
+        module = self.runner()
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "night",
+                    "--dry-run",
+                    "--performance-only",
+                    "--reference-recipe",
+                    "historical-bde",
+                    "--variants",
+                    "baseline,megamoe",
+                    "--repeats",
+                    "1",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(module.main(), 0)
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan["feature_commands"], {})
+        self.assertEqual(plan["variants"], ["baseline", "megamoe"])
+        self.assertTrue(plan["server_settings"]["performance_only"])
+        self.assertEqual(plan["repeats"], 1)
+
+    def test_timed_megamoe_requires_kernel_and_local_ep_activation(self):
+        module = self.runner()
+        log = "\n".join(
+            "NPU_FEATURE_EVIDENCE " + json.dumps(dict(feature=name))
+            for name in ("dsa-residual-shard", "megamoe", "dsa-ep-moe-local")
+        )
+        self.assertIn("megamoe", module.timed_activation(log, "megamoe"))
+        with self.assertRaisesRegex(RuntimeError, "dsa-ep-moe-local"):
+            module.timed_activation(log.rsplit("\n", 1)[0], "megamoe")
+
+    def test_diagnostic_gate_only_bypasses_activated_parity_failures(self):
+        module = self.runner()
+        gate = dict(
+            status="fail",
+            failure_phase="parity",
+            activation="verified",
+            quality="unverified",
+            missing=[],
+        )
+        self.assertFalse(module.benchmark_admitted(gate))
+        self.assertTrue(module.benchmark_admitted(gate, allow_parity_failure=True))
+        self.assertTrue(
+            module.benchmark_admitted(gate, baseline=True, allow_parity_failure=True)
+        )
+        for changes in (
+            dict(failure_phase="candidate"),
+            dict(failure_phase="reference"),
+            dict(activation="unverified"),
+            dict(missing=["megamoe"]),
+            dict(status="inactive"),
+            dict(status="dependency_blocked"),
+        ):
+            with self.subTest(changes=changes):
+                self.assertFalse(
+                    module.benchmark_admitted(
+                        dict(gate, **changes), allow_parity_failure=True
+                    )
+                )
+        passed = dict(status="pass", quality="verified", activation="unverified")
+        self.assertTrue(module.benchmark_admitted(passed, baseline=True))
+        self.assertFalse(module.benchmark_admitted(passed))
+
     def test_failed_requests_and_missing_summary_cannot_pass(self):
         module = self.runner()
         for text in ("no summary", "│ Failed Requests │ total │ 2 │"):

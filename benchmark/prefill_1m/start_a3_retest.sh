@@ -29,6 +29,21 @@ case "$mode" in
     args+=(--features-only --feature-stages serve --feature-cases serve-baseline,serve-megamoe
            --max-hours 1 --feature-timeout 3600)
     ;;
+  megamoe-compare)
+    args+=(--performance-only --reference-recipe historical-bde --variants baseline,megamoe
+           --length 1000000 --requests 16 --maxreq 1 --chunk 32768
+           --kv-rows 67584 --context 1048576 --memfrac 0.85 --repeats 1
+           --megamoe-dispatch-tokens 2048 --startup-timeout 1200
+           --max-hours 2)
+    ;;
+  megamoe-diagnostic)
+    args+=(--feature-stages serve --reference-recipe historical-bde --allow-parity-failure
+           --feature-cases serve-baseline,serve-megamoe --variants baseline,megamoe
+           --length 1000000 --requests 16 --maxreq 1 --chunk 32768
+           --kv-rows 67584 --context 1048576 --memfrac 0.85 --repeats 1
+           --megamoe-dispatch-tokens 2048 --startup-timeout 1200
+           --max-hours 2 --feature-timeout 7200)
+    ;;
   historical-repro)
     args+=(--feature-stages serve --reference-recipe historical-bde --feature-cases serve-historical-bde --variants historical-bde
            --length 1000000 --requests 16 --maxreq 1 --chunk 32768
@@ -100,7 +115,7 @@ case "$mode" in
   all)
     args+=(--repeats 3)
     ;;
-  *) printf 'Usage: %s {quick|megamoe|historical-repro|baseline-repro|megamoe-500k|megamoe-measure|fix-check|moe|dcp|failures|overnight-repair|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
+  *) printf 'Usage: %s {quick|megamoe|megamoe-compare|megamoe-diagnostic|historical-repro|baseline-repro|megamoe-500k|megamoe-measure|fix-check|moe|dcp|failures|overnight-repair|overnight|overnight-core|all} [runner arguments]\n' "$0"; exit 2 ;;
 esac
 
 docker cp "$container:$repo/benchmark/prefill_1m/start_bde_overnight.sh" "$scratch/start.sh"

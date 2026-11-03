@@ -649,6 +649,7 @@ def _prepare_dcp_prefix(m, batch, hidden_states):
             batch.npu_dcp_extend_gather = plan
     else:
         plan = packed
+        dcp_layout.dcp_packed_kv_lens(batch, packed, hidden_states.device)
     refs = (
         hidden_states.new_empty((0, 1, m.kv_lora_rank)),
         hidden_states.new_empty((0, 1, m.qk_rope_head_dim)),

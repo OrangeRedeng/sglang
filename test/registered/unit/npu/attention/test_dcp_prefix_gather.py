@@ -1,6 +1,8 @@
 """Guard asynchronous prefix ownership, wait ordering and packed remapping."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
@@ -9,6 +11,7 @@ from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
 )
 from sglang.srt.layers.dcp.layout import (
     dcp_owned_prefix_positions,
+    dcp_packed_kv_lens,
     plan_dcp_extend_gather,
     plan_dcp_packed_read,
     remap_topk_to_packed,
@@ -50,6 +53,20 @@ class CollectiveWorld:
 
 
 class TestDcpPrefixGather(CustomTestCase):
+    def test_packed_lengths_reuse_and_refresh_without_host_tensor_copy(self):
+        batch = SimpleNamespace()
+        with patch.object(
+            torch, "tensor", side_effect=AssertionError("blocking host tensor factory")
+        ):
+            first = dcp_packed_kv_lens(batch, SimpleNamespace(rows=34816), "cpu")
+            reused = dcp_packed_kv_lens(batch, SimpleNamespace(rows=34816), "cpu")
+            changed = dcp_packed_kv_lens(batch, SimpleNamespace(rows=35840), "cpu")
+        self.assertIs(first, reused)
+        self.assertIsNot(first, changed)
+        self.assertEqual(first.tolist(), [34816])
+        self.assertEqual(changed.tolist(), [35840])
+        self.assertEqual(changed.dtype, torch.int32)
+
     def test_deferred_gather_matches_position_order(self):
         for size in (2, 4):
             for page in (1, 8, 128):

@@ -43,6 +43,7 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
     dcp_crop_free_extend,
     dcp_local_kv_block_table,
+    dcp_packed_kv_lens,
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
@@ -1494,9 +1495,7 @@ class AscendAttnBackend(AttentionBackend):
         sparse_mode = 3
         packed = getattr(forward_batch, "npu_dcp_prefix_layout", None)
         if packed is not None:
-            seq_lengths_kv = torch.tensor(
-                [packed.rows], device=q_nope.device, dtype=torch.int32
-            )
+            seq_lengths_kv = dcp_packed_kv_lens(forward_batch, packed, q_nope.device)
             sparse_mode = 0
         elif dsa_token_shard_plan is not None:
             if dcp_crop_free_extend(
