@@ -483,6 +483,20 @@ class AscendAttnBackend(AttentionBackend):
             self.full_to_swa_index_mapping = pool.full_to_swa_index_mapping
             self.sliding_window_size = model_runner.sliding_window_size
 
+        # Frozen draft TND attention uses fia_mask plus sparse-window arguments,
+        # not the dense per-request swa_mask. Check every actual SWA layer:
+        # unsupported head geometry still needs the BSH fallback's dense mask.
+        self.frozen_kv_draft_uses_tnd_swa = False
+        if frozen_draft and self.use_fia and not self.use_mla and self.is_hybrid_swa:
+            swa_layers = [
+                layer
+                for layer in model_runner.model.modules()
+                if isinstance(layer, RadixAttention) and self._is_swa_layer(layer)
+            ]
+            self.frozen_kv_draft_uses_tnd_swa = bool(swa_layers) and all(
+                self._can_use_tnd(layer) for layer in swa_layers
+            )
+
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
             self.is_hybrid_swa
@@ -1128,11 +1142,17 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            # Skip this dense decode-only mask for frozen-KV target verify.
-            # forward_mtp uses mtp_mask for TND or builds a separate BSND
-            # causal mask; neither path reads metadata.swa_mask. Keep the
-            # buffer and refresh it normally for decode and prefill modes.
-            if not (self.is_frozen_kv_mtp and forward_mode.is_target_verify()):
+            # Frozen verify uses mtp_mask (TND) or its own BSND mask. Frozen
+            # draft also does not read swa_mask when all SWA layers use TND.
+            # Preserve the dense mask for prefill and the BSH decode fallback.
+            skip_swa_mask = (
+                self.is_frozen_kv_mtp and forward_mode.is_target_verify()
+            ) or (
+                self.frozen_kv_draft_uses_tnd_swa
+                and forward_mode.is_decode_or_idle()
+                and spec_info is None
+            )
+            if not skip_swa_mask:
                 # Update SWA mask: True = masked out (don't attend), False = attend.
                 # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
                 # (= prefix + block_size) to keep draft KV inside the mask window.
