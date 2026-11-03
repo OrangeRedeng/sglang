@@ -1126,31 +1126,36 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            # Update SWA mask: True = masked out (don't attend), False = attend.
-            # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
-            # (= prefix + block_size) to keep draft KV inside the mask window.
-            if (
-                forward_mode.is_target_verify()
-                and _is_dflash_verify(spec_info)
-                and seq_lens_cpu is not None
-            ):
-                # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
-                seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
-            else:
-                seq_lens_int = seq_lens[:bs].int()
-            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-            indices = (
-                prefill_state["swa_indices"]
-                if prefill_state is not None
-                else self.graph_metadata["swa_indices"]
-            )
-            start_exp = starts.unsqueeze(1)
-            seq_exp = seq_lens_int.unsqueeze(1)
-            mask = (indices.unsqueeze(0) < start_exp) | (
-                indices.unsqueeze(0) >= seq_exp
-            )
-            metadata.swa_mask[:bs, 0, :].copy_(mask)
-            metadata.swa_mask[bs:, :, :].fill_(True)
+            # Skip this dense decode-only mask for frozen-KV target verify.
+            # forward_mtp uses mtp_mask for TND or builds a separate BSND
+            # causal mask; neither path reads metadata.swa_mask. Keep the
+            # buffer and refresh it normally for decode and prefill modes.
+            if not (self.is_frozen_kv_mtp and forward_mode.is_target_verify()):
+                # Update SWA mask: True = masked out (don't attend), False = attend.
+                # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
+                # (= prefix + block_size) to keep draft KV inside the mask window.
+                if (
+                    forward_mode.is_target_verify()
+                    and _is_dflash_verify(spec_info)
+                    and seq_lens_cpu is not None
+                ):
+                    # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
+                    seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
+                else:
+                    seq_lens_int = seq_lens[:bs].int()
+                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+                indices = (
+                    prefill_state["swa_indices"]
+                    if prefill_state is not None
+                    else self.graph_metadata["swa_indices"]
+                )
+                start_exp = starts.unsqueeze(1)
+                seq_exp = seq_lens_int.unsqueeze(1)
+                mask = (indices.unsqueeze(0) < start_exp) | (
+                    indices.unsqueeze(0) >= seq_exp
+                )
+                metadata.swa_mask[:bs, 0, :].copy_(mask)
+                metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
             // self.page_size
