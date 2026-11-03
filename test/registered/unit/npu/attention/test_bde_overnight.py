@@ -32,6 +32,28 @@ class TestBdeOvernight(CustomTestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_native_failure_attribution_and_run_scoped_dumps(self):
+        runner = self.runner()
+        self.assertEqual(
+            runner.server_failure("retCode=0x25 [aicore timeout]"),
+            "native AICore timeout",
+        )
+        self.assertIsNone(runner.server_failure("Missing successful AISBench summary"))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "extra-info/data-dump/0"
+            source.mkdir(parents=True)
+            (source / "old").write_text("old run")
+            os.utime(source / "old", (1, 1))
+            (source / "mc2_exception_info_MegaMoe").write_text("native evidence")
+            target = repo / "artifacts"
+            runner.collect_native_dumps(repo, target, 2)
+            self.assertFalse((target / "native-dumps/0/old").exists())
+            self.assertEqual(
+                (target / "native-dumps/0/mc2_exception_info_MegaMoe").read_text(),
+                "native evidence",
+            )
+
     def test_global_budget_and_single_warmup_reach_container_command(self):
         module = self.runner()
         output = io.StringIO()

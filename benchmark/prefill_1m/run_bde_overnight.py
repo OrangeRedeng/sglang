@@ -225,6 +225,28 @@ def ais_metrics(text, requests):
     return metrics
 
 
+def server_failure(log):
+    for pattern, reason in (
+        (r"aicore timeout", "native AICore timeout"),
+        (r"out of memory|NPU out of memory", "server out of memory"),
+    ):
+        match = re.search(pattern, log, re.IGNORECASE)
+        if match:
+            return reason
+    return None
+
+
+def collect_native_dumps(repo, folder, started):
+    source = repo / "extra-info" / "data-dump"
+    if not source.is_dir():
+        return
+    for path in source.rglob("*"):
+        if path.is_file() and path.stat().st_mtime >= started:
+            target = folder / "native-dumps" / path.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+
 def variant_launch(harness, repo, config):
     scenario = harness.scenario_for(
         config["variant"], config.get("reference_recipe", "ordinary")
@@ -376,6 +398,7 @@ def worker():
     folder.mkdir(parents=True, exist_ok=True)
     os.chdir(repo)
     owned = []
+    started = time.time()
 
     def spawn(*args, **kwargs):
         process = subprocess.Popen(*args, **kwargs)
@@ -515,6 +538,10 @@ def worker():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         for process in reversed(owned):
             stop_owned(process, include_exited=config["action"] == "serve")
+        try:
+            collect_native_dumps(repo, folder, started)
+        except OSError as exc:
+            (folder / "native-dumps-error.log").write_text(str(exc))
 
 
 class ContainerJob:
@@ -1148,9 +1175,25 @@ def main():
                                 start_new_session=True,
                             )
                             try:
-                                code = process.wait(
-                                    timeout=remaining_timeout(args.benchmark_timeout)
+                                deadline = time.monotonic() + remaining_timeout(
+                                    args.benchmark_timeout
                                 )
+                                while True:
+                                    if job.process.poll() is not None:
+                                        raise RuntimeError(
+                                            "Server worker exited during AISBench; see server.log"
+                                        )
+                                    try:
+                                        code = process.wait(
+                                            timeout=min(
+                                                2, max(0, deadline - time.monotonic())
+                                            )
+                                        )
+                                        break
+                                    except subprocess.TimeoutExpired:
+                                        if time.monotonic() >= deadline:
+                                            raise
+
                             finally:
                                 stop_owned(process, include_exited=True)
                         if code:
@@ -1204,12 +1247,28 @@ def main():
                     )
                 except Exception as exc:  # noqa: BLE001 - retain failures and continue independent cases
                     (folder / "exception.log").write_text(traceback.format_exc())
+                    failure_phase, error = phase, str(exc)
+                    snapshot = subprocess.run(
+                        [*docker, "cat", f"{remote}/{variant}/server.log"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if snapshot.returncode == 0:
+                        (folder / "server-failure.log").write_text(snapshot.stdout)
+                        reason = server_failure(snapshot.stdout)
+                        if reason:
+                            failure_phase, error = (
+                                "server-execution",
+                                f"{reason}; client: {exc}",
+                            )
                     records.append(
                         {
                             "case": variant,
                             "status": "fail",
-                            "phase": phase,
-                            "error": str(exc),
+                            "phase": failure_phase,
+                            "client_phase": phase,
+                            "error": error,
                             "log": str(folder / "exception.log"),
                         }
                     )

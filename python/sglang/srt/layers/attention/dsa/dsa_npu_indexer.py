@@ -189,6 +189,14 @@ def prepare_graph_indexer_query_shard(forward_batch, cache):
     return shard
 
 
+def _indexer_device_lengths(values, device):
+    # Scalar fills enqueue on the current stream without a synchronous H2D copy.
+    result = torch.empty(len(values), dtype=torch.int32, device=device)
+    for index, value in enumerate(values):
+        result[index : index + 1].fill_(value)
+    return result
+
+
 def _build_indexer_query_shard(
     forward_batch: ForwardBatch,
 ) -> Optional[_IndexerQueryShard]:
@@ -219,10 +227,8 @@ def _build_indexer_query_shard(
         num_real=num_real,
         total=sum(extend_lens),
         tp_size=parallel.attn_tp_size,
-        actual_seq_lengths_q=torch.tensor(
-            cum_query_lens, dtype=torch.int32, device=device
-        ),
-        actual_seq_lengths_kv=torch.tensor(key_lens, dtype=torch.int32, device=device),
+        actual_seq_lengths_q=_indexer_device_lengths(cum_query_lens, device),
+        actual_seq_lengths_kv=_indexer_device_lengths(key_lens, device),
     )
 
 
@@ -243,19 +249,31 @@ def _get_indexer_query_shard(
         if plan is None or num_tokens != plan.rows:
             raise ValueError("indexer received a different local token grid")
         device = forward_batch.positions.device
-        return _IndexerQueryShard(
-            start=plan.local_start,
-            rows=plan.rows,
-            num_real=plan.num_local_tokens,
-            total=plan.num_tokens,
-            tp_size=plan.num_tokens_pad // plan.rows,
-            actual_seq_lengths_q=torch.tensor(
-                cumulative(plan.query_lens), dtype=torch.int32, device=device
-            ),
-            actual_seq_lengths_kv=torch.tensor(
-                plan.key_lens, dtype=torch.int32, device=device
-            ),
+        signature = (
+            plan.local_start,
+            plan.rows,
+            plan.num_local_tokens,
+            plan.num_tokens,
+            tuple(plan.query_lens),
+            tuple(plan.key_lens),
+            device,
         )
+        cached = getattr(forward_batch, "npu_local_indexer_query_shard", None)
+        if cached is None or cached[0] != signature:
+            shard = _IndexerQueryShard(
+                start=plan.local_start,
+                rows=plan.rows,
+                num_real=plan.num_local_tokens,
+                total=plan.num_tokens,
+                tp_size=plan.num_tokens_pad // plan.rows,
+                actual_seq_lengths_q=_indexer_device_lengths(
+                    cumulative(plan.query_lens), device
+                ),
+                actual_seq_lengths_kv=_indexer_device_lengths(plan.key_lens, device),
+            )
+            cached = (signature, shard)
+            forward_batch.npu_local_indexer_query_shard = cached
+        return cached[1]
     if get_attn_tp_context().input_scattered:
         # A scattered input is already sliced.
         if envs.SGLANG_NPU_DEBUG_DCP.get():

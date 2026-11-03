@@ -637,6 +637,29 @@ class TestDsaTokenResidual(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "different local token grid"):
                 indexer._get_indexer_query_shard(batch, 4)
 
+    def test_local_indexer_metadata_avoids_host_copy_and_refreshes_boundaries(self):
+        from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
+
+        batch = SimpleNamespace(
+            npu_dsa_cp_plan=plan_dsa_cp_shard([5], [6149], 2, 1, padded_num_tokens=16),
+            npu_dsa_cp_attention_local=True,
+            positions=torch.arange(16),
+        )
+        with (
+            patch.object(dsa_cp, "_enable_dsa_cp", True),
+            patch.object(indexer.torch, "tensor", side_effect=AssertionError("H2D copy")),
+        ):
+            shard = indexer._get_indexer_query_shard(batch, 8)
+            self.assertIs(indexer._get_indexer_query_shard(batch, 8), shard)
+            self.assertEqual(shard.actual_seq_lengths_q.tolist(), [0])
+            self.assertEqual(shard.actual_seq_lengths_kv.tolist(), [0])
+            batch.npu_dsa_cp_plan = plan_dsa_cp_shard(
+                [5], [7005], 2, 0, padded_num_tokens=16
+            )
+            updated = indexer._get_indexer_query_shard(batch, 8)
+            self.assertIsNot(updated, shard)
+            self.assertEqual(updated.actual_seq_lengths_kv.tolist(), [7005])
+
     @staticmethod
     def _tp8_indexer_case(legacy, total, rank):
         from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
