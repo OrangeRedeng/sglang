@@ -1113,11 +1113,13 @@ class AscendAttnBackend(AttentionBackend):
         max_len = attention_kv_lens_cpu.max().item()
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
+        # Both full and SWA tables refer to these same committed page starts.
+        # Gather once: the metadata writes below do not modify req_to_token.
+        full_page_locs = self.req_to_token[
+            req_pool_indices[:bs],
+            0 : max_len : self.page_size,
+        ]
         if self.is_hybrid_swa:
-            full_page_locs = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_len : self.page_size,
-            ]
             swa_page_table = (
                 self.full_to_swa_index_mapping[full_page_locs] // self.page_size
             )
@@ -1157,8 +1159,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
+            full_page_locs // self.page_size
         )
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
