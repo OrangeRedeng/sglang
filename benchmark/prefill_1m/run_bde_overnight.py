@@ -58,6 +58,10 @@ DCP_VARIANTS = (
     "dcp-decode-q-preissue",
     "bde-v2",
     "historical-bde",
+    "legacy-control-40s",
+    "legacy-megamoe-34s",
+    "graph-full",
+    "graph-piecewise",
     "dsa-metadata",
     "dsa-metadata-batch2",
     "dsa-metadata-megamoe",
@@ -280,7 +284,7 @@ def variant_launch(harness, repo, config):
         MEMFRAC=str(config["memfrac"]),
         MAXREQ=str(config["maxreq"]),
         PORT="30000",
-        EXTRA_ARGS=f"--quantization modelslim --watchdog-timeout 7200 --max-total-tokens {config['kv_rows']}",
+        EXTRA_ARGS=f"--quantization modelslim --watchdog-timeout {config.get('watchdog_timeout', 7200)} --max-total-tokens {config['kv_rows']}",
     )
     if scenario.get("dcp"):
         inherited["PREFILL_MAXREQ"] = str(
@@ -315,6 +319,20 @@ def variant_launch(harness, repo, config):
         SGLANG_DEBUG_STAGE_LATENCY="False",
         SGLANG_NPU_DEBUG_DCP="False",
     )
+    if scenario.get("graph"):
+        command[command.index("--cuda-graph-backend-prefill") + 1] = scenario["graph"]
+        command[command.index("--cuda-graph-backend-decode") + 1] = "full"
+        command += [
+            "--cuda-graph-max-bs-decode",
+            "32",
+            "--cuda-graph-bs-prefill",
+            "16",
+            "128",
+            "1024",
+            "4096",
+            "16384",
+            "32768",
+        ]
     if scenario.get("separate_shared"):
         command.append("--disable-shared-experts-fusion")
     if scenario.get("fuseep"):
@@ -346,8 +364,8 @@ def validate_variant_topology(harness, config, resolved):
             overrides.get("max_running_requests", config["maxreq"]),
         ),
         ("quantization", "modelslim"),
-        ("cuda_graph_backend_prefill", "disabled"),
-        ("cuda_graph_backend_decode", "disabled"),
+        ("cuda_graph_backend_prefill", scenario.get("graph", "disabled")),
+        ("cuda_graph_backend_decode", "full" if scenario.get("graph") else "disabled"),
     ):
         if resolved.get(key) != expected:
             raise RuntimeError(
@@ -365,7 +383,7 @@ def validate_variant_topology(harness, config, resolved):
         raise RuntimeError("Resolved FuseEP topology/mode differs from launch")
 
 
-def timed_activation(log, variant):
+def timed_activation(log, variant, scenario=None):
     features = set()
     for line in log.splitlines():
         if "NPU_FEATURE_EVIDENCE " not in line:
@@ -376,9 +394,13 @@ def timed_activation(log, variant):
             )
         except (ValueError, KeyError, TypeError):
             continue
-    required = {"dsa-residual-shard"}
+    required = set(scenario.get("expected", [])) if scenario is not None else set()
+    if not variant.startswith("legacy-"):
+        required.add("dsa-residual-shard")
     if "megamoe" in variant:
-        required |= {"megamoe", "dsa-ep-moe-local"}
+        required.add("megamoe")
+        if not variant.startswith("legacy-"):
+            required.add("dsa-ep-moe-local")
     if variant.startswith("dsa-metadata"):
         required.add("dsa-metadata-reuse")
     if variant.endswith("-batch2"):
@@ -524,6 +546,9 @@ def worker():
                     "capacity": min(map(int, capacities)),
                     "max_running_requests": resolved["max_running_requests"],
                     "prefill_max_requests": resolved.get("prefill_max_requests"),
+                    "scenario": harness.scenario_for(
+                        config["variant"], config.get("reference_recipe", "ordinary")
+                    ),
                 }
             )
             while process.poll() is None:
@@ -681,6 +706,7 @@ def main():
     parser.add_argument("--memfrac", type=float, default=0.88)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--benchmark-timeout", type=int, default=14400)
+    parser.add_argument("--watchdog-timeout", type=int, default=7200)
     parser.add_argument("--feature-timeout", type=int, default=43200)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -724,26 +750,16 @@ def main():
         parser.error("Benchmark timing requires serve qualification")
     if args.performance_only:
         selected = args.variants.split(",")
-        supported = {
-            "baseline",
-            "megamoe",
-            "dsa-metadata",
-            "dsa-metadata-batch2",
-            "dsa-metadata-megamoe",
-            "dsa-metadata-megamoe-batch2",
-            "dsa-metadata-packed-batch2",
-            "dsa-metadata-packed-megamoe-batch2",
-        }
+        supported = set(VARIANTS) - {"fuseep-1", "fuseep-2"}
         if (
             args.reference_recipe != "historical-bde"
             or not selected
-            or selected[0] != "baseline"
             or len(set(selected)) != len(selected)
             or set(selected) - supported
             or args.moe_only
         ):
             parser.error(
-                "--performance-only requires historical-bde and unique supported variants starting with baseline"
+                "--performance-only requires historical-bde and unique supported variants"
             )
         stages = []
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
@@ -793,6 +809,7 @@ def main():
         "output_len": 1,
         "repeat_rate": 0.99,
         "startup_timeout": args.startup_timeout,
+        "watchdog_timeout": args.watchdog_timeout,
     }
     feature_commands = {}
     for stage in stages:
@@ -925,6 +942,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     shutil.copyfile(__file__, output / "runner.py")
     save(output / "settings.json", vars(args) | {"output": str(output)})
+    (output / "remote-path.txt").write_text(remote + "\n")
     inspect = json.loads(
         subprocess.check_output(["docker", "inspect", args.container], text=True)
     )[0]
@@ -1198,9 +1216,13 @@ def main():
                                 stop_owned(process, include_exited=True)
                         if code:
                             raise RuntimeError(f"AISBench exited {code}; see {logpath}")
-                        metrics = ais_metrics(
-                            logpath.read_text(errors="replace"), args.requests
-                        )
+                        client_log = logpath.read_text(errors="replace")
+                        try:
+                            cold = ais_metrics(client_log, 1)
+                        except RuntimeError as exc:
+                            cold = {"status": "incomplete", "error": str(exc)}
+                        save(folder / f"cold-prefix-metrics-{repeat}.json", cold)
+                        metrics = ais_metrics(client_log, args.requests)
                         csv = Path(args.ais_dir) / "aisbench_result.csv"
                         if csv.is_file():
                             shutil.copyfile(
@@ -1211,7 +1233,9 @@ def main():
                                 [*docker, "cat", f"{remote}/{variant}/server.log"],
                                 text=True,
                             )
-                            features = timed_activation(log, variant)
+                            features = timed_activation(
+                                log, variant, ready.get("scenario")
+                            )
                             save(folder / "activation.json", features)
                         records.append(
                             {

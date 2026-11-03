@@ -27,6 +27,22 @@ def add_combinations(scenarios):
         context_length=1048576,
     )
     scenarios["historical-bde"] = historical
+    legacy = dict(
+        dcp=True,
+        separate_shared=True,
+        launch_overrides=dict(
+            chunk=16384,
+            mem_fraction=0.88,
+            kv_rows=74752,
+            max_running_requests=64,
+            prefill_max_requests=1,
+            context_length=1048576,
+        ),
+    )
+    scenarios["legacy-control-40s"] = copy.deepcopy(legacy)
+    scenarios["legacy-megamoe-34s"] = dict(
+        copy.deepcopy(scenarios["megamoe"]), **legacy
+    )
     for name, moe, batch2 in (
         ("dsa-metadata", False, False),
         ("dsa-metadata-batch2", False, True),
@@ -111,7 +127,11 @@ def component_blockers(case, qualified):
 
 def scenario_for(scenarios, name, reference_recipe="ordinary"):
     variant = copy.deepcopy(scenarios[name])
-    if reference_recipe != "historical-bde" or name == "historical-bde":
+    if (
+        reference_recipe != "historical-bde"
+        or name == "historical-bde"
+        or name.startswith("legacy-")
+    ):
         return variant
     baseline = copy.deepcopy(scenarios["historical-bde"])
     if name in ("baseline", "dcp-baseline"):

@@ -413,6 +413,39 @@ class TestBdeOvernight(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "FuseEP"):
             module.validate_variant_topology(harness, config, dict(resolved, ep_size=1))
 
+    def test_nightly_legacy_control_and_graph_launch_remain_distinct(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "nightly_launch"
+        )
+        config = dict(
+            variant="legacy-control-40s",
+            reference_recipe="historical-bde",
+            checkpoint="/tmp/weights",
+            chunk=32768,
+            context=1048576,
+            memfrac=0.85,
+            maxreq=1,
+            kv_rows=67584,
+        )
+        command, env = module.variant_launch(harness, root, config)
+        self.assertEqual(command[command.index("--chunked-prefill-size") + 1], "16384")
+        self.assertEqual(command[command.index("--max-running-requests") + 1], "64")
+        self.assertEqual(env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "False")
+        config["variant"] = "graph-piecewise"
+        command, env = module.variant_launch(harness, root, config)
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-prefill") + 1], "tc_piecewise"
+        )
+        self.assertEqual(command[command.index("--chunked-prefill-size") + 1], "32768")
+        with self.assertRaisesRegex(RuntimeError, "graph-piecewise-replay"):
+            module.timed_activation(
+                'NPU_FEATURE_EVIDENCE {"feature":"dsa-residual-shard"}',
+                config["variant"],
+                harness.scenario_for(config["variant"], "historical-bde"),
+            )
+
     def test_performance_only_has_no_qualification_launches(self):
         module = self.runner()
         output = io.StringIO()
