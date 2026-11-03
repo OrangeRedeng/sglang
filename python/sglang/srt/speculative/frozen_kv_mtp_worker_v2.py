@@ -113,6 +113,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.gpu_id = gpu_id
         self.device = get_device().device
         self.target_worker = target_worker
+        self._rebuild_topk1_chain_buffers()
         self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -613,14 +614,28 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
         hidden_states = seed_hidden_per_req
 
+        # At topk=1 every proposed node is retained in depth order. Reuse
+        # EAGLE's static chain geometry instead of scoring/selecting one branch
+        # and sorting all nodes again. Keep the existing softmax/token choice.
+        topk1_chain_fits = (
+            self.topk == 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+            and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
+            and self._topk1_score_indices_prealloc.shape[1]
+            == self.speculative_num_steps
+        )
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            if topk1_chain_fits:
+                input_ids = topk_index.flatten()
+                token_list.append(topk_index)
+            else:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
             if i == self.speculative_num_steps - 1:
                 break
@@ -653,6 +668,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             )
             hidden_states = logits_output.hidden_states
 
+        if topk1_chain_fits:
+            bs = token_list[0].shape[0]
+            return (
+                self._topk1_parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
+                torch.cat(token_list, dim=1),
+            )
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
