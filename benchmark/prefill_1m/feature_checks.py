@@ -73,6 +73,17 @@ def dcp_probe_payloads(info):
         }
 
 
+def dcp_batch2_probe_payload(info):
+    prefix_len, suffix_len, _ = dcp_probe_lengths(info)
+    prefix = [1] * prefix_len
+    return {
+        "input_ids": [prefix + [3] * suffix_len, prefix + [4] * (suffix_len - 1)],
+        "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+        "return_logprob": True,
+        "logprob_start_len": prefix_len,
+    }
+
+
 def checkpoint_identity(model_path):
     root = Path(model_path)
     hashes = {}

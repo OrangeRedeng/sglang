@@ -621,6 +621,7 @@ def _prepare_dcp_prefix(m, batch, hidden_states):
     pool = get_token_to_kv_pool()
     if m.layer_id == pool.start_layer:
         batch.npu_dcp_packed_plan = dcp_layout._PACKED_MISSING
+        batch.npu_dcp_crop_free = None
         batch.npu_dcp_extend_gather = None
         batch.npu_dcp_prefix_pending = None
         if _dcp_pipeline is not None:
@@ -727,6 +728,12 @@ def _take_dcp_prefix(m, batch, k_nope, k_pe):
             return _dcp_gather_extend_kv_npu(m, batch, k_nope, k_pe)
     if packed is not None:
         record("dcp-packed-read")
+        if isinstance(packed, dcp_layout.DcpPackedBatchReadPlan):
+            record(
+                "dcp-packed-read-batch2",
+                request_rows=[r.rows for r in packed.requests],
+                key_lens=list(packed.key_lens),
+            )
     return result
 
 
@@ -894,7 +901,13 @@ def forward_dsa_core_npu(
         attn = m.attn_mqa_for_dsa_token_shard
     if dcp_gathers_kv and forward_batch.npu_dcp_prefix_layout is not None:
         attn_topk_indices = dcp_layout.remap_topk_to_packed(
-            attn_topk_indices, forward_batch.npu_dcp_prefix_layout
+            attn_topk_indices,
+            forward_batch.npu_dcp_prefix_layout,
+            (
+                dsa_token_shard_plan.query_lens
+                if dsa_token_shard_plan is not None
+                else forward_batch.extend_seq_lens_cpu
+            ),
         )
     attn_output = attn(
         q_nope_out.contiguous(),

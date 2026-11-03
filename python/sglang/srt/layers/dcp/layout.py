@@ -657,12 +657,13 @@ class DcpPackedReadPlan(NamedTuple):
     ``send_rows`` is the padded local length, so ranks below ``prefix_len % C``
     hold one row more than the rest and the spare rows are never addressed.
 
-    **ONE REQUEST ONLY, and the reason is the same one DSA-CP has.** With two
+    This plan is single-request. DcpPackedBatchReadPlan instead gathers each
+    request into its own contiguous packed segment. With one shared send for two
     requests the all-gather still lays out rank-major over the whole send, so a
     request's rows land in C separate blocks and the operator's cumulative
     ``actual_seq_lengths_kv`` -- which needs each request contiguous -- cannot
-    describe them. Multi-request extends keep the permuting path. That covers
-    87% of the tokens in the AISBench run as measured on 2026-09-18.
+    describe them. Without the opt-in batch plan, multi-request extends retain
+    the permuting path.
     """
 
     prefix_len: int
@@ -694,6 +695,48 @@ def plan_dcp_packed_read(
     )
 
 
+class DcpPackedBatchReadPlan(NamedTuple):
+    """Request-major segments containing independently packed rank-major prefixes."""
+
+    requests: Tuple[DcpPackedReadPlan, ...]
+    local_lens: Tuple[int, ...]
+    row_offsets: Tuple[int, ...]
+    key_lens: Tuple[int, ...]
+    rows: int
+    send_rows: int
+
+
+def plan_dcp_packed_batch_read(
+    prefix_lens, extend_lens, dcp_size, dcp_rank, interleave
+):
+    if len(prefix_lens) != 2 or len(extend_lens) != 2:
+        raise ValueError("Packed batch read requires exactly two requests")
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError("Invalid DCP rank")
+    requests = tuple(
+        plan_dcp_packed_read(p, e, dcp_size, interleave)
+        for p, e in zip(prefix_lens, extend_lens)
+    )
+    local, offsets, key_lens = [], [], []
+    rows = 0
+    for request in requests:
+        cycles, tail = divmod(request.prefix_len, dcp_size * interleave)
+        local.append(
+            cycles * interleave + max(0, min(interleave, tail - dcp_rank * interleave))
+        )
+        offsets.append(rows)
+        rows += request.rows
+        key_lens.append(rows)
+    return DcpPackedBatchReadPlan(
+        requests,
+        tuple(local),
+        tuple(offsets),
+        tuple(key_lens),
+        rows,
+        sum(r.send_rows for r in requests),
+    )
+
+
 def packed_row_of(pos: int, plan: DcpPackedReadPlan) -> int:
     """Reference implementation of the remap, one position at a time.
 
@@ -715,7 +758,7 @@ def packed_row_of(pos: int, plan: DcpPackedReadPlan) -> int:
 
 
 def remap_topk_to_packed(
-    topk_indices: torch.Tensor, plan: DcpPackedReadPlan
+    topk_indices: torch.Tensor, plan, query_lens=None
 ) -> torch.Tensor:
     """Top-k positions within a request -> rows of the packed buffer.
 
@@ -725,6 +768,21 @@ def remap_topk_to_packed(
     branch here is elementwise, which is what keeps this ~ a millisecond against
     the 216 ms it replaces.
     """
+    if isinstance(plan, DcpPackedBatchReadPlan):
+        if query_lens is None or len(query_lens) != len(plan.requests):
+            raise ValueError(
+                "Packed batch remapping requires per-request query lengths"
+            )
+        if any(n < 0 for n in query_lens) or sum(query_lens) > topk_indices.shape[0]:
+            raise ValueError("Packed query lengths exceed this rank's rows")
+        mapped = torch.full_like(topk_indices, -1)
+        start = 0
+        for request, length in zip(plan.requests, query_lens):
+            end = start + length
+            # SFA indices are relative to each request's cumulative KV segment.
+            mapped[start:end] = remap_topk_to_packed(topk_indices[start:end], request)
+            start = end
+        return mapped
     c = plan.dcp_size
     # floor division, not trunc: torch's // on a signed tensor rounds toward
     # zero for negatives, and the -1 sentinels must come through untouched.
@@ -791,7 +849,7 @@ def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
 
 def dcp_packed_read_plan(
     forward_batch, index_topk: Optional[int]
-) -> Optional[DcpPackedReadPlan]:
+) -> Optional[DcpPackedReadPlan | DcpPackedBatchReadPlan]:
     """This forward's packed-buffer plan, or None to keep the permuting path.
 
     Resolved once per forward and cached on the batch. It lives here, beside the
@@ -826,7 +884,23 @@ def dcp_packed_read_plan(
             )
     elif not extend_lens or prefix_lens is None:
         if envs.SGLANG_NPU_DEBUG_DCP.get():
-            print_info_once("DCP packed read is off: no CPU length metadata on this extend")
+            print_info_once(
+                "DCP packed read is off: no CPU length metadata on this extend"
+            )
+    elif (
+        len(extend_lens) == 2
+        and len(prefix_lens) == 2
+        and envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2.get()
+        and dcp_crop_free_extend(forward_batch, index_topk)
+    ):
+        parallel = get_parallel()
+        plan = plan_dcp_packed_batch_read(
+            prefix_lens,
+            extend_lens,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            get_attn_backend().page_size,
+        )
     elif len(extend_lens) != 1:
         # ONE REQUEST, for the layout reason in DcpPackedReadPlan: the
         # all-gather is rank-major over the WHOLE send, so with two requests a
@@ -864,26 +938,33 @@ def dcp_packed_read_plan(
     return plan
 
 
-def dcp_packed_kv_lens(forward_batch, plan: DcpPackedReadPlan, device) -> torch.Tensor:
+def dcp_packed_kv_lens(
+    forward_batch, plan: DcpPackedReadPlan | DcpPackedBatchReadPlan, device
+) -> torch.Tensor:
     """The operator's ``actual_seq_lengths_kv`` for a packed read, built once.
 
-    One request, so one entry, and it is the whole buffer: with the causal crop
-    off there is nothing to shorten, and the padding rows the ranks sent to keep
-    their sends equal are never named by any remapped index.
+    Each entry ends one request's packed segment. With the causal crop off,
+    nothing needs shortening; padded prefix rows are never named by remapped
+    indices. The segment partition is part of the cache key, not just its sum.
 
     Cached on the batch rather than built where it is used, because that use is
     once per layer and ``torch.tensor(list, device=npu)`` is a blocking
     host-to-device copy -- 78 of them a forward, each draining the queue. The
     same mistake was already made and fixed once on the DSA-CP path.
     """
+    lengths = (
+        plan.key_lens if isinstance(plan, DcpPackedBatchReadPlan) else (plan.rows,)
+    )
     cached = getattr(forward_batch, "npu_dcp_packed_kv_lens", None)
     if (
         cached is None
-        or getattr(forward_batch, "npu_dcp_packed_kv_rows", None) != plan.rows
+        or getattr(forward_batch, "npu_dcp_packed_kv_rows", None) != lengths
         or cached.device != torch.device(device)
     ):
-        # Device fill avoids a blocking host copy between asynchronous collectives.
-        cached = torch.full((1,), plan.rows, dtype=torch.int32, device=device)
+        # Device fills avoid blocking host copies between asynchronous collectives.
+        cached = torch.empty((len(lengths),), dtype=torch.int32, device=device)
+        for index, length in enumerate(lengths):
+            cached[index].fill_(length)
         forward_batch.npu_dcp_packed_kv_lens = cached
-        forward_batch.npu_dcp_packed_kv_rows = plan.rows
+        forward_batch.npu_dcp_packed_kv_rows = lengths
     return cached

@@ -6,7 +6,7 @@ The fast path validates CPU lengths against prefix + extend lengths, then reads 
 
 ## Optional prefill batch two
 
-Set both `--max-running-requests 2` and `--prefill-max-requests 2`. These are caps, not a minimum batch size. Long cached-prefix DSA already supports multiple requests when every request satisfies the existing crop-free/top-k eligibility bound. The packed rank-major KV layout is still single-request only; a two-request prefill uses the existing request-contiguous permutation/gather path. This preserves per-request KV boundaries and does not implement a new multi-request packed layout. The extra gather/permutation cost can offset batching gains.
+Set both `--max-running-requests 2` and `--prefill-max-requests 2`. These are caps, not a minimum batch size. Long cached-prefix DSA already supports multiple requests when every request satisfies the existing crop-free/top-k eligibility bound. The metadata-only feature keeps the existing request-contiguous permutation/gather fallback for two requests. The separate experimental `SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2` feature now adds request-aware packed segments; see `PACKED_BATCH2_20261103.md`. This preserves per-request KV boundaries and does not implement a new multi-request packed layout. The extra gather/permutation cost can offset batching gains.
 
 The global chunk remains 32768. MegaMoE's per-rank dispatch capacity stays 2048 at TP16; adding a second request does not double the global chunk. The runner checks capacity using the actual resolved running cap and records resolved caps in each case's workload/capacity artifacts. A 1M independent-prompt batch two may need more KV capacity; the provided workload uses a 99% shared prefix.
 

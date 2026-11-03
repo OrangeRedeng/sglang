@@ -38,11 +38,19 @@ def add_combinations(scenarios):
         feature.setdefault("expected", []).append("dsa-metadata-reuse")
         feature["dcp"] = True
         if batch2:
+            feature["probe_batch2"] = True
             feature["launch_overrides"] = dict(
                 max_running_requests=2, prefill_max_requests=2
             )
             feature["expected"].append("dcp-prefill-batch-2")
         scenarios[name] = feature
+    for name, source in (
+        ("dsa-metadata-packed-batch2", "dsa-metadata-batch2"),
+        ("dsa-metadata-packed-megamoe-batch2", "dsa-metadata-megamoe-batch2"),
+    ):
+        scenarios[name] = copy.deepcopy(scenarios[source])
+        scenarios[name]["env"]["SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2"] = "True"
+        scenarios[name]["expected"].append("dcp-packed-read-batch2")
     for source in ("indexer-query-shard", "multistream"):
         scenarios["dcp-" + source] = dict(copy.deepcopy(scenarios[source]), dcp=True)
     groups = {

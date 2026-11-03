@@ -62,6 +62,8 @@ DCP_VARIANTS = (
     "dsa-metadata-batch2",
     "dsa-metadata-megamoe",
     "dsa-metadata-megamoe-batch2",
+    "dsa-metadata-packed-batch2",
+    "dsa-metadata-packed-megamoe-batch2",
 )
 MOE_VARIANTS = (
     "baseline",
@@ -359,6 +361,8 @@ def timed_activation(log, variant):
         required.add("dsa-metadata-reuse")
     if variant.endswith("-batch2"):
         required.add("dcp-prefill-batch-2")
+        if "packed" in variant:
+            required.add("dcp-packed-read-batch2")
     missing = sorted(required - features)
     if missing:
         raise RuntimeError("Timed workload missing activation: " + ", ".join(missing))
@@ -700,6 +704,8 @@ def main():
             "dsa-metadata-batch2",
             "dsa-metadata-megamoe",
             "dsa-metadata-megamoe-batch2",
+            "dsa-metadata-packed-batch2",
+            "dsa-metadata-packed-megamoe-batch2",
         }
         if (
             args.reference_recipe != "historical-bde"

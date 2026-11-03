@@ -95,7 +95,15 @@ class PendingGather:
         for work in self.works:
             if work is not None:
                 work.wait()
-        if self.packed:
+        if self.packed and hasattr(self.plan, "requests"):
+            source = 0
+            for request, offset in zip(self.plan.requests, self.plan.row_offsets):
+                for out, value in zip(self.outputs, own):
+                    out[offset + request.gathered_rows : offset + request.rows] = value[
+                        source : source + request.extend_len
+                    ]
+                source += request.extend_len
+        elif self.packed:
             for out, value in zip(self.outputs, own):
                 out[self.plan.gathered_rows :] = value[: self.plan.extend_len]
         else:
@@ -125,7 +133,30 @@ def start_prefix_gather(
         return dcp_extend_gather_buffer(f"pipeline-{buffer_slot}-{name}", ref, rows)
 
     works, scratches = [], []
-    if packed:
+    if packed and hasattr(plan, "requests"):
+        if any(sum(plan.local_lens) != send.shape[0] for send in sends):
+            raise ValueError("Packed batch prefix ownership does not match the sends")
+        outputs = tuple(
+            allocate(f"out-{i}", ref, plan.rows) for i, ref in enumerate(refs)
+        )
+        retained = []
+        source = 0
+        for request, local, offset in zip(
+            plan.requests, plan.local_lens, plan.row_offsets
+        ):
+            for out, send in zip(outputs, sends):
+                padded = send.new_zeros((request.send_rows, *send.shape[1:]))
+                padded[:local] = send[source : source + local]
+                retained.append(padded)
+                if request.gathered_rows:
+                    works.append(
+                        group.all_gather_into_tensor_async(
+                            out[offset : offset + request.gathered_rows], padded
+                        )
+                    )
+            source += local
+        sends = tuple(retained)
+    elif packed:
         outputs = tuple(
             allocate(f"out-{i}", ref, plan.rows) for i, ref in enumerate(refs)
         )

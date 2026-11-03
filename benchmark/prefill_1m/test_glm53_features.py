@@ -743,6 +743,25 @@ def serve(args, case, directory, env):
                     raise RuntimeError(
                         f"DCP activation probe did not reuse its aligned prefix: {probe}"
                     )
+            if scenario.get("probe_batch2"):
+                from feature_checks import dcp_batch2_probe_payload
+
+                pair = request(
+                    base + "/generate",
+                    dcp_batch2_probe_payload(probe_info),
+                    args.request_timeout,
+                )
+                if not isinstance(pair, list) or len(pair) != 2:
+                    raise RuntimeError(
+                        "Batch-two DCP probe did not return two responses"
+                    )
+                for item in pair:
+                    if (
+                        item.get("meta_info", {}).get("cached_tokens", 0)
+                        < expected_cached
+                    ):
+                        raise RuntimeError("Batch-two DCP probe lost its cached prefix")
+                responses.extend(pair)
             from concurrent.futures import ThreadPoolExecutor
 
             prompts = ["Explain addition briefly. " * size for size in (8, 64, 256)]
@@ -920,6 +939,8 @@ def validate_serving(args, case, directory, case_env, base_env):
             if key in ("quant", "dcp", "separate_shared", "launch_overrides")
         }
     )
+    if scenario.get("probe_batch2"):
+        reference["probe_batch2"] = True
     reference_env = dict(base_env, **reference.get("env", {}))
     if case["id"].endswith("dcp-stream-o-proj"):
         reference["env"] = dict(scenario["env"], SGLANG_NPU_STREAM_O_PROJ="False")

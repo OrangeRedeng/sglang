@@ -1252,6 +1252,8 @@ class Envs:
     # refusal is logged by dcp_packed_read_plan, so it cannot turn off
     # silently.
     SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(True)
+    # Two request-contiguous packed segments; validated separately from batch one.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2 = EnvBool(False)
     # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
     # l computes, into the other of two slots. Requires the packed read above.
     #

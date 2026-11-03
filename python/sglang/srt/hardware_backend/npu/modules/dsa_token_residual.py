@@ -360,7 +360,7 @@ def core_attention(m, q_pe, key_pe, q_nope, key_nope, topk, batch, gate=None):
     indices = topk
     packed = batch.npu_dcp_prefix_layout
     if packed is not None:
-        indices = mla.dcp_layout.remap_topk_to_packed(indices, packed)
+        indices = mla.dcp_layout.remap_topk_to_packed(indices, packed, plan.query_lens)
     output = sparse_attention_or_empty(
         m, q_nope, q_pe, key_nope, key_pe, indices, batch, plan
     )

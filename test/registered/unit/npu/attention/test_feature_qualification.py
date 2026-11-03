@@ -29,6 +29,22 @@ def load(name, filename):
 
 
 class TestFeatureQualification(CustomTestCase):
+    def test_batch2_probe_has_shared_prefix_and_distinct_ragged_tails(self):
+        checks = load("batch2_probe", "feature_checks.py")
+        info = dict(
+            page_size=128,
+            dcp_size=16,
+            chunked_prefill_size=32768,
+            context_length=1048576,
+        )
+        payload = checks.dcp_batch2_probe_payload(info)
+        first, second = payload["input_ids"]
+        prefix = payload["logprob_start_len"]
+        self.assertEqual(first[:prefix], second[:prefix])
+        self.assertNotEqual(first[prefix], second[prefix])
+        self.assertEqual(len(first), len(second) + 1)
+        self.assertTrue(payload["return_logprob"])
+
     def test_historical_recipe_is_optimized_and_preserves_original_launch(self):
         harness = load("historical_recipe", "test_glm53_features.py")
         args = SimpleNamespace(

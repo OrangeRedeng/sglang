@@ -467,6 +467,40 @@ class TestBdeOvernight(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "dcp-prefill-batch-2"):
             module.timed_activation(log.rsplit("\n", 1)[0], "dsa-metadata-batch2")
 
+    def test_packed_batch2_requires_its_own_activation(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "packed_batch2_launch"
+        )
+        config = dict(
+            variant="dsa-metadata-packed-batch2",
+            reference_recipe="historical-bde",
+            checkpoint="/tmp/weights",
+            chunk=32768,
+            context=1048576,
+            memfrac=0.85,
+            maxreq=1,
+            kv_rows=67584,
+            performance_only=True,
+        )
+        command, env = module.variant_launch(harness, root, config)
+        self.assertEqual(command[command.index("--prefill-max-requests") + 1], "2")
+        self.assertEqual(env["SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2"], "True")
+        features = (
+            "dsa-residual-shard",
+            "dsa-metadata-reuse",
+            "dcp-prefill-batch-2",
+            "dcp-packed-read-batch2",
+        )
+        log = "\n".join(
+            "NPU_FEATURE_EVIDENCE " + json.dumps(dict(feature=name))
+            for name in features
+        )
+        module.timed_activation(log, config["variant"])
+        with self.assertRaisesRegex(RuntimeError, "dcp-packed-read-batch2"):
+            module.timed_activation(log.rsplit("\n", 1)[0], config["variant"])
+
     def test_timed_megamoe_requires_kernel_and_local_ep_activation(self):
         module = self.runner()
         log = "\n".join(
