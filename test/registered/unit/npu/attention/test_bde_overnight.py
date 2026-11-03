@@ -419,6 +419,54 @@ class TestBdeOvernight(CustomTestCase):
         self.assertTrue(plan["server_settings"]["performance_only"])
         self.assertEqual(plan["repeats"], 1)
 
+    def test_metadata_batch2_launch_and_topology_preserve_baseline_settings(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "metadata_launch"
+        )
+        config = dict(
+            variant="dsa-metadata-batch2",
+            reference_recipe="historical-bde",
+            checkpoint="/tmp/weights",
+            chunk=32768,
+            context=1048576,
+            memfrac=0.85,
+            maxreq=1,
+            kv_rows=67584,
+            performance_only=True,
+        )
+        command, env = module.variant_launch(harness, root, config)
+        for flag, value in (
+            ("--max-running-requests", "2"),
+            ("--prefill-max-requests", "2"),
+            ("--chunked-prefill-size", "32768"),
+        ):
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertEqual(env["SGLANG_NPU_DSA_METADATA_REUSE"], "True")
+        self.assertEqual(env["SGLANG_NPU_ENABLE_DCP_PACKED_READ"], "True")
+        module.validate_variant_topology(
+            harness,
+            config,
+            dict(
+                tp_size=16,
+                dcp_size=16,
+                max_running_requests=2,
+                prefill_max_requests=2,
+                quantization="modelslim",
+                cuda_graph_backend_prefill="disabled",
+                cuda_graph_backend_decode="disabled",
+            ),
+        )
+        features = ("dsa-residual-shard", "dsa-metadata-reuse", "dcp-prefill-batch-2")
+        log = "\n".join(
+            "NPU_FEATURE_EVIDENCE " + json.dumps(dict(feature=name))
+            for name in features
+        )
+        module.timed_activation(log, "dsa-metadata-batch2")
+        with self.assertRaisesRegex(RuntimeError, "dcp-prefill-batch-2"):
+            module.timed_activation(log.rsplit("\n", 1)[0], "dsa-metadata-batch2")
+
     def test_timed_megamoe_requires_kernel_and_local_ep_activation(self):
         module = self.runner()
         log = "\n".join(

@@ -721,43 +721,75 @@ class AscendAttnBackend(AttentionBackend):
 
             # Piecewise tracing must not enter host planning or device tensor factories.
             forward_batch.npu_indexer_query_shard = _build_indexer_query_shard(forward_batch)
-        # Data-driven branch: take the CPU-mirror path whenever the mirror is
-        # present, instead of statically gating on needs_cpu_seq_lens. When the
-        # mirror is absent (true mirrorless), fall through to the else branch.
-        if forward_batch.seq_lens_cpu is not None:
-            seq_lens_max = forward_batch.seq_lens.max()
-            if forward_batch.forward_mode.is_target_verify():
-                if (
-                    forward_batch.spec_algorithm is not None
-                    and forward_batch.spec_algorithm.is_dflash()
-                ):
-                    # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
-                    # one verify block, which already covers the draft block.
-                    seq_lens_max = forward_batch.seq_lens_cpu.max().item()
-                else:
-                    # Overlap scheduling can publish the CPU sequence length one
-                    # step ahead of the device tensor. FIA consumes seq_lens_cpu
-                    # below, so derive the block-table width from the same source.
-                    # Otherwise a page-aligned request can expose KV_S=N while
-                    # asking FIA for N+1.
-                    spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
-                    seq_lens_max = (
-                        forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
-                    )
-            elif (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.spec_info is not None
-            ):
+        from sglang.srt.hardware_backend.npu.attention.dsa_metadata import (
+            prepare_dsa_page_tables,
+        )
+
+        if not prepare_dsa_page_tables(self, forward_batch):
+            # Data-driven branch: take the CPU-mirror path whenever the mirror is
+            # present, instead of statically gating on needs_cpu_seq_lens. When the
+            # mirror is absent (true mirrorless), fall through to the else branch.
+            if forward_batch.seq_lens_cpu is not None:
                 seq_lens_max = forward_batch.seq_lens.max()
-                seq_lens_max += self.speculative_step_id + 1
+                if forward_batch.forward_mode.is_target_verify():
+                    if (
+                        forward_batch.spec_algorithm is not None
+                        and forward_batch.spec_algorithm.is_dflash()
+                    ):
+                        # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
+                        # one verify block, which already covers the draft block.
+                        seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+                    else:
+                        # Overlap scheduling can publish the CPU sequence length one
+                        # step ahead of the device tensor. FIA consumes seq_lens_cpu
+                        # below, so derive the block-table width from the same source.
+                        # Otherwise a page-aligned request can expose KV_S=N while
+                        # asking FIA for N+1.
+                        spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
+                        seq_lens_max = (
+                            forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+                        )
+                elif (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is not None
+                ):
+                    seq_lens_max = forward_batch.seq_lens.max()
+                    seq_lens_max += self.speculative_step_id + 1
+                else:
+                    seq_lens_max = forward_batch.seq_lens.max()
+                self.forward_metadata.block_tables = (
+                    self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, :seq_lens_max
+                    ][:, :: self.page_size]
+                    // self.page_size
+                )
+                if self.is_hybrid_swa:
+                    self.forward_metadata.block_tables_swa = (
+                        (
+                            self.full_to_swa_index_mapping[
+                                self.req_to_token_pool.req_to_token[
+                                    forward_batch.req_pool_indices, :seq_lens_max
+                                ]
+                            ][:, :: self.page_size]
+                            // self.page_size
+                        )
+                        .to(torch.int32)
+                        .contiguous()
+                    )
             else:
                 seq_lens_max = forward_batch.seq_lens.max()
+            loc_rows = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :seq_lens_max
+            ]
+            # Unchanged on purpose: dividing by the unscaled page_size already gives
+            # page ids over the whole virtual span, which is the indexer's view.
             self.forward_metadata.block_tables = (
-                self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :seq_lens_max
-                ][:, :: self.page_size]
-                // self.page_size
+                loc_rows[:, :: self.page_size] // self.page_size
             )
+            if get_parallel().dcp_enabled:
+                self.forward_metadata.dcp_local_block_tables = dcp_local_kv_block_table(
+                    loc_rows, self.page_size
+                )
             if self.is_hybrid_swa:
                 self.forward_metadata.block_tables_swa = (
                     (
@@ -771,33 +803,6 @@ class AscendAttnBackend(AttentionBackend):
                     .to(torch.int32)
                     .contiguous()
                 )
-        else:
-            seq_lens_max = forward_batch.seq_lens.max()
-        loc_rows = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, :seq_lens_max
-        ]
-        # Unchanged on purpose: dividing by the unscaled page_size already gives
-        # page ids over the whole virtual span, which is the indexer's view.
-        self.forward_metadata.block_tables = (
-            loc_rows[:, :: self.page_size] // self.page_size
-        )
-        if get_parallel().dcp_enabled:
-            self.forward_metadata.dcp_local_block_tables = dcp_local_kv_block_table(
-                loc_rows, self.page_size
-            )
-        if self.is_hybrid_swa:
-            self.forward_metadata.block_tables_swa = (
-                (
-                    self.full_to_swa_index_mapping[
-                        self.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
-                    // self.page_size
-                )
-                .to(torch.int32)
-                .contiguous()
-            )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (

@@ -655,6 +655,11 @@ def _prepare_dcp_prefix(m, batch, hidden_states):
         hidden_states.new_empty((0, 1, m.qk_rope_head_dim)),
     )
     batch.npu_dcp_prefix_layout = packed
+    active_requests = sum(n > 0 for n in batch.extend_seq_lens_cpu)
+    if active_requests == 2:
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        record("dcp-prefill-batch-2", layout="request-contiguous" if packed is None else "packed")
     prefetch = envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
     if prefetch:
         if _dcp_pipeline is None:

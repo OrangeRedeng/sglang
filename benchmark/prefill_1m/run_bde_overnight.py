@@ -58,6 +58,10 @@ DCP_VARIANTS = (
     "dcp-decode-q-preissue",
     "bde-v2",
     "historical-bde",
+    "dsa-metadata",
+    "dsa-metadata-batch2",
+    "dsa-metadata-megamoe",
+    "dsa-metadata-megamoe-batch2",
 )
 MOE_VARIANTS = (
     "baseline",
@@ -255,7 +259,9 @@ def variant_launch(harness, repo, config):
         EXTRA_ARGS=f"--quantization modelslim --watchdog-timeout 7200 --max-total-tokens {config['kv_rows']}",
     )
     if scenario.get("dcp"):
-        inherited["PREFILL_MAXREQ"] = "1"
+        inherited["PREFILL_MAXREQ"] = str(
+            scenario.get("launch_overrides", {}).get("prefill_max_requests", 1)
+        )
     else:
         inherited.pop("PREFILL_MAXREQ", None)
     args = argparse.Namespace(
@@ -323,8 +329,9 @@ def validate_variant_topology(harness, config, resolved):
             raise RuntimeError(
                 f"Unexpected {key}: {resolved.get(key)}; expected {expected}"
             )
-    if scenario.get("dcp") and resolved.get("prefill_max_requests") != 1:
-        raise RuntimeError("DCP timing requires prefill_max_requests=1")
+    prefill_cap = overrides.get("prefill_max_requests", 1)
+    if scenario.get("dcp") and resolved.get("prefill_max_requests") != prefill_cap:
+        raise RuntimeError(f"DCP timing requires prefill_max_requests={prefill_cap}")
     fuseep = scenario.get("fuseep")
     if fuseep and (
         resolved.get("ep_size", resolved.get("moe_ep_size")) != 16
@@ -346,8 +353,12 @@ def timed_activation(log, variant):
         except (ValueError, KeyError, TypeError):
             continue
     required = {"dsa-residual-shard"}
-    if variant == "megamoe":
+    if "megamoe" in variant:
         required |= {"megamoe", "dsa-ep-moe-local"}
+    if variant.startswith("dsa-metadata"):
+        required.add("dsa-metadata-reuse")
+    if variant.endswith("-batch2"):
+        required.add("dcp-prefill-batch-2")
     missing = sorted(required - features)
     if missing:
         raise RuntimeError("Timed workload missing activation: " + ", ".join(missing))
@@ -468,9 +479,10 @@ def worker():
                     * (
                         config["repeat_rate"]
                         + (1 - config["repeat_rate"])
-                        * min(config["maxreq"], config["requests"])
+                        * min(resolved["max_running_requests"], config["requests"])
                     )
-                    + config["output_len"] * min(config["maxreq"], config["requests"])
+                    + config["output_len"]
+                    * min(resolved["max_running_requests"], config["requests"])
                 )
                 + 4096
             )
@@ -483,6 +495,8 @@ def worker():
                     "status": "ready",
                     "pid": process.pid,
                     "capacity": min(map(int, capacities)),
+                    "max_running_requests": resolved["max_running_requests"],
+                    "prefill_max_requests": resolved.get("prefill_max_requests"),
                 }
             )
             while process.poll() is None:
@@ -678,12 +692,25 @@ def main():
     if not args.features_only and "serve" not in stages:
         parser.error("Benchmark timing requires serve qualification")
     if args.performance_only:
+        selected = args.variants.split(",")
+        supported = {
+            "baseline",
+            "megamoe",
+            "dsa-metadata",
+            "dsa-metadata-batch2",
+            "dsa-metadata-megamoe",
+            "dsa-metadata-megamoe-batch2",
+        }
         if (
             args.reference_recipe != "historical-bde"
-            or args.variants != "baseline,megamoe"
+            or not selected
+            or selected[0] != "baseline"
+            or len(set(selected)) != len(selected)
+            or set(selected) - supported
+            or args.moe_only
         ):
             parser.error(
-                "--performance-only requires historical-bde and --variants baseline,megamoe"
+                "--performance-only requires historical-bde and unique supported variants starting with baseline"
             )
         stages = []
     variants = list(MOE_VARIANTS) if args.moe_only else args.variants.split(",")
@@ -1074,7 +1101,16 @@ def main():
                 )
                 phase = "server-startup"
                 try:
-                    job.receive(remaining_timeout(args.startup_timeout + 30))
+                    ready = job.receive(remaining_timeout(args.startup_timeout + 30))
+                    save(folder / "resolved-capacity.json", ready)
+                    settings.update(
+                        maxreq=ready.get("max_running_requests", settings["maxreq"]),
+                        prefill_max_requests=ready.get("prefill_max_requests"),
+                    )
+                    save(
+                        folder / "workload.json",
+                        dict(settings, ais_args=variant_ais_args),
+                    )
                     for repeat in range(1, args.repeats + 1):
                         # Each AISBench invocation performs its own prefix prewarm after this flush.
                         phase = f"cache-flush/{repeat}"

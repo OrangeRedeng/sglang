@@ -597,7 +597,7 @@ def server_command(args, scenario):
     ):
         command += [
             "--prefill-max-requests",
-            "1",
+            str(getattr(args, "prefill_max_requests", 1)),
             "--max-running-requests",
             str(getattr(args, "max_running_requests", 64)),
         ]
@@ -1545,9 +1545,11 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.megamoe_dispatch_tokens <= 4096:
         parser.error("--megamoe-dispatch-tokens must be in [1,4096]")
-    SCENARIOS["megamoe"]["env"]["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
-        args.megamoe_dispatch_tokens
-    )
+    for scenario in SCENARIOS.values():
+        if scenario.get("fuseep") == 3:
+            scenario["env"]["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+                args.megamoe_dispatch_tokens
+            )
     if (
         not args.long_cache_modes
         or set(args.long_cache_modes) - {"cold", "prefix99"}

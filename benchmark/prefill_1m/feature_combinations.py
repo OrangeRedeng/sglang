@@ -27,6 +27,22 @@ def add_combinations(scenarios):
         context_length=1048576,
     )
     scenarios["historical-bde"] = historical
+    for name, moe, batch2 in (
+        ("dsa-metadata", False, False),
+        ("dsa-metadata-batch2", False, True),
+        ("dsa-metadata-megamoe", True, False),
+        ("dsa-metadata-megamoe-batch2", True, True),
+    ):
+        feature = copy.deepcopy(scenarios["megamoe"]) if moe else {"dcp": True}
+        feature.setdefault("env", {})["SGLANG_NPU_DSA_METADATA_REUSE"] = "True"
+        feature.setdefault("expected", []).append("dsa-metadata-reuse")
+        feature["dcp"] = True
+        if batch2:
+            feature["launch_overrides"] = dict(
+                max_running_requests=2, prefill_max_requests=2
+            )
+            feature["expected"].append("dcp-prefill-batch-2")
+        scenarios[name] = feature
     for source in ("indexer-query-shard", "multistream"):
         scenarios["dcp-" + source] = dict(copy.deepcopy(scenarios[source]), dcp=True)
     groups = {
@@ -104,6 +120,7 @@ def scenario_for(scenarios, name, reference_recipe="ordinary"):
             if k not in ("env", "expected", "launch_overrides")
         }
     )
+    baseline["launch_overrides"].update(variant.get("launch_overrides", {}))
     overlay = dict(variant.get("env", {}))
     if "auto-hccl" not in variant.get("expected", []):
         for key in ("HCCL_BUFFSIZE", "DEEPEP_HCCL_BUFFSIZE"):

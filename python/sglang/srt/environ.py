@@ -1221,6 +1221,8 @@ class Envs:
     # every rank computes every head for its own slice, with the query
     # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_CP = EnvBool(False)
+    # Eager prefill: gather page starts once using validated CPU length mirrors.
+    SGLANG_NPU_DSA_METADATA_REUSE = EnvBool(False)
     # DSA-CP: also shard batches carrying more than one request, by passing
     # full per-request KV lengths and dropping the operator's causal crop.
     # Only engages where every request's prefix reaches index_topk.
