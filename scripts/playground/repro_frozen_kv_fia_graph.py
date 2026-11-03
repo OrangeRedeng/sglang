@@ -57,7 +57,7 @@ def run_case(args):
         params.update(
             num_query_heads=16, input_layout="TND", actual_seq_qlen=[1],
             atten_mask=mask, sparse_mode=4, pre_tokens=1023,
-            next_tokens=2147483647, softmax_scale=dim ** -0.5,
+            next_tokens=args.next_tokens, softmax_scale=dim ** -0.5,
         )
     else:
         params.update(num_heads=16, input_layout="BSH", sparse_mode=0,
@@ -77,12 +77,18 @@ def run_case(args):
     references = {}
     for length in (275, 2313):
         set_table(length)
-        log(f"{args.layout}: eager kv={length} begin")
+        sync(f"table kv={length}")
+        log(f"{args.layout}: eager kv={length} begin; "
+            f"next_tokens={params.get('next_tokens')}")
         result = operation(**{**params, length_name: [length]})[0]
         sync(f"eager kv={length}")
         references[length] = result.detach().cpu()
         assert torch.isfinite(references[length]).all(), "non-finite eager result"
         del result
+
+    if args.eager_only:
+        log(f"{args.layout}: EAGER PASS kv=275,2313 next_tokens={args.next_tokens}")
+        return
 
     # Same capture-time lengths as production's zero-filled graph inputs by
     # default. --capture-length 2313 is the control for length-dependent tiling.
@@ -139,10 +145,16 @@ def main():
     parser.add_argument("--timeout", type=float, default=45)
     parser.add_argument("--capture-length", type=int, choices=(0, 275, 2313), default=0)
     parser.add_argument("--layout", choices=("all", "swa", "full"), default="all")
+    parser.add_argument("--next-tokens", type=int, default=0,
+                        help="SWA lookahead; use 2147483647 for the old graph path")
+    parser.add_argument("--eager-only", action="store_true",
+                        help="Check the isolated FIA without creating a graph")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.next_tokens < 0:
+        parser.error("--next-tokens must be nonnegative")
     if args.child:
         log(f"CASE START layout={args.layout} capture_kv={args.capture_length}")
         run_case(args)
@@ -153,7 +165,10 @@ def main():
     for layout in layouts:
         command = [sys.executable, "-u", os.path.abspath(__file__), "--child",
                    "--layout", layout, "--device", str(args.device),
-                   "--capture-length", str(args.capture_length)]
+                   "--capture-length", str(args.capture_length),
+                   "--next-tokens", str(args.next_tokens)]
+        if args.eager_only:
+            command.append("--eager-only")
         log(f"START {layout}, hard timeout={args.timeout}s (includes NPU initialization)")
         process = subprocess.Popen(command)
         try:

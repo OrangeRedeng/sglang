@@ -3238,8 +3238,9 @@ class AscendAttnBackend(AttentionBackend):
                         if layer.sliding_window_size != -1
                         else FULL_ATTENTION_WINDOW
                     ),
+                    # Match eager SWA and target verification: no lookahead.
                     next_tokens=(
-                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
+                        0 if layer.sliding_window_size != -1 else FULL_ATTENTION_WINDOW
                     ),
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=sparse_mode,
