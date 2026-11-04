@@ -94,6 +94,9 @@ class TestBdeOvernight(CustomTestCase):
             command[command.index("--cuda-graph-backend-decode") + 1], "disabled"
         )
         self.assertEqual(env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "False")
+        self.assertGreaterEqual(
+            int(command[command.index("--max-total-tokens") + 1]), 8192 + 4096 + 1
+        )
 
     def test_short_piecewise_probe_ignores_unselected_long_workloads(self):
         module = self.runner()

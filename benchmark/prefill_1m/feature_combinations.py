@@ -87,7 +87,7 @@ def add_combinations(scenarios):
         ),
         launch_overrides=dict(
             chunk=4096,
-            kv_rows=8192,
+            kv_rows=16384,
             context_length=16384,
             max_running_requests=1,
             prefill_max_requests=1,
