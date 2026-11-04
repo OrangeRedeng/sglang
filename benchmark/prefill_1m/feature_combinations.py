@@ -56,7 +56,7 @@ def add_combinations(scenarios):
         if batch2:
             feature["probe_batch2"] = True
             feature["launch_overrides"] = dict(
-                max_running_requests=2, prefill_max_requests=2
+                max_running_requests=2, prefill_max_requests=2, max_prefill_tokens=32768
             )
             feature["expected"].append("dcp-prefill-batch-2")
         scenarios[name] = feature
@@ -67,6 +67,32 @@ def add_combinations(scenarios):
         scenarios[name] = copy.deepcopy(scenarios[source])
         scenarios[name]["env"]["SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2"] = "True"
         scenarios[name]["expected"].append("dcp-packed-read-batch2")
+    scenarios["metadata-budget-control"] = copy.deepcopy(scenarios["dsa-metadata"])
+    scenarios["metadata-budget-control"]["launch_overrides"] = dict(
+        max_prefill_tokens=32768
+    )
+    scenarios["megamoe-no-lookahead"] = copy.deepcopy(scenarios["megamoe"])
+    scenarios["megamoe-no-lookahead"]["env"].update(
+        SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH="False",
+        SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP="False",
+    )
+    scenarios["graph-piecewise-probe"] = dict(
+        graph="tc_piecewise",
+        decode_graph="disabled",
+        expected=["graph-piecewise-capture", "graph-piecewise-replay"],
+        env=dict(
+            SGLANG_NPU_INDEXER_INT8="True",
+            SGLANG_NPU_SFA_KV_8BIT="True",
+            HCCL_BUFFSIZE="256",
+        ),
+        launch_overrides=dict(
+            chunk=4096,
+            kv_rows=8192,
+            context_length=16384,
+            max_running_requests=1,
+            prefill_max_requests=1,
+        ),
+    )
     for source in ("indexer-query-shard", "multistream"):
         scenarios["dcp-" + source] = dict(copy.deepcopy(scenarios[source]), dcp=True)
     groups = {
@@ -128,12 +154,18 @@ def component_blockers(case, qualified):
 def scenario_for(scenarios, name, reference_recipe="ordinary"):
     variant = copy.deepcopy(scenarios[name])
     if (
-        reference_recipe != "historical-bde"
+        reference_recipe
+        not in ("historical-bde", "historical-bde-hccl256", "historical-bde-capacity")
         or name == "historical-bde"
         or name.startswith("legacy-")
+        or name == "graph-piecewise-probe"
     ):
         return variant
     baseline = copy.deepcopy(scenarios["historical-bde"])
+    if reference_recipe in ("historical-bde-hccl256", "historical-bde-capacity"):
+        baseline["env"]["HCCL_BUFFSIZE"] = "256"
+    if reference_recipe == "historical-bde-capacity":
+        baseline["launch_overrides"].update(kv_rows=63488, mem_fraction=0.80)
     if name in ("baseline", "dcp-baseline"):
         return baseline
     if name == "indexer-int8":

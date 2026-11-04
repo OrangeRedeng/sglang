@@ -931,8 +931,9 @@ def validate_serving(args, case, directory, case_env, base_env):
                 reason="required operator/API unavailable; see capability.log",
             )
     reference = (
-        scenario_for("historical-bde")
-        if getattr(args, "reference_recipe", "ordinary") == "historical-bde"
+        scenario_for("baseline", args.reference_recipe)
+        if getattr(args, "reference_recipe", "ordinary")
+        in ("historical-bde", "historical-bde-hccl256", "historical-bde-capacity")
         else {
             key: value
             for key, value in scenario.items()
@@ -1484,7 +1485,14 @@ def main():
     )
     parser.add_argument("--tp", type=int, default=16)
     parser.add_argument(
-        "--reference-recipe", choices=("ordinary", "historical-bde"), default="ordinary"
+        "--reference-recipe",
+        choices=(
+            "ordinary",
+            "historical-bde",
+            "historical-bde-hccl256",
+            "historical-bde-capacity",
+        ),
+        default="ordinary",
     )
     parser.add_argument("--megamoe-dispatch-tokens", type=int, default=4096)
     parser.add_argument(

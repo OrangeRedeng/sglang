@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -18,8 +19,7 @@ def plan():
     names = [
         ("01-control-40s-recipe", "legacy-control-40s", 1024),
         ("02-control-24s-recipe", "baseline", 2048),
-        ("03-prefill-graph-full", "graph-full", 2048),
-        ("04-prefill-graph-piecewise", "graph-piecewise", 2048),
+        ("04-prefill-graph-piecewise", "graph-piecewise-probe", 2048),
         ("05-tp-routed-scale", "tp-routed-scale", 2048),
         ("06-tp-prequant", "tp-prequant", 2048),
         ("07-tp-shared", "tp-shared", 2048),
@@ -37,7 +37,51 @@ def plan():
         ("19-megamoe-24s-target", "megamoe", 2048),
         ("20-megamoe-metadata-combined", "dsa-metadata-megamoe", 2048),
     ]
-    return [dict(name=n, variant=v, dispatch=d) for n, v, d in names]
+    cases = [dict(name=n, variant=v, dispatch=d) for n, v, d in names]
+    for case in cases:
+        if case["variant"] == "graph-piecewise-probe":
+            case.update(length=8192, context=16384)
+    return cases
+
+
+def repair_plan():
+    rows = [
+        ("01-control-hccl1000", "baseline", "historical-bde"),
+        ("02-control-hccl256", "baseline", "historical-bde-hccl256"),
+        ("03-capacity-control", "baseline", "historical-bde-capacity"),
+        ("04-piecewise-8k-probe", "graph-piecewise-probe", "historical-bde-capacity"),
+        ("05-tp-prequant", "tp-prequant", "historical-bde-capacity"),
+        ("06-tp-combined", "moe-fused-combined", "historical-bde-capacity"),
+        (
+            "07-metadata-budget-control",
+            "metadata-budget-control",
+            "historical-bde-capacity",
+        ),
+        ("08-metadata-batch2", "dsa-metadata-batch2", "historical-bde-capacity"),
+        (
+            "09-packed-metadata-batch2",
+            "dsa-metadata-packed-batch2",
+            "historical-bde-capacity",
+        ),
+        ("10-indexer-fp16-ablation", "indexer-fp16", "historical-bde-capacity"),
+        ("11-stream-auto-combined", "moe-stream-auto", "historical-bde-capacity"),
+        ("12-capacity-control-repeat", "baseline", "historical-bde-capacity"),
+        ("13-megamoe-34s-recipe", "legacy-megamoe-34s", "historical-bde"),
+        ("14-megamoe-no-lookahead", "megamoe-no-lookahead", "historical-bde-capacity"),
+        ("15-megamoe-lookahead-control", "megamoe", "historical-bde-capacity"),
+    ]
+    cases = [
+        dict(
+            name=n,
+            variant=v,
+            recipe=r,
+            dispatch=1024 if v.startswith("legacy") else 2048,
+        )
+        for n, v, r in rows
+    ]
+    cases[3].update(length=8192, context=16384)
+    cases[-3].update(benchmark_timeout=1800, repeats=1)
+    return cases
 
 
 def save(path, value):
@@ -126,6 +170,31 @@ def progress(completed, total, name, elapsed, status="running"):
     )
 
 
+def aggregate_measurements(details, expected):
+    measured = [
+        item
+        for item in details
+        if item.get("metrics") and item.get("status") == "diagnostic-unqualified"
+    ]
+    if not measured:
+        return {}
+    means = [item["metrics"]["TTFT avg"] for item in measured]
+    metrics = dict(measured[0]["metrics"])
+    for key in ("TTFT avg", "TTFT P90", "E2E_time", "qps", "prefill_token_throughput"):
+        metrics[key] = statistics.mean(item["metrics"][key] for item in measured)
+    return dict(
+        status="diagnostic-unqualified"
+        if len(measured) == expected
+        else "incomplete-repetitions",
+        metrics=metrics,
+        repetitions=[item["metrics"] for item in measured],
+        completed_repeats=len(measured),
+        ttft_cv_pct=(100 * statistics.pstdev(means) / statistics.mean(means))
+        if len(means) > 1
+        else None,
+    )
+
+
 def summarize(root, records):
     save(root / "progress.json", records)
     lines = [
@@ -133,8 +202,8 @@ def summarize(root, records):
         "",
         "Performance only; numerical quality unchecked. Recipe names are historical labels.",
         "",
-        "| Case | Status | TTFT mean / P90 (s) | Wall (min) |",
-        "|---|---|---|---|",
+        "| Case | Status | TTFT mean / mean P90 (s) | Repeats | TTFT CV (%) | Wall (min) | Reason |",
+        "|---|---|---|---|---|---|---|",
     ]
     for record in records:
         metrics = record.get("metrics", {})
@@ -144,9 +213,42 @@ def summarize(root, records):
             if mean is not None and p90 is not None
             else ""
         )
+        cv = record.get("ttft_cv_pct")
+        cv_text = f"{cv:.2f}" if cv is not None else ""
         lines.append(
-            f"| {record['name']} | {record['status']} | {ttft} | {record.get('wall_s', 0) / 60:.1f} |"
+            f"| {record['name']} | {record['status']} | {ttft} | {record.get('completed_repeats', '')} | {cv_text} | {record.get('wall_s', 0) / 60:.1f} | {record.get('reason', '').replace('|', '/').replace(chr(10), ' ')} |"
         )
+    controls = [
+        r
+        for r in records
+        if r["name"] in ("03-capacity-control", "12-capacity-control-repeat")
+        and r.get("metrics")
+    ]
+    if len(controls) == 2:
+        before, after = [r["metrics"]["TTFT avg"] for r in controls]
+        drift = 100 * (after - before) / before
+        enough = all(r.get("completed_repeats", 0) >= 3 for r in controls)
+        low_variation = all((r.get("ttft_cv_pct") or 0) <= 5 for r in controls)
+        stable = abs(drift) <= 5 and enough and low_variation
+        save(
+            root / "control-stability.json",
+            dict(
+                drift_pct=drift,
+                stable=stable,
+                threshold_pct=5,
+                enough_repetitions=enough,
+                low_variation=low_variation,
+            ),
+        )
+        lines += [
+            "",
+            f"Bracketed control drift: {drift:+.2f}%. "
+            + (
+                "Controls meet 5% drift/CV thresholds with three repetitions."
+                if stable
+                else "Controls are unstable or incomplete; cross-case comparisons remain provisional."
+            ),
+        ]
     (root / "SUMMARY.md").write_text("\n".join(lines) + "\n")
 
 
@@ -158,13 +260,15 @@ def main():
         "--root", type=Path, default=Path("/home/tbaydasov/aisbench/overnight-results")
     )
     parser.add_argument("--hours", type=float, default=12.0)
-    parser.add_argument("--case-minutes", type=float, default=30)
+    parser.add_argument("--case-minutes", type=float, default=45)
+    parser.add_argument("--round", choices=("all", "repair"), default="repair")
+    parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--stop-previous", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not 0 < args.hours <= 24 or args.case_minutes < 20:
         parser.error("hours must be in (0,24]; case-minutes must be at least 20")
-    cases = plan()
+    cases = repair_plan() if args.round == "repair" else plan()
     if args.dry_run:
         print(
             json.dumps(
@@ -175,7 +279,7 @@ def main():
                     requests=16,
                     concurrency=16,
                     tokens=1000000,
-                    repeats=1,
+                    repeats=args.repeats,
                 ),
                 indent=2,
             )
@@ -260,7 +364,7 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
     deadline = time.monotonic() + args.hours * 3600
     for index, case in enumerate(cases):
         # Reserve bounded attempts for the three MegaMoE cases at the end.
-        reserve = min(5400, args.case_minutes * 180) if index < len(cases) - 3 else 0
+        reserve = min(8100, args.case_minutes * 180) if index < len(cases) - 3 else 0
         remaining = deadline - time.monotonic()
         if remaining < 1200 + reserve:
             records.append(dict(case, status="skipped-budget"))
@@ -279,11 +383,11 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
             args.repo,
             "--performance-only",
             "--reference-recipe",
-            "historical-bde",
+            case.get("recipe", "historical-bde"),
             "--variants",
             case["variant"],
             "--length",
-            "1000000",
+            str(case.get("length", 1000000)),
             "--requests",
             "16",
             "--maxreq",
@@ -293,15 +397,15 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
             "--kv-rows",
             "67584",
             "--context",
-            "1048576",
+            str(case.get("context", 1048576)),
             "--memfrac",
             "0.85",
             "--repeats",
-            "1",
+            str(case.get("repeats", args.repeats)),
             "--startup-timeout",
             "900",
             "--benchmark-timeout",
-            "600",
+            str(case.get("benchmark_timeout", 1200)),
             "--watchdog-timeout",
             "180",
             "--max-hours",
@@ -365,12 +469,26 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
         record.update(
             exit_code=process.returncode, wall_s=round(time.monotonic() - started, 1)
         )
-        measured = next((item for item in details if item.get("metrics")), None)
-        if measured:
-            record.update(status=measured["status"], metrics=measured["metrics"])
+        aggregate = aggregate_measurements(details, case.get("repeats", args.repeats))
+        if aggregate:
+            record.update(aggregate)
         elif record["status"] == "running":
             record["status"] = "failed-or-blocked"
         record["details"] = details
+        failure = next((item for item in details if item.get("status") == "fail"), None)
+        if failure:
+            record["status"] = "failed-or-blocked"
+            record["reason"] = failure.get("error", "")[:400]
+            if "out of memory" in record["reason"].lower():
+                record["status"] = "capacity-blocked"
+            elif "missing activation" in record["reason"].lower():
+                record["status"] = "incomplete-activation"
+            elif "total budget" in record["reason"]:
+                record["status"] = "client-timeout"
+            # A successful client measurement remains inspectable even if activation failed.
+            raw = list((folder / "results" / case["variant"]).glob("metrics-*.json"))
+            if raw and not aggregate:
+                record["metrics"] = json.loads(sorted(raw)[-1].read_text())
         summarize(root, records)
         progress(
             index + 1, len(cases), case["name"], record["wall_s"], record["status"]

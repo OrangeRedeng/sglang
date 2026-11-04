@@ -62,6 +62,9 @@ DCP_VARIANTS = (
     "legacy-megamoe-34s",
     "graph-full",
     "graph-piecewise",
+    "graph-piecewise-probe",
+    "metadata-budget-control",
+    "megamoe-no-lookahead",
     "dsa-metadata",
     "dsa-metadata-batch2",
     "dsa-metadata-megamoe",
@@ -229,6 +232,22 @@ def ais_metrics(text, requests):
     return metrics
 
 
+def wait_benchmark(process, worker_process, limit):
+    deadline = time.monotonic() + limit
+    while True:
+        if worker_process.poll() is not None:
+            raise RuntimeError("Server worker exited during AISBench; see server.log")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"AISBench exceeded {limit:.0f}s total budget; see client and server logs"
+            )
+        try:
+            return process.wait(timeout=min(2, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def server_failure(log):
     for pattern, reason in (
         (r"aicore timeout", "native AICore timeout"),
@@ -319,19 +338,21 @@ def variant_launch(harness, repo, config):
         SGLANG_DEBUG_STAGE_LATENCY="False",
         SGLANG_NPU_DEBUG_DCP="False",
     )
+    if "max_prefill_tokens" in scenario.get("launch_overrides", {}):
+        command += [
+            "--max-prefill-tokens",
+            str(scenario["launch_overrides"]["max_prefill_tokens"]),
+        ]
     if scenario.get("graph"):
         command[command.index("--cuda-graph-backend-prefill") + 1] = scenario["graph"]
-        command[command.index("--cuda-graph-backend-decode") + 1] = "full"
+        command[command.index("--cuda-graph-backend-decode") + 1] = scenario.get(
+            "decode_graph", "full"
+        )
+        command += ["--cuda-graph-max-bs-decode", "32", "--cuda-graph-bs-prefill"]
         command += [
-            "--cuda-graph-max-bs-decode",
-            "32",
-            "--cuda-graph-bs-prefill",
-            "16",
-            "128",
-            "1024",
-            "4096",
-            "16384",
-            "32768",
+            str(n)
+            for n in (16, 128, 1024, 4096, 16384, 32768)
+            if n <= min(config["chunk"], config["context"])
         ]
     if scenario.get("separate_shared"):
         command.append("--disable-shared-experts-fusion")
@@ -365,12 +386,25 @@ def validate_variant_topology(harness, config, resolved):
         ),
         ("quantization", "modelslim"),
         ("cuda_graph_backend_prefill", scenario.get("graph", "disabled")),
-        ("cuda_graph_backend_decode", "full" if scenario.get("graph") else "disabled"),
+        (
+            "cuda_graph_backend_decode",
+            scenario.get("decode_graph", "full")
+            if scenario.get("graph")
+            else "disabled",
+        ),
     ):
         if resolved.get(key) != expected:
             raise RuntimeError(
                 f"Unexpected {key}: {resolved.get(key)}; expected {expected}"
             )
+    prefill_budget = overrides.get("max_prefill_tokens")
+    if (
+        prefill_budget is not None
+        and resolved.get("max_prefill_tokens") != prefill_budget
+    ):
+        raise RuntimeError(
+            f"Expected max_prefill_tokens={prefill_budget}; got {resolved.get('max_prefill_tokens')}"
+        )
     prefill_cap = overrides.get("prefill_max_requests", 1)
     if scenario.get("dcp") and resolved.get("prefill_max_requests") != prefill_cap:
         raise RuntimeError(f"DCP timing requires prefill_max_requests={prefill_cap}")
@@ -395,7 +429,7 @@ def timed_activation(log, variant, scenario=None):
         except (ValueError, KeyError, TypeError):
             continue
     required = set(scenario.get("expected", [])) if scenario is not None else set()
-    if not variant.startswith("legacy-"):
+    if not variant.startswith("legacy-") and variant != "graph-piecewise-probe":
         required.add("dsa-residual-shard")
     if "megamoe" in variant:
         required.add("megamoe")
@@ -654,7 +688,14 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument(
-        "--reference-recipe", choices=("ordinary", "historical-bde"), default="ordinary"
+        "--reference-recipe",
+        choices=(
+            "ordinary",
+            "historical-bde",
+            "historical-bde-hccl256",
+            "historical-bde-capacity",
+        ),
+        default="ordinary",
     )
     parser.add_argument("--feature-cases", default="*")
     parser.add_argument(
@@ -721,7 +762,7 @@ def main():
         parser.error("Long lengths and concurrency must be comma-separated integers")
     if min(*lengths, *concurrencies, args.long_requests, args.long_kv_rows) <= 0:
         parser.error("Long workload settings must be positive")
-    if max(lengths) + 1 > args.context:
+    if "long" in args.feature_stages.split(",") and max(lengths) + 1 > args.context:
         parser.error("Long prompt must leave space for output in context")
     if args.worker:
         return worker()
@@ -752,7 +793,12 @@ def main():
         selected = args.variants.split(",")
         supported = set(VARIANTS) - {"fuseep-1", "fuseep-2"}
         if (
-            args.reference_recipe != "historical-bde"
+            args.reference_recipe
+            not in (
+                "historical-bde",
+                "historical-bde-hccl256",
+                "historical-bde-capacity",
+            )
             or not selected
             or len(set(selected)) != len(selected)
             or set(selected) - supported
@@ -1193,25 +1239,11 @@ def main():
                                 start_new_session=True,
                             )
                             try:
-                                deadline = time.monotonic() + remaining_timeout(
-                                    args.benchmark_timeout
+                                code = wait_benchmark(
+                                    process,
+                                    job.process,
+                                    remaining_timeout(args.benchmark_timeout),
                                 )
-                                while True:
-                                    if job.process.poll() is not None:
-                                        raise RuntimeError(
-                                            "Server worker exited during AISBench; see server.log"
-                                        )
-                                    try:
-                                        code = process.wait(
-                                            timeout=min(
-                                                2, max(0, deadline - time.monotonic())
-                                            )
-                                        )
-                                        break
-                                    except subprocess.TimeoutExpired:
-                                        if time.monotonic() >= deadline:
-                                            raise
-
                             finally:
                                 stop_owned(process, include_exited=True)
                         if code:
@@ -1223,6 +1255,7 @@ def main():
                             cold = {"status": "incomplete", "error": str(exc)}
                         save(folder / f"cold-prefix-metrics-{repeat}.json", cold)
                         metrics = ais_metrics(client_log, args.requests)
+                        save(folder / f"metrics-{repeat}.json", metrics)
                         csv = Path(args.ais_dir) / "aisbench_result.csv"
                         if csv.is_file():
                             shutil.copyfile(

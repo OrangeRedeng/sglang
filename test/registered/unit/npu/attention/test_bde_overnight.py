@@ -54,6 +54,103 @@ class TestBdeOvernight(CustomTestCase):
                 "native evidence",
             )
 
+    def test_client_polling_reports_total_timeout_budget(self):
+        module = self.runner()
+        client, worker = MagicMock(), MagicMock()
+        worker.poll.return_value = None
+        client.wait.side_effect = subprocess.TimeoutExpired("aisbench", 2)
+        with patch.object(module.time, "monotonic", side_effect=[0, 0, 2, 4, 6]):
+            with self.assertRaisesRegex(TimeoutError, "6s total budget"):
+                module.wait_benchmark(client, worker, 6)
+        self.assertEqual(client.wait.call_count, 3)
+
+    def test_repair_round_has_legal_piecewise_and_fixed_batch_budget(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "repair_launch"
+        )
+        config = dict(
+            variant="dsa-metadata-packed-batch2",
+            reference_recipe="historical-bde-capacity",
+            checkpoint="/tmp/weights",
+            chunk=32768,
+            context=1048576,
+            memfrac=0.85,
+            maxreq=1,
+            kv_rows=67584,
+        )
+        command, env = module.variant_launch(harness, root, config)
+        self.assertEqual(command[command.index("--max-prefill-tokens") + 1], "32768")
+        self.assertEqual(command[command.index("--max-total-tokens") + 1], "63488")
+        self.assertEqual(env["HCCL_BUFFSIZE"], "256")
+        config["variant"] = "graph-piecewise-probe"
+        command, env = module.variant_launch(harness, root, config)
+        self.assertEqual(command[command.index("--dcp-size") + 1], "1")
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-prefill") + 1], "tc_piecewise"
+        )
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-decode") + 1], "disabled"
+        )
+        self.assertEqual(env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "False")
+
+    def test_short_piecewise_probe_ignores_unselected_long_workloads(self):
+        module = self.runner()
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "night",
+                    "--dry-run",
+                    "--performance-only",
+                    "--reference-recipe",
+                    "historical-bde-capacity",
+                    "--variants",
+                    "graph-piecewise-probe",
+                    "--length",
+                    "8192",
+                    "--context",
+                    "16384",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(module.main(), 0)
+        self.assertEqual(
+            json.loads(output.getvalue())["variants"], ["graph-piecewise-probe"]
+        )
+
+    def test_nightly_averages_repetitions_and_marks_partial_results(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        night = module.load_module(
+            root / "benchmark/prefill_1m/run_a3_nightly.py", "repair_summary"
+        )
+        rows = [
+            dict(
+                status="diagnostic-unqualified",
+                metrics={
+                    "TTFT avg": value,
+                    "TTFT P90": value * 2,
+                    "E2E_time": 4,
+                    "qps": 1,
+                    "prefill_token_throughput": 20,
+                },
+            )
+            for value in (10, 12, 14)
+        ]
+        result = night.aggregate_measurements(rows, 3)
+        self.assertEqual(result["metrics"]["TTFT avg"], 12)
+        self.assertEqual(result["metrics"]["TTFT P90"], 24)
+        self.assertAlmostEqual(result["ttft_cv_pct"], 13.60827635, places=5)
+        self.assertEqual(
+            night.aggregate_measurements(rows[:2], 3)["status"],
+            "incomplete-repetitions",
+        )
+
     def test_global_budget_and_single_warmup_reach_container_command(self):
         module = self.runner()
         output = io.StringIO()
@@ -508,6 +605,7 @@ class TestBdeOvernight(CustomTestCase):
                 dcp_size=16,
                 max_running_requests=2,
                 prefill_max_requests=2,
+                max_prefill_tokens=32768,
                 quantization="modelslim",
                 cuda_graph_backend_prefill="disabled",
                 cuda_graph_backend_decode="disabled",

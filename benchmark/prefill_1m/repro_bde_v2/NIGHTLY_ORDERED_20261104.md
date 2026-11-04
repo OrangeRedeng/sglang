@@ -1,5 +1,9 @@
 # Ordered A3 nightly comparisons
 
+Current default is the repaired piecewise-only round described in
+[NIGHTLY_REPAIR_20261104.md](NIGHTLY_REPAIR_20261104.md). The profile below records
+the original round at commit9c1b27f5d9; its results are retained as historical evidence.
+
 Budget: 12 hours, 30 minutes per case, 15 minutes server startup, 10 minutes
 AISBench, scheduler watchdog 180 seconds. One repetition, nominal 1M tokens,
 16 simultaneous client requests, 99% shared prefix, one output token.
