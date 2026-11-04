@@ -1494,6 +1494,7 @@ class DeepseekV2MoE(nn.Module):
 
             group = get_parallel().attn_tp_group
             from sglang.srt.hardware_backend.npu.moe.contracts import INT8, QuantizedOperand
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_stream_rows_eligible
 
             if boundary_operand is not None:
                 boundary_operand.validate(INT8)
@@ -1543,8 +1544,7 @@ class DeepseekV2MoE(nn.Module):
                 and not skip_shared_experts
                 and not get_is_capture_mode()
                 and not torch.compiler.is_compiling()
-                and hidden_states.shape[0]
-                >= envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
+                and shared_stream_rows_eligible(hidden_states.shape[0])
             ):
                 shared_stream = self.alt_stream
                 current_stream = torch.get_device_module(

@@ -79,6 +79,11 @@ MOE_VARIANTS = (
     "tp-finalize",
     "tp-prequant",
     "tp-shared-stream",
+    "tp-shared-stream-bounded",
+    "best-int8-fused",
+    "best-int8-metadata",
+    "best-int8-packed-batch2",
+    "best-int8-batch2",
     "tp-shared-stream-combined",
     "gate-int8-norm-probe",
     "gate-int8-norm",
@@ -255,10 +260,25 @@ def wait_benchmark(process, worker_process, limit):
             pass
 
 
+def required_kv_capacity(config, resolved):
+    page = resolved["page_size"] * resolved["dcp_size"]
+
+    def rounded(tokens):
+        return (tokens + page - 1) // page * page
+
+    cached = max(0, int(config["length"] * config["repeat_rate"]) - 1) // page * page
+    active = min(resolved["max_running_requests"], config["requests"])
+    full = rounded(config["length"] + config["output_len"])
+    suffix = rounded(config["length"] + config["output_len"] - cached)
+    return max(full, cached + active * suffix) + 4096
+
+
 def server_failure(log):
     for pattern, reason in (
         (r"aicore timeout", "native AICore timeout"),
         (r"out of memory|NPU out of memory", "server out of memory"),
+        (r"Scheduler watchdog timeout", "scheduler watchdog timeout"),
+        (r"TypeError: _weak_ref_tensor", "piecewise graph output type error"),
     ):
         match = re.search(pattern, log, re.IGNORECASE)
         if match:
@@ -553,8 +573,11 @@ def worker():
             deadline = time.monotonic() + config["startup_timeout"]
             while time.monotonic() < deadline:
                 if process.poll() is not None:
+                    reason = server_failure(
+                        (folder / "server.log").read_text(errors="replace")
+                    )
                     raise RuntimeError(
-                        f"Server exited {process.returncode}; see server.log"
+                        reason or f"Server exited {process.returncode}; see server.log"
                     )
                 try:
                     http("/health")
@@ -577,19 +600,7 @@ def worker():
                 raise RuntimeError("Full real weights are required")
             contents = (folder / "server.log").read_text(errors="replace")
             capacities = re.findall(r"max_total_num_tokens=(\d+)", contents)
-            required = (
-                int(
-                    config["length"]
-                    * (
-                        config["repeat_rate"]
-                        + (1 - config["repeat_rate"])
-                        * min(resolved["max_running_requests"], config["requests"])
-                    )
-                    + config["output_len"]
-                    * min(resolved["max_running_requests"], config["requests"])
-                )
-                + 4096
-            )
+            required = required_kv_capacity(config, resolved)
             if not capacities or min(map(int, capacities)) < required:
                 raise RuntimeError(
                     f"KV capacity cannot cover shared-prefix working set {required}"

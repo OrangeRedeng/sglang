@@ -125,6 +125,13 @@ def supports_quantized_linear(layer) -> bool:
     return linear_input_contract(layer) is not None
 
 
+def shared_stream_rows_eligible(rows):
+    maximum = envs.SGLANG_NPU_TP_MOE_SHARED_STREAM_MAX_TOKENS.get()
+    return rows >= envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get() and (
+        maximum <= 0 or rows <= maximum
+    )
+
+
 def can_overlap_tp_shared(experts):
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
 

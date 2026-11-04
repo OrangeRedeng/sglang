@@ -1161,6 +1161,8 @@ class Envs:
     SGLANG_NPU_DSA_OVERLAP_QPROJ_KVNORM_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_EAGER_INDEXER_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS = EnvInt(0)
+    # Bound token-sharded overlap to avoid cold-prefill resource contention.
+    SGLANG_NPU_TP_MOE_SHARED_STREAM_MAX_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_INDEXER_QUERY_SHARDING_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_DSA_CP_MIN_TOKENS = EnvInt(0)
     # Opt-in fused Gemma4 QKV norm (dual-contract INT8 gate path).

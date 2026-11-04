@@ -75,6 +75,33 @@ def kernels_plan():
     return cases
 
 
+def final_plan():
+    variants = [
+        "baseline",
+        "graph-piecewise-dcp16",
+        "megamoe-no-lookahead",
+        "megamoe-no-lookahead",
+        "tp-shared-stream-bounded",
+        "best-int8-fused",
+        "best-int8-metadata",
+        "best-int8-batch2",
+        "best-int8-packed-batch2",
+        "baseline",
+    ]
+    cases = [
+        dict(
+            name=f"{i:02d}-{v}",
+            variant=v,
+            dispatch=2048,
+            recipe="historical-bde-capacity",
+        )
+        for i, v in enumerate(variants, 1)
+    ]
+    cases[2].update(name="03-megamoe-no-lookahead-500k", length=500000)
+    cases[3].update(name="04-megamoe-no-lookahead-1m", requires=cases[2]["name"])
+    return cases
+
+
 def repair_plan():
     rows = [
         ("01-control-hccl1000", "baseline", "historical-bde"),
@@ -323,10 +350,10 @@ def main():
     parser.add_argument(
         "--root", type=Path, default=Path("/home/tbaydasov/aisbench/overnight-results")
     )
-    parser.add_argument("--hours", type=float, default=12.0)
-    parser.add_argument("--case-minutes", type=float, default=45)
+    parser.add_argument("--hours", type=float, default=8.0)
+    parser.add_argument("--case-minutes", type=float, default=40)
     parser.add_argument(
-        "--round", choices=("all", "repair", "kernels"), default="repair"
+        "--round", choices=("all", "repair", "kernels", "final"), default="repair"
     )
     parser.add_argument("--repeats", type=int, choices=(1,), default=1)
     parser.add_argument("--stop-previous", action="store_true")
@@ -335,7 +362,12 @@ def main():
     args = parser.parse_args()
     if not 0 < args.hours <= 24 or args.case_minutes < 20:
         parser.error("hours must be in (0,24]; case-minutes must be at least 20")
-    cases = {"repair": repair_plan, "all": plan, "kernels": kernels_plan}[args.round]()
+    cases = {
+        "repair": repair_plan,
+        "all": plan,
+        "kernels": kernels_plan,
+        "final": final_plan,
+    }[args.round]()
     if args.dry_run:
         print(
             json.dumps(
@@ -402,6 +434,10 @@ def main():
         if copied.returncode:
             raise RuntimeError(f"Cannot snapshot {name}")
     runtime_paths = (
+        "python/sglang/srt/compilation/npu_piecewise_backend.py",
+        "python/sglang/srt/model_executor/runner_backend_utils/weak_ref_tensor.py",
+        "python/sglang/srt/environ.py",
+        "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py",
         "python/sglang/srt/hardware_backend/npu/moe/norm_gate.py",
         "python/sglang/srt/hardware_backend/npu/moe/tp_fusion.py",
         "python/sglang/srt/hardware_backend/npu/layernorm_quant.py",
@@ -471,10 +507,24 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
     records = []
     deadline = time.monotonic() + args.hours * 3600
     for index, case in enumerate(cases):
+        prerequisite = case.get("requires")
+        if prerequisite and not any(
+            r["name"] == prerequisite and r["status"] == "diagnostic-unqualified"
+            for r in records
+        ):
+            records.append(
+                dict(
+                    case,
+                    status="blocked-prerequisite",
+                    reason=f"Requires successful {prerequisite}",
+                )
+            )
+            summarize(root, records)
+            continue
         # Reserve bounded attempts for the three MegaMoE cases at the end.
         reserve = (
             min(8100, args.case_minutes * 180)
-            if args.round != "kernels" and index < len(cases) - 3
+            if args.round in ("all", "repair") and index < len(cases) - 3
             else 0
         )
         remaining = deadline - time.monotonic()
@@ -600,6 +650,8 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
                 record["status"] = "incomplete-activation"
             elif "GMM2 finalizer requires W8A8" in record["reason"]:
                 record["status"] = "dependency-blocked"
+            elif "scheduler watchdog timeout" in record["reason"]:
+                record["status"] = "native-watchdog"
             elif "total budget" in record["reason"]:
                 record["status"] = "client-timeout"
             # A successful client measurement remains inspectable even if activation failed.

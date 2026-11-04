@@ -274,6 +274,7 @@ def runtime_gather_reserve_bytes(
 ):
     row_bytes = 0
     prefix_row_bytes = 0
+    decode_row_bytes = 0
     for layer in model.modules():
         # Prepared projection rings are already resident in the free-memory sample.
         if getattr(layer, "w_vc_qrep", None) is not None:
@@ -287,6 +288,10 @@ def runtime_gather_reserve_bytes(
                     * hidden
                     * layer.w_vc_qrep.element_size()
                 ),
+            )
+            latent, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
+            decode_row_bytes = max(
+                decode_row_bytes, latent + rope * 2 + latent // 128 * 4 + latent * 4 + 8
             )
             prefix_row_bytes = max(
                 prefix_row_bytes,
@@ -306,7 +311,12 @@ def runtime_gather_reserve_bytes(
         + get_parallel().attn_tp_size
         - 1
     ) // get_parallel().attn_tp_size
-    return row_bytes + prefix_bytes + local_sends
+    decode_scratch = 0
+    if envs.SGLANG_NPU_SFA_KV_8BIT.get() and prefix_row_bytes and context_tokens:
+        rank = get_parallel().attn_tp_size
+        local_rows = (context_tokens + tokens + rank - 1) // rank + 128
+        decode_scratch = local_rows * prefill_requests * 2 * decode_row_bytes
+    return row_bytes + prefix_bytes + local_sends + decode_scratch
 
 
 def prepare_quantized_q_projection(m, group):

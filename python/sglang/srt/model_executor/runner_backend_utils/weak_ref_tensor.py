@@ -1,6 +1,7 @@
-from typing import Any, Union
+from typing import Any
 
 import torch
+from torch.utils._pytree import tree_map_only
 
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
@@ -14,17 +15,6 @@ else:
     )
 
 
-def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
-    """
-    Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
-    """
-    if isinstance(tensors, torch.Tensor):
-        return weak_ref_tensor(tensors)
-    if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
-    if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
-    raise ValueError("Invalid type for tensors")
+def weak_ref_tensors(tensors: Any) -> Any:
+    """Release tensor ownership without changing symbolic/scalar graph outputs."""
+    return tree_map_only(torch.Tensor, weak_ref_tensor, tensors)

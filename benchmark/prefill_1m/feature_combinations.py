@@ -58,6 +58,10 @@ def add_combinations(scenarios):
         "gate-int8-executed",
         "megamoe-shared-stream",
     ]
+    scenarios["tp-shared-stream-bounded"] = copy.deepcopy(scenarios["tp-shared-stream"])
+    scenarios["tp-shared-stream-bounded"]["env"][
+        "SGLANG_NPU_TP_MOE_SHARED_STREAM_MAX_TOKENS"
+    ] = "16384"
     historical = copy.deepcopy(scenarios["bde-v2"])
     historical["env"].update(
         DEEPEP_HCCL_BUFFSIZE="2500",
@@ -195,6 +199,44 @@ def add_combinations(scenarios):
             if source.get("probe"):
                 merged["probe"] = source["probe"]
         scenarios[name] = merged
+    scenarios["best-int8-fused"] = copy.deepcopy(scenarios["gate-int8-norm"])
+    scenarios["best-int8-fused"]["env"] = copy.deepcopy(
+        scenarios["moe-fused-combined"]["env"]
+    )
+    # The norm already supplies the operand; there is no separate prequant kernel.
+    scenarios["best-int8-fused"]["expected"] += [
+        feature
+        for feature in scenarios["moe-fused-combined"]["expected"]
+        if feature != "tp-prequant"
+    ]
+    scenarios["best-int8-metadata"] = copy.deepcopy(scenarios["best-int8-fused"])
+    scenarios["best-int8-metadata"]["env"]["SGLANG_NPU_DSA_METADATA_REUSE"] = "True"
+    scenarios["best-int8-metadata"]["expected"].append("dsa-metadata-reuse")
+    scenarios["best-int8-batch2"] = copy.deepcopy(scenarios["best-int8-metadata"])
+    scenarios["best-int8-batch2"].update(
+        probe_batch2=True,
+        launch_overrides=dict(
+            max_running_requests=2,
+            prefill_max_requests=2,
+            max_prefill_tokens=32768,
+            kv_rows=63616,
+        ),
+    )
+    scenarios["best-int8-batch2"]["expected"].append("dcp-prefill-batch-2")
+    scenarios["best-int8-packed-batch2"] = copy.deepcopy(scenarios["best-int8-batch2"])
+    scenarios["best-int8-packed-batch2"]["env"][
+        "SGLANG_NPU_ENABLE_DCP_PACKED_READ_BATCH2"
+    ] = "True"
+    scenarios["best-int8-packed-batch2"].update(
+        probe_batch2=True,
+        launch_overrides=dict(
+            max_running_requests=2,
+            prefill_max_requests=2,
+            max_prefill_tokens=32768,
+            kv_rows=63616,
+        ),
+    )
+    scenarios["best-int8-packed-batch2"]["expected"].append("dcp-packed-read-batch2")
 
 
 def qualification_key(case, name=None):

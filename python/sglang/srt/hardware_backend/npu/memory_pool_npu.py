@@ -884,7 +884,42 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 f"GiB); {self.layer_num} KV layers, {size} rows, index-K "
                 f"{self.index_k_store_dtype}"
             )
+        self._prepare_dcp_packed_read_buffers()
         self._finalize_allocation_log(size)
+
+    def _prepare_dcp_packed_read_buffers(self):
+        self._dcp_packed_read_buffers = None
+        if not (
+            self.sfa_packed_kv_storage
+            and self.dcp_size > 1
+            and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+            and self.k_buffer is not None
+        ):
+            return
+        from sglang.srt.runtime_context import get_schedule
+
+        requests = max(1, get_schedule().prefill_max_requests or 1)
+        rows = self.k_buffer[0].numel() // self.kv_cache_dim * requests
+        self._dcp_packed_read_buffers = [
+            (
+                torch.empty(
+                    (rows, self.kv_cache_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                ),
+                torch.empty(rows, dtype=torch.int64, device=self.device),
+                torch.empty(
+                    (rows, self.kv_lora_rank), dtype=torch.float32, device=self.device
+                ),
+                torch.empty(
+                    (rows, self.kv_lora_rank), dtype=self.dtype, device=self.device
+                ),
+                torch.empty(
+                    (rows, self.qk_rope_head_dim), dtype=self.dtype, device=self.device
+                ),
+            )
+            for _ in range(2)
+        ]
 
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
@@ -1071,8 +1106,40 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         storage = self.k_buffer[read_layer_id - self.start_layer].view(
             -1, self.kv_cache_dim
         )
-        rows = storage.index_select(0, loc.to(torch.int64))
         out_dtype = dst_dtype if dst_dtype is not None else self.dtype
+        buffers = getattr(self, "_dcp_packed_read_buffers", None)
+        if buffers is not None and out_dtype == self.dtype:
+            raw, index, fp32, nope_out, rope_out = buffers[read_layer_id % 2]
+            count = loc.numel()
+            if count > raw.shape[0]:
+                raise RuntimeError("DCP packed read exceeds its prepared row capacity")
+            index = index[:count]
+            index.copy_(loc)
+            rows = raw[:count]
+            torch.index_select(storage, 0, index, out=rows)
+            tiles = self.kv_lora_rank // 128
+            rope_end = self.kv_lora_rank + self.qk_rope_head_dim * 2
+            scale = (
+                rows[:, rope_end:]
+                .view(torch.uint8)
+                .view(torch.float32)
+                .reshape(count, tiles, 1)
+            )
+            fp32 = fp32[:count]
+            fp32.copy_(rows[:, : self.kv_lora_rank])
+            fp32.view(count, tiles, 128).mul_(scale)
+            nope, rope = nope_out[:count], rope_out[:count]
+            nope.copy_(fp32)
+            rope.copy_(
+                rows[:, self.kv_lora_rank : rope_end]
+                .view(torch.uint8)
+                .view(torch.bfloat16)
+            )
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("dcp-packed-read-preallocated", capacity=raw.shape[0])
+            return nope.unsqueeze(1), rope.unsqueeze(1)
+        rows = storage.index_select(0, loc.to(torch.int64))
         rope_bytes = self.qk_rope_head_dim * 2
         tiles = self.kv_lora_rank // 128
         # Dequantise in FP32 (the scale is exact there; a bf16 scale would add

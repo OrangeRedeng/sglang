@@ -178,9 +178,10 @@ def dsa_cp_gather_last_token_rows(x: torch.Tensor, forward_batch) -> torch.Tenso
     # alone is the first token of the NEXT request (and past the end for the
     # last one), so using it as the index shifts every request by one and
     # zeroes the final request's logits row.
-    last_rows = list(
-        (torch.cumsum(torch.tensor(extend_lens), dim=0) - 1).tolist()
-    )
+    last_rows = [end - 1 for end in cumulative(extend_lens)]
+    from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+    record("dsa-logits-host-metadata", request_count=len(last_rows))
     bs = len(last_rows)
     mine = x.new_zeros((bs,) + x.shape[1:])
     for i, row in enumerate(last_rows):
