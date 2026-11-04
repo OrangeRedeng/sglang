@@ -98,6 +98,36 @@ class TestBdeOvernight(CustomTestCase):
             int(command[command.index("--max-total-tokens") + 1]), 8192 + 4096 + 1
         )
 
+    def test_dcp16_piecewise_variant_keeps_long_context_and_residual_flags(self):
+        module = self.runner()
+        root = Path(__file__).resolve().parents[5]
+        harness = module.load_module(
+            root / "benchmark/prefill_1m/test_glm53_features.py", "dcp16_graph"
+        )
+        command, env = module.variant_launch(
+            harness,
+            root,
+            dict(
+                variant="graph-piecewise-dcp16",
+                reference_recipe="historical-bde-capacity",
+                checkpoint="/tmp/weights",
+                chunk=32768,
+                context=1048576,
+                memfrac=0.8,
+                maxreq=1,
+                kv_rows=63488,
+            ),
+        )
+        self.assertEqual(command[command.index("--dcp-size") + 1], "16")
+        self.assertEqual(command[command.index("--context-length") + 1], "1048576")
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-prefill") + 1], "tc_piecewise"
+        )
+        self.assertEqual(
+            command[command.index("--cuda-graph-backend-decode") + 1], "disabled"
+        )
+        self.assertEqual(env["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"], "True")
+
     def test_short_piecewise_probe_ignores_unselected_long_workloads(self):
         module = self.runner()
         output = io.StringIO()

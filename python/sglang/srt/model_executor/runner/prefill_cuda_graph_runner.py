@@ -871,6 +871,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 full_graph=self._is_full_backend,
             ),
         ):
+            if (
+                is_npu()
+                and self.prefill_backend_name == Backend.TC_PIECEWISE
+                and get_parallel().dcp_enabled
+            ):
+                from sglang.srt.hardware_backend.npu.dcp_piecewise import prepare_batch
+
+                prepare_batch(self.model_runner, forward_batch)
             yield
 
     @torch.no_grad()
@@ -1721,6 +1729,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
                 max_seq_len_override=self.max_context_size,
+                origin_out_cache_loc=(
+                    _slot("out_cache_loc")
+                    if is_npu() and get_parallel().dcp_enabled
+                    else None
+                ),
                 full_prefill_cuda_graph_capture=(
                     self.prefill_backend_name == Backend.FULL
                 ),
@@ -2055,6 +2068,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,

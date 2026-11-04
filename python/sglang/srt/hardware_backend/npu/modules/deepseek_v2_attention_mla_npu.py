@@ -681,7 +681,13 @@ def _prepare_dcp_prefix(m, batch, hidden_states):
             m.attn_mqa, batch.attn_dcp_metadata.dcp_local_prefix_kv_indices
         )
         batch.npu_dcp_prefix_pending = start_prefix_gather(
-            parallel.dcp_group, sends, refs, plan, parallel.dcp_size, packed is not None
+            parallel.dcp_group,
+            sends,
+            refs,
+            plan,
+            parallel.dcp_size,
+            packed is not None,
+            buffer_slot=m.layer_id % 2,
         )
 
 
@@ -722,7 +728,13 @@ def _take_dcp_prefix(m, batch, k_nope, k_pe):
         elif packed is not None:
             sends = pool.get_mla_kv_buffer(m.attn_mqa, indices)
             result = start_prefix_gather(
-                parallel.dcp_group, sends, (k_nope, k_pe), plan, parallel.dcp_size, True
+                parallel.dcp_group,
+                sends,
+                (k_nope, k_pe),
+                plan,
+                parallel.dcp_size,
+                True,
+                buffer_slot=m.layer_id % 2,
             ).finish((k_nope, k_pe))
         else:
             return _dcp_gather_extend_kv_npu(m, batch, k_nope, k_pe)

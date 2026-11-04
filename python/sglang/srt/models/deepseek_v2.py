@@ -2661,6 +2661,20 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu import dcp_piecewise
+
+            if dcp_piecewise.active():
+                return dcp_piecewise.attention(
+                    self,
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    input_on_attn_tp_slices,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -3470,7 +3484,12 @@ class DeepseekV2Model(nn.Module):
                 reset_forward,
             )
 
-            reset_forward(forward_batch, positions.shape[0])
+            from sglang.srt.hardware_backend.npu import dcp_piecewise
+
+            if dcp_piecewise.active():
+                dcp_piecewise.reset_forward(forward_batch, positions.shape[0])
+            else:
+                reset_forward(forward_batch, positions.shape[0])
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)

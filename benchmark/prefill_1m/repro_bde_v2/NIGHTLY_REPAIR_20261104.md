@@ -1,5 +1,9 @@
 # A3 nightly analysis and repair round, November 4
 
+The current implementation and remaining A3 acceptance requirements are described
+in [DCP_RUNTIME_REPAIR_20261104.md](DCP_RUNTIME_REPAIR_20261104.md). The observations
+and first repair plan below are retained as the original evidence.
+
 Evidence: `retest-nightly-20261104-061011`, commit 9c1b27f5d9, full GLM5.2
 ModelSlim W4A8, Ascend910_9362x16, CANN 9.1, torch 2.10.0+cpu,
 torch_npu 2.10.0.post6, sgl-kernel-npu 2026.9.0, DeepEP 00db6cd6,

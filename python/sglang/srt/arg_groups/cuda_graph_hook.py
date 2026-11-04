@@ -426,16 +426,19 @@ def validate_cuda_graph_config(server_args: Any):
             raise ValueError("tc_piecewise NPU prefill requires ascend attention")
         if (
             cfg.pp_size > 1
-            or cfg.dcp_size > 1
             or cfg.attn_cp_size > 1
             or cfg.enable_dp_attention
             or cfg.enable_lora
             or cfg.speculative_algorithm is not None
         ):
             raise ValueError(
-                "tc_piecewise NPU prefill does not support PP, CP, DP attention, "
+                "tc_piecewise NPU prefill does not support PP, attention CP, DP attention, "
                 "LoRA, or speculative decoding"
             )
+        if cfg.dcp_size > 1 and getattr(cfg, "ep_size", 1) > 1:
+            raise ValueError("tc_piecewise NPU DCP currently requires EP size one")
+        if cfg.dcp_size > 1 and cfg.dcp_size != cfg.tp_size:
+            raise ValueError("tc_piecewise NPU DCP requires equal TP and DCP sizes")
         logger.warning(
             "Ascend tc_piecewise prefill is experimental; attention runs eagerly "
             "between captured compute pieces."

@@ -103,6 +103,12 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        if model_runner.device == "npu" and get_parallel().dcp_enabled:
+            inner = getattr(self._language_model, "model", self._language_model)
+            if not getattr(inner, "use_dsa", False):
+                raise ValueError(
+                    "NPU DCP piecewise currently requires a DeepSeek/GLM DSA model"
+                )
         _suppress_lru_cache_dynamo_warning()
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
@@ -122,6 +128,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             "tc_piecewise prefill compiler."
         )
 
+        if server_args.device == "npu" and get_parallel().dcp_enabled:
+            tp = get_parallel().attn_tp_size
+            num_tokens = sorted(
+                set(num_tokens) | {(n + tp - 1) // tp for n in num_tokens}
+            )
         config = CompilationConfig(
             num_tokens,
             compiler,
@@ -182,6 +193,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     inner_model,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
+                    # DCP's eager boundaries deliberately graph-break around host/HCCL work.
+                    fullgraph=not (
+                        cuda_graph_runner.model_runner.device == "npu"
+                        and get_parallel().dcp_enabled
+                    ),
                 )
 
                 with enable_torch_compile_warmup():

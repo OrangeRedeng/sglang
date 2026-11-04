@@ -120,6 +120,11 @@ _o_proj_stream_shards: Dict[int, torch.Tensor] = {}
 
 
 def register_o_proj_stream_shard(layer_id: int, shard: torch.Tensor) -> None:
+    from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
+        prepare_o_proj_gather,
+    )
+
+    prepare_o_proj_gather(get_parallel().attn_tp_group, shard)
     _o_proj_stream_shards[layer_id] = shard
 
 

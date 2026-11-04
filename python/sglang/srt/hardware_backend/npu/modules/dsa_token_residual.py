@@ -102,7 +102,9 @@ def full_head_plan(batch, index_topk=None):
         )
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    if get_is_capture_mode():
+    from sglang.srt.hardware_backend.npu.dcp_piecewise import in_eager_attention
+
+    if get_is_capture_mode() and not in_eager_attention():
         raise ValueError(
             "DSA-CP full-head extend is eager-only; disable prefill graph capture"
         )
@@ -128,6 +130,16 @@ def _read_norm(hidden, batch, norm, plan=None):
 def decoder_forward(
     layer, positions, hidden, batch, allocator, previous_topk=None, *, plan=None
 ):
+    from sglang.srt.hardware_backend.npu import dcp_piecewise
+
+    if dcp_piecewise.active():
+        prepared = dcp_piecewise.prepare_decoder(
+            layer, positions, hidden, batch, allocator, previous_topk, plan
+        )
+        if prepared is None:
+            return None
+        normalized, topk, plan = prepared
+        return decoder_ffn(layer, normalized, batch, plan, piecewise=True), topk
     plan = (
         plan
         if plan is not None
@@ -142,6 +154,15 @@ def decoder_forward(
         if getattr(batch, "npu_dsa_cp_token_sharded", False):
             raise RuntimeError("DSA residual sharding cannot change within a forward")
         return None
+    normalized, topk = prepare_decoder_attention(
+        layer, positions, hidden, batch, allocator, previous_topk, plan
+    )
+    return decoder_ffn(layer, normalized, batch, plan), topk
+
+
+def prepare_decoder_attention(
+    layer, positions, hidden, batch, allocator, previous_topk, plan
+):
     batch.npu_dsa_cp_token_sharded = True
     normalized = _read_norm(hidden, batch, layer.input_layernorm, plan)
     output = layer.self_attn(
@@ -159,15 +180,32 @@ def decoder_forward(
     stream = residual_batch.stream_of(batch)
     output = stream.record(output, PLAIN_ADD)
     normalized = _read_norm(output, batch, layer.post_attention_layernorm)
+    return normalized, topk
+
+
+def decoder_ffn(layer, normalized, batch, plan, *, piecewise=False):
     # Sparse MoE gathers its quantized local input in its own forward. Dense
     # layers still need every token before their tensor-parallel projection.
     if not layer.is_layer_sparse:
-        group = get_parallel().attn_tp_group
-        full = normalized.new_empty((plan.num_tokens_pad, normalized.shape[-1]))
-        group.all_gather_into_tensor(full, normalized.contiguous())
-        normalized = full
+        if piecewise:
+            from sglang.srt.hardware_backend.npu.dcp_piecewise import gather_dense
+
+            normalized = gather_dense(layer, normalized, plan)
+        else:
+            group = get_parallel().attn_tp_group
+            full = normalized.new_empty((plan.num_tokens_pad, normalized.shape[-1]))
+            group.all_gather_into_tensor(full, normalized.contiguous())
+            normalized = full
     with get_forward().scoped(npu_dsa_cp_token_sharded=layer.is_layer_sparse):
         output = layer.mlp(normalized, batch, None)
+    if piecewise:
+        from sglang.srt.hardware_backend.npu.dcp_piecewise import finish_decoder
+
+        return finish_decoder(layer, output, batch, plan)
+    return finish_decoder_ffn(layer, output, batch, plan)
+
+
+def finish_decoder_ffn(layer, output, batch, plan, *, stage_output=False):
     reduce_results = (
         layer.mlp.reduce_results
         if layer.is_layer_sparse
@@ -178,8 +216,12 @@ def decoder_forward(
         output = dsa_cp_reduce_scatter_tokens(output)
     if output.shape[0] != plan.rows:
         raise RuntimeError("DSA-CP FFN must return this rank's local residual rows")
+    if stage_output:
+        from sglang.srt.hardware_backend.npu.dcp_piecewise import stage_tensor
+
+        output = stage_tensor(layer, "ffn_output", output)
     record("dsa-residual-shard")
-    return stream.record(output, PLAIN_ADD), topk
+    return residual_batch.stream_of(batch).record(output, PLAIN_ADD)
 
 
 def gather_logit_rows(hidden, batch):
@@ -208,22 +250,44 @@ def gather_logit_rows(hidden, batch):
     return full
 
 
-def runtime_gather_reserve_bytes(model, tokens):
-    projection_bytes = 0
+def runtime_gather_reserve_bytes(
+    model, tokens, *, context_tokens=0, prefill_requests=1, capture_tokens=()
+):
     row_bytes = 0
+    prefix_row_bytes = 0
     for layer in model.modules():
-        shard = getattr(layer, "o_proj_stream_shard", None)
-        if shard is not None:
-            full_bytes = (
-                shard.numel() * shard.element_size() * get_parallel().attn_tp_size
-            )
-            projection_bytes = max(projection_bytes, 3 * full_bytes)
+        # Prepared projection rings are already resident in the free-memory sample.
         if getattr(layer, "w_vc_qrep", None) is not None:
             hidden = layer.o_proj.output_size
+            # Two ring slots: global dense inputs plus local FFN/residual/output.
+            staging_rows = (2 + 6 / get_parallel().attn_tp_size) * sum(capture_tokens)
             row_bytes = max(
-                row_bytes, 2 * tokens * hidden * layer.w_vc_qrep.element_size()
+                row_bytes,
+                int(
+                    (2 * tokens + staging_rows)
+                    * hidden
+                    * layer.w_vc_qrep.element_size()
+                ),
             )
-    return projection_bytes + row_bytes
+            prefix_row_bytes = max(
+                prefix_row_bytes,
+                (layer.kv_lora_rank + layer.qk_rope_head_dim)
+                * layer.w_vc_qrep.element_size(),
+            )
+    slots = 2 if envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get() else 1
+    # The generic layout holds both contiguous output and rank-major scratch.
+    copies = (
+        1
+        if envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get() and prefill_requests == 1
+        else 2
+    )
+    prefix_bytes = context_tokens * prefill_requests * prefix_row_bytes * slots * copies
+    local_sends = (
+        2 * context_tokens * prefill_requests * prefix_row_bytes * slots
+        + get_parallel().attn_tp_size
+        - 1
+    ) // get_parallel().attn_tp_size
+    return row_bytes + prefix_bytes + local_sends
 
 
 def prepare_quantized_q_projection(m, group):
@@ -391,7 +455,9 @@ def core_attention(m, q_pe, key_pe, q_nope, key_nope, topk, batch, gate=None):
                 )
 
                 gathered, send, work = start_o_proj_gather(
-                    get_parallel().attn_tp_group, get_o_proj_stream_shard(m.layer_id)
+                    get_parallel().attn_tp_group,
+                    get_o_proj_stream_shard(m.layer_id),
+                    buffer_slot=m.layer_id % 2,
                 )
                 if work is not None:
                     work.wait()

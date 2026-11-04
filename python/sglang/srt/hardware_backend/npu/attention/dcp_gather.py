@@ -45,11 +45,48 @@ def validate_legacy_dcp_flags(environment, *, tp_size=None, dcp_size=None):
         )
 
 
-def start_o_proj_gather(group, shard):
-    # RowParallel shards columns. Gather transposed shards along rows, then
-    # expose a transpose view; gathering raw [out, in_r] bytes scrambles W.
-    send = shard.t().contiguous()
-    gathered = send.new_empty((send.shape[0] * group.world_size, send.shape[1]))
+_o_proj_gather_buffers = {}
+
+
+def _o_proj_key(group, shard):
+    return (
+        tuple(getattr(group, "ranks", ())),
+        getattr(group, "rank_in_group", id(group)),
+        group.world_size,
+        shard.dtype,
+        shard.device,
+        tuple(shard.shape),
+    )
+
+
+def prepare_o_proj_gather(group, shard):
+    key = _o_proj_key(group, shard)
+    if key not in _o_proj_gather_buffers:
+        rows, cols = shard.shape[1], shard.shape[0]
+        _o_proj_gather_buffers[key] = [
+            (
+                shard.new_empty((rows * group.world_size, cols)),
+                shard.new_empty((rows, cols)),
+            )
+            for _ in range(2)
+        ]
+
+
+def start_o_proj_gather(group, shard, *, buffer_slot=None):
+    # Rank r contributes columns r*in_r:(r+1)*in_r of [out, in].
+    if buffer_slot is None:
+        send = shard.t().contiguous()
+        gathered = send.new_empty((send.shape[0] * group.world_size, send.shape[1]))
+    else:
+        buffers = _o_proj_gather_buffers.get(_o_proj_key(group, shard))
+        if buffers is None:
+            raise RuntimeError(
+                "Streamed o_proj buffers must be prepared before serving"
+            )
+        if buffer_slot not in (0, 1):
+            raise ValueError("Streamed o_proj uses exactly two buffer slots")
+        gathered, send = buffers[buffer_slot]
+        send.copy_(shard.t())
     work = group.all_gather_into_tensor_async(gathered, send)
     return gathered, send, work
 
@@ -141,11 +178,14 @@ def start_prefix_gather(
         )
         retained = []
         source = 0
-        for request, local, offset in zip(
-            plan.requests, plan.local_lens, plan.row_offsets
+        for request_id, (request, local, offset) in enumerate(
+            zip(plan.requests, plan.local_lens, plan.row_offsets)
         ):
-            for out, send in zip(outputs, sends):
-                padded = send.new_zeros((request.send_rows, *send.shape[1:]))
+            for value_id, (out, send) in enumerate(zip(outputs, sends)):
+                padded = allocate(
+                    f"send-{request_id}-{value_id}", send, request.send_rows
+                )
+                padded.zero_()
                 padded[:local] = send[source : source + local]
                 retained.append(padded)
                 if request.gathered_rows:
@@ -161,8 +201,9 @@ def start_prefix_gather(
             allocate(f"out-{i}", ref, plan.rows) for i, ref in enumerate(refs)
         )
         padded = []
-        for send in sends:
-            value = send.new_zeros((plan.send_rows, *send.shape[1:]))
+        for value_id, send in enumerate(sends):
+            value = allocate(f"send-{value_id}", send, plan.send_rows)
+            value.zero_()
             value[: send.shape[0]] = send
             padded.append(value)
         sends = tuple(padded)
@@ -175,8 +216,9 @@ def start_prefix_gather(
         rows = plan.pieces[-1].out_end if plan.pieces else 0
         outputs = tuple(allocate(f"out-{i}", ref, rows) for i, ref in enumerate(refs))
         padded = []
-        for send in sends:
-            value = send.new_zeros((plan.send_rows, *send.shape[1:]))
+        for value_id, send in enumerate(sends):
+            value = allocate(f"send-{value_id}", send, plan.send_rows)
+            value.zero_()
             src = dst = 0
             for local, width in zip(plan.local_lens, plan.padded_lens):
                 value[dst : dst + local] = send[src : src + local]
@@ -253,7 +295,9 @@ class DcpGatherPipeline:
                     raise ValueError(
                         "Streamed o_proj requires identical DCP and attention-TP rank order"
                     )
-                gathered, send, work = start_o_proj_gather(parallel.dcp_group, shard)
+                gathered, send, work = start_o_proj_gather(
+                    parallel.dcp_group, shard, buffer_slot=layer_id % 2
+                )
                 if work is not None:
                     work.wait()
                 self.o_proj_slots[layer_id] = (

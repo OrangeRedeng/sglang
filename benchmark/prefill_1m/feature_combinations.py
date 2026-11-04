@@ -76,6 +76,16 @@ def add_combinations(scenarios):
         SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH="False",
         SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP="False",
     )
+    scenarios["graph-piecewise-dcp16"] = dict(
+        dcp=True,
+        graph="tc_piecewise",
+        decode_graph="disabled",
+        expected=[
+            "graph-piecewise-capture",
+            "graph-piecewise-replay",
+            "graph-piecewise-dcp",
+        ],
+    )
     scenarios["graph-piecewise-probe"] = dict(
         graph="tc_piecewise",
         decode_graph="disabled",

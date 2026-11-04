@@ -2884,19 +2884,38 @@ class KVCacheConfigurator:
             cpu_group=get_parallel().world_group.cpu_group,
         )
 
+        gather_reserve_gb = 0.0
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
         if self.device == "npu" and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get():
             from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
                 runtime_gather_reserve_bytes,
             )
 
-            # Streamed projection double buffers and gathered rows share runtime slack.
+            # Reserve simultaneous prefix gathers before assigning the KV budget.
             tokens = max(
                 get_schedule().chunked_prefill_size or 0,
                 get_schedule().max_prefill_tokens or 0,
             )
-            slack_gb = max(
-                slack_gb, runtime_gather_reserve_bytes(self.model, tokens) / (1 << 30)
+            # Future DCP gathers coexist with the ordinary activation/runtime slack.
+            gather_bytes = runtime_gather_reserve_bytes(
+                self.model,
+                tokens,
+                context_tokens=self.model_config.context_len,
+                prefill_requests=max(
+                    1,
+                    get_schedule().prefill_max_requests
+                    or get_schedule().max_running_requests
+                    or 1,
+                ),
+                capture_tokens=(get_exec().graph.cuda_graph_config.prefill.bs or ())
+                if get_exec().graph.cuda_graph_config.prefill.backend
+                == Backend.TC_PIECEWISE
+                else (),
+            )
+            gather_reserve_gb = gather_bytes / (1 << 30)
+            slack_gb += gather_reserve_gb
+            logger.info(
+                "NPU DCP runtime gather reserve: %.3f GiB", gather_bytes / (1 << 30)
             )
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
@@ -2935,8 +2954,16 @@ class KVCacheConfigurator:
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
             minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
+                1
+                - (available_gpu_memory - gather_reserve_gb)
+                / pre_model_load_memory
             )
+            if gather_reserve_gb and minimum_mem_fraction_static >= 1:
+                raise ValueError(
+                    f"Runtime reserves leave no KV capacity: DCP gathers={gather_reserve_gb:.3f} GiB, "
+                    f"available={available_gpu_memory:.3f} GiB. Reduce the explicit runtime "
+                    "working set or provide more device memory."
+                )
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
             )
@@ -3317,8 +3344,7 @@ def sfa_packed_kv_cache_row_bytes(
     pool-init assert, not as a silent sizing error.
     """
     if not (
-        envs.SGLANG_NPU_SFA_KV_8BIT.get()
-        and is_deepseek_dsa(model_config.hf_config)
+        envs.SGLANG_NPU_SFA_KV_8BIT.get() and is_deepseek_dsa(model_config.hf_config)
     ):
         return None
     return (

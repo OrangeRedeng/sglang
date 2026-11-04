@@ -63,6 +63,7 @@ DCP_VARIANTS = (
     "graph-full",
     "graph-piecewise",
     "graph-piecewise-probe",
+    "graph-piecewise-dcp16",
     "metadata-budget-control",
     "megamoe-no-lookahead",
     "dsa-metadata",

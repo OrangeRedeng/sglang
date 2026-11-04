@@ -19,7 +19,7 @@ def plan():
     names = [
         ("01-control-40s-recipe", "legacy-control-40s", 1024),
         ("02-control-24s-recipe", "baseline", 2048),
-        ("04-prefill-graph-piecewise", "graph-piecewise-probe", 2048),
+        ("04-prefill-graph-piecewise", "graph-piecewise-dcp16", 2048),
         ("05-tp-routed-scale", "tp-routed-scale", 2048),
         ("06-tp-prequant", "tp-prequant", 2048),
         ("07-tp-shared", "tp-shared", 2048),
@@ -49,7 +49,7 @@ def repair_plan():
         ("01-control-hccl1000", "baseline", "historical-bde"),
         ("02-control-hccl256", "baseline", "historical-bde-hccl256"),
         ("03-capacity-control", "baseline", "historical-bde-capacity"),
-        ("04-piecewise-8k-probe", "graph-piecewise-probe", "historical-bde-capacity"),
+        ("04-piecewise-dcp16-1m", "graph-piecewise-dcp16", "historical-bde-capacity"),
         ("05-tp-prequant", "tp-prequant", "historical-bde-capacity"),
         ("06-tp-combined", "moe-fused-combined", "historical-bde-capacity"),
         (
@@ -79,7 +79,6 @@ def repair_plan():
         )
         for n, v, r in rows
     ]
-    cases[3].update(length=8192, context=16384)
     cases[-3].update(benchmark_timeout=1800, repeats=1)
     return cases
 
@@ -319,6 +318,25 @@ def main():
         )
         if copied.returncode:
             raise RuntimeError(f"Cannot snapshot {name}")
+    runtime_paths = (
+        "python/sglang/srt/hardware_backend/npu/dcp_piecewise.py",
+        "python/sglang/srt/hardware_backend/npu/attention/dcp_gather.py",
+        "python/sglang/srt/hardware_backend/npu/modules/dsa_token_residual.py",
+        "python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",
+        "python/sglang/srt/layers/attention/dsa/dsa_cp.py",
+        "python/sglang/srt/mem_cache/kv_cache_configurator.py",
+        "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py",
+        "python/sglang/srt/model_executor/runner_backend/tc_piecewise_cuda_graph_backend.py",
+        "python/sglang/srt/arg_groups/cuda_graph_hook.py",
+        "python/sglang/srt/models/deepseek_v2.py",
+    )
+    for relative in runtime_paths:
+        target = source / "runtime" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if run(
+            ["docker", "cp", f"{args.container}:{args.repo}/{relative}", str(target)]
+        ).returncode:
+            raise RuntimeError(f"Cannot snapshot runtime source {relative}")
     for name, command in (
         ("commit.txt", [*docker, "git", "log", "-1", "--format=%H %s"]),
         ("source-diff.patch", [*docker, "git", "diff", "--binary", "HEAD"]),
@@ -346,8 +364,8 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
     save(
         source / "sha256.json",
         {
-            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in source.iterdir()
+            str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in source.rglob("*")
             if p.is_file()
         },
     )
