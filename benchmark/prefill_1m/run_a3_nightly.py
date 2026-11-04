@@ -3,6 +3,7 @@
 
 import argparse
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -109,7 +110,7 @@ def repair_plan():
         )
         for n, v, r in rows
     ]
-    cases[-3].update(benchmark_timeout=1800, repeats=1)
+    cases[-3].update(benchmark_timeout=1800)
     return cases
 
 
@@ -123,7 +124,38 @@ def run(command, *, timeout=20, **kwargs):
     return subprocess.run(command, timeout=timeout, check=False, **kwargs)
 
 
+def wait_for_exit(pid, seconds=180):
+    for _ in range(seconds):
+        try:
+            if not Path(f"/proc/{pid}/cmdline").read_bytes():
+                return True
+        except FileNotFoundError:
+            return True
+        time.sleep(1)
+    return False
+
+
 def stop_previous():
+    stopped = []
+    # Stop the outer suite first so it cannot relaunch a case after worker cleanup.
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            if len(argv) > 1 and Path(os.fsdecode(argv[1])).name == "run_a3_nightly.py":
+                print(f"Stopping previous nightly suite {entry.name}", flush=True)
+                os.kill(int(entry.name), signal.SIGTERM)
+                stopped.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    for pid in stopped:
+        if not wait_for_exit(pid):
+            raise RuntimeError(f"Previous suite {pid} has not finished cleanup")
+    stop_previous_worker()
+
+
+def stop_previous_worker():
     holders = run(
         ["fuser", "/tmp/sglang-bde-overnight.lock"], capture_output=True, text=True
     )
@@ -136,12 +168,11 @@ def stop_previous():
             if b"run_bde_overnight.py" not in command:
                 raise RuntimeError(f"Refusing to stop unrelated lock owner {pid}")
             os.kill(pid, signal.SIGINT)
-            for _ in range(45):
-                if not Path(f"/proc/{pid}").exists():
-                    break
-                time.sleep(1)
-            else:
+            if not wait_for_exit(pid):
                 os.kill(pid, signal.SIGTERM)
+                raise RuntimeError(
+                    f"Previous worker {pid} did not finish cleanup; retry after it exits"
+                )
         except ProcessLookupError:
             pass
 
@@ -149,7 +180,7 @@ def stop_previous():
 def export_live(args, results, folder, stamp):
     remote_file = results / "remote-path.txt"
     if not remote_file.is_file():
-        return
+        return False
     remote = remote_file.read_text().strip()
     if not remote.startswith("/tmp/sglang-bde-night-"):
         raise RuntimeError("Invalid container artifact directory")
@@ -189,6 +220,8 @@ def export_live(args, results, folder, stamp):
             tail
         )
 
+    return copied.returncode == 0
+
 
 def progress(completed, total, name, elapsed, status="running"):
     cells = int(24 * completed / total)
@@ -209,8 +242,10 @@ def aggregate_measurements(details, expected):
         return {}
     means = [item["metrics"]["TTFT avg"] for item in measured]
     metrics = dict(measured[0]["metrics"])
-    for key in ("TTFT avg", "TTFT P90", "E2E_time", "qps", "prefill_token_throughput"):
-        metrics[key] = statistics.mean(item["metrics"][key] for item in measured)
+    for key in metrics:
+        values = [item["metrics"].get(key) for item in measured]
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            metrics[key] = statistics.mean(values)
     return dict(
         status="diagnostic-unqualified"
         if len(measured) == expected
@@ -293,8 +328,9 @@ def main():
     parser.add_argument(
         "--round", choices=("all", "repair", "kernels"), default="repair"
     )
-    parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--repeats", type=int, choices=(1,), default=1)
     parser.add_argument("--stop-previous", action="store_true")
+    parser.add_argument("--stop-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not 0 < args.hours <= 24 or args.case_minutes < 20:
@@ -316,8 +352,22 @@ def main():
             )
         )
         return 0
-    if args.stop_previous:
+    if args.stop_previous or args.stop_only:
         stop_previous()
+    if args.stop_only:
+        return 0
+    suite_lock = Path("/tmp/sglang-a3-nightly.lock").open("a+")
+    try:
+        fcntl.flock(suite_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError(
+            "Another nightly suite is active; use --stop-previous"
+        ) from exc
+
+    def interrupt_suite(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt_suite)
     holders = run(
         ["fuser", "/tmp/sglang-bde-overnight.lock"], capture_output=True, text=True
     )
@@ -329,6 +379,7 @@ def main():
         "retest-nightly-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     root.mkdir(parents=True)
+    (root / "suite.pid").write_text(str(os.getpid()) + "\n")
     print(f"Host logs: {root}", flush=True)
     docker = ["docker", "exec", "-w", args.repo, args.container]
     source = root / "source"
@@ -360,6 +411,7 @@ def main():
         "python/sglang/srt/hardware_backend/npu/modules/dsa_token_residual.py",
         "python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",
         "python/sglang/srt/layers/attention/dsa/dsa_cp.py",
+        "python/sglang/srt/layers/dcp/layout.py",
         "python/sglang/srt/mem_cache/kv_cache_configurator.py",
         "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py",
         "python/sglang/srt/model_executor/runner_backend/tc_piecewise_cuda_graph_backend.py",
@@ -411,6 +463,8 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
             cases=cases,
             arguments=vars(args) | {"root": str(args.root)},
             numerical_quality="unchecked",
+            server_lifecycle="fresh-server-per-case",
+            measured_invocations_per_server=1,
             target_ttft_is_guaranteed=False,
         ),
     )
@@ -459,7 +513,7 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
             "--memfrac",
             "0.85",
             "--repeats",
-            str(case.get("repeats", args.repeats)),
+            str(args.repeats),
             "--startup-timeout",
             "900",
             "--benchmark-timeout",
@@ -489,12 +543,15 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
                     progress(index, len(cases), case["name"], elapsed)
                     if elapsed >= next_export:
                         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                        exported = False
                         try:
-                            export_live(args, folder / "results", folder, stamp)
+                            exported = export_live(
+                                args, folder / "results", folder, stamp
+                            )
                         except (OSError, subprocess.TimeoutExpired) as exc:
                             with (folder / "export.log").open("a") as error:
                                 error.write(f"{stamp}: {exc}\n")
-                        next_export = elapsed + 600
+                        next_export = elapsed + (600 if exported else 15)
                     if elapsed > cap:
                         record["status"] = "timeout"
                         process.send_signal(signal.SIGINT)
@@ -541,6 +598,8 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
                 record["status"] = "capacity-blocked"
             elif "missing activation" in record["reason"].lower():
                 record["status"] = "incomplete-activation"
+            elif "GMM2 finalizer requires W8A8" in record["reason"]:
+                record["status"] = "dependency-blocked"
             elif "total budget" in record["reason"]:
                 record["status"] = "client-timeout"
             # A successful client measurement remains inspectable even if activation failed.

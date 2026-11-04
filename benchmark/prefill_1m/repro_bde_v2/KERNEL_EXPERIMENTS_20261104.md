@@ -1,6 +1,6 @@
 # A3 INT kernel experiments
 
-Use `run_a3_nightly.py --round kernels --hours 12 --repeats 3`.
+Use `run_a3_nightly.py --round kernels --hours 12 --repeats 1`.
 Fifteen attempts have a 45-minute ceiling each (11h15m total attempt budget),
 within the 12-hour wall budget. Actual duration depends on startup and prefill.
 The runner exports full logs to the host every 600 seconds and on completion,
@@ -24,7 +24,7 @@ Numerical qualification remains skipped: measurements are diagnostic-unqualified
 | MegaMoE, then MegaMoE + INT8 gate | Native MegaMoE and EP16 token-local execution; converted gate case also requires shared-stream and gate markers |
 
 All long cases keep 1,000,000 input tokens, 16 requests/concurrency, 99% shared
-prefix, one output token, chunk 32768 and three matched repetitions. INT8 indexer,
+prefix, one output token, chunk 32768 and one measured invocation per fresh server. INT8 indexer,
 SFA INT8 and DCP gather optimizations are inherited from the BDE control; their
 existing activation checks remain in place. The control is the historical 24s
 workload recipe with the previously introduced capacity/HCCL settings, not a
@@ -88,3 +88,5 @@ shared/routed addition once, typed gather without requantization, native device
 stream APIs, residual preservation and gate NZ preparation before transpose.
 A3 execution, native ABI/layout acceptance, numerical quality, memory and latency
 remain pending; these host checks are not device acceptance evidence.
+
+The fresh-server repair supersedes shared-server repetitions; see `FRESH_SERVER_REPAIR_20261105.md`.

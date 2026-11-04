@@ -234,7 +234,7 @@ def dcp_owned_prefix_positions(
     page), where a fixed stride over the concatenation would drift.
     """
     cycle = dcp_size * interleave
-    run = torch.arange(interleave, dtype=torch.int64)
+    run = torch.arange(interleave, dtype=torch.int64, device="cpu")
     parts = []
     offset = 0
     for prefix_len in prefix_lens:
@@ -243,13 +243,13 @@ def dcp_owned_prefix_positions(
             offset += prefix_len
             continue
         starts = torch.arange(
-            dcp_rank * interleave, prefix_len, cycle, dtype=torch.int64
+            dcp_rank * interleave, prefix_len, cycle, dtype=torch.int64, device="cpu"
         )
         positions = (starts[:, None] + run).reshape(-1)
         parts.append(positions[positions < prefix_len] + offset)
         offset += prefix_len
     if not parts:
-        return torch.empty(0, dtype=torch.int64)
+        return torch.empty(0, dtype=torch.int64, device="cpu")
     return torch.cat(parts)
 
 

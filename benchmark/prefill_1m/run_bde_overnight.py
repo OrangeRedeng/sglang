@@ -439,7 +439,8 @@ def timed_activation(log, variant, scenario=None):
             continue
     required = set(scenario.get("expected", [])) if scenario is not None else set()
     if not variant.startswith("legacy-") and variant not in (
-        "graph-piecewise-probe", "gate-int8-norm-probe"
+        "graph-piecewise-probe",
+        "gate-int8-norm-probe",
     ):
         required.add("dsa-residual-shard")
     if "megamoe" in variant:
@@ -507,6 +508,15 @@ def worker():
                 code = harness.main()
             emit({"status": "done", "returncode": code})
             return code
+        if config["variant"] == "tp-finalize":
+            checks = load_module(
+                repo / "benchmark/prefill_1m/feature_checks.py", "finalize_check"
+            )
+            schemes = checks.expert_quantization(config["checkpoint"])
+            if not schemes or not schemes <= {"W8A8", "W8A8_DYNAMIC"}:
+                raise ValueError(
+                    f"GMM2 finalizer requires W8A8 expert weights; found {sorted(schemes)}"
+                )
         command, env = variant_launch(harness, repo, config)
         save(
             folder / "launch.json",
@@ -589,6 +599,7 @@ def worker():
                     "status": "ready",
                     "pid": process.pid,
                     "capacity": min(map(int, capacities)),
+                    "resolved_server_args": resolved,
                     "max_running_requests": resolved["max_running_requests"],
                     "prefill_max_requests": resolved.get("prefill_max_requests"),
                     "scenario": harness.scenario_for(
@@ -1217,7 +1228,11 @@ def main():
                     )
                     save(
                         folder / "workload.json",
-                        dict(settings, ais_args=variant_ais_args),
+                        dict(
+                            settings,
+                            ais_args=variant_ais_args,
+                            resolved_server_args=ready.get("resolved_server_args"),
+                        ),
                     )
                     for repeat in range(1, args.repeats + 1):
                         # Each AISBench invocation performs its own prefix prewarm after this flush.
