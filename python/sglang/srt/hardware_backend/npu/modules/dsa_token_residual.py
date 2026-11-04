@@ -111,13 +111,25 @@ def full_head_plan(batch, index_topk=None):
     return get_dsa_cp_plan(batch, index_topk)
 
 
-def _read_norm(hidden, batch, norm, plan=None):
+def _read_norm(hidden, batch, norm, plan=None, quant_format=""):
     stream = residual_batch.stream_of(batch)
     output, residual = stream.export(hidden)
     if plan is not None:
         output = dsa_cp_slice(output, plan) if output.shape[0] != plan.rows else output
         if residual is not None and residual.shape[0] != plan.rows:
             residual = dsa_cp_slice(residual, plan)
+    if quant_format == "npu_int8":
+        from sglang.srt.hardware_backend.npu.layernorm_quant import (
+            native_add_rmsnorm_quant,
+        )
+        from sglang.srt.hardware_backend.npu.moe.contracts import INT8
+
+        readout = native_add_rmsnorm_quant(
+            output, residual, norm.weight.data, norm.variance_epsilon, INT8
+        )
+        stream.write(output if residual is None else readout.updated_residual)
+        record("dcp-norm-quant-int8")
+        return readout.operand
     if residual is None:
         residual = output
         normalized = norm(output)
@@ -179,7 +191,14 @@ def prepare_decoder_attention(
         topk = None
     stream = residual_batch.stream_of(batch)
     output = stream.record(output, PLAIN_ADD)
-    normalized = _read_norm(output, batch, layer.post_attention_layernorm)
+    normalized = _read_norm(
+        output,
+        batch,
+        layer.post_attention_layernorm,
+        quant_format=getattr(layer, "ffn_quant_format", "")
+        if layer.is_layer_sparse
+        else "",
+    )
     return normalized, topk
 
 

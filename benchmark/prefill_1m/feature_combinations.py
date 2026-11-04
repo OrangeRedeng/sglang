@@ -5,6 +5,59 @@ import copy
 
 def add_combinations(scenarios):
     scenarios["dcp-baseline"] = {"dcp": True}
+    scenarios["tp-shared-stream"] = copy.deepcopy(scenarios["multistream"])
+    scenarios["tp-shared-stream"]["expected"] = ["tp-shared-stream"]
+    scenarios["tp-shared-stream"]["env"].update(
+        SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT="False",
+        SGLANG_NPU_TP_MOE_SHARED_GMM1="False",
+    )
+    scenarios["tp-shared-stream-combined"] = copy.deepcopy(
+        scenarios["tp-shared-stream"]
+    )
+    scenarios["tp-shared-stream-combined"]["env"].update(
+        SGLANG_NPU_TP_MOE_PREQUANT_INPUT="True",
+        SGLANG_NPU_TP_MOE_SHARED_GMM1="True",
+    )
+    scenarios["tp-shared-stream-combined"]["expected"] += [
+        "tp-prequant",
+        "tp-shared-activation",
+    ]
+    scenarios["gate-int8-norm-probe"] = dict(
+        quant="gate:w8a8_dynamic,shared_expert:w8a8_dynamic",
+        separate_shared=True,
+        expected=[
+            "gate-int8-executed",
+            "add-rmsnorm-quant-int8",
+            "weight-layout-audit",
+        ],
+        launch_overrides=dict(
+            chunk=4096,
+            kv_rows=16384,
+            context_length=16384,
+            mem_fraction=0.80,
+            max_running_requests=1,
+        ),
+    )
+    scenarios["gate-int8-norm"] = dict(
+        quant="gate:w8a8_dynamic,shared_expert:w8a8_dynamic",
+        separate_shared=True,
+        expected=[
+            "gate-int8-executed",
+            "add-rmsnorm-quant-int8",
+            "dcp-norm-quant-int8",
+        ],
+    )
+    scenarios["gate-int8-norm-stream"] = copy.deepcopy(scenarios["gate-int8-norm"])
+    scenarios["gate-int8-norm-stream"]["env"] = copy.deepcopy(
+        scenarios["tp-shared-stream"]["env"]
+    )
+    scenarios["gate-int8-norm-stream"]["expected"].append("tp-shared-stream")
+    scenarios["megamoe-gate-int8"] = copy.deepcopy(scenarios["megamoe"])
+    scenarios["megamoe-gate-int8"].update(quant="gate:w8a8_dynamic")
+    scenarios["megamoe-gate-int8"]["expected"] += [
+        "gate-int8-executed",
+        "megamoe-shared-stream",
+    ]
     historical = copy.deepcopy(scenarios["bde-v2"])
     historical["env"].update(
         DEEPEP_HCCL_BUFFSIZE="2500",
@@ -168,7 +221,7 @@ def scenario_for(scenarios, name, reference_recipe="ordinary"):
         not in ("historical-bde", "historical-bde-hccl256", "historical-bde-capacity")
         or name == "historical-bde"
         or name.startswith("legacy-")
-        or name == "graph-piecewise-probe"
+        or name in ("graph-piecewise-probe", "gate-int8-norm-probe")
     ):
         return variant
     baseline = copy.deepcopy(scenarios["historical-bde"])

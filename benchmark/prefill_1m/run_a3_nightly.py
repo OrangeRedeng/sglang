@@ -44,6 +44,36 @@ def plan():
     return cases
 
 
+def kernels_plan():
+    variants = [
+        "baseline",
+        "tp-shared-stream",
+        "tp-routed-scale",
+        "tp-prequant",
+        "tp-shared",
+        "tp-shared-activation",
+        "tp-finalize",
+        "moe-fused-combined",
+        "gate-int8-norm",
+        "gate-int8-norm-stream",
+        "tp-shared-stream-combined",
+        "graph-piecewise-dcp16",
+        "baseline",
+        "megamoe",
+        "megamoe-gate-int8",
+    ]
+    cases = [
+        dict(
+            name=f"{i:02d}-{v}",
+            variant=v,
+            dispatch=2048,
+            recipe="historical-bde-capacity",
+        )
+        for i, v in enumerate(variants, 1)
+    ]
+    return cases
+
+
 def repair_plan():
     rows = [
         ("01-control-hccl1000", "baseline", "historical-bde"),
@@ -260,14 +290,16 @@ def main():
     )
     parser.add_argument("--hours", type=float, default=12.0)
     parser.add_argument("--case-minutes", type=float, default=45)
-    parser.add_argument("--round", choices=("all", "repair"), default="repair")
+    parser.add_argument(
+        "--round", choices=("all", "repair", "kernels"), default="repair"
+    )
     parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--stop-previous", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not 0 < args.hours <= 24 or args.case_minutes < 20:
         parser.error("hours must be in (0,24]; case-minutes must be at least 20")
-    cases = repair_plan() if args.round == "repair" else plan()
+    cases = {"repair": repair_plan, "all": plan, "kernels": kernels_plan}[args.round]()
     if args.dry_run:
         print(
             json.dumps(
@@ -319,6 +351,10 @@ def main():
         if copied.returncode:
             raise RuntimeError(f"Cannot snapshot {name}")
     runtime_paths = (
+        "python/sglang/srt/hardware_backend/npu/moe/norm_gate.py",
+        "python/sglang/srt/hardware_backend/npu/moe/tp_fusion.py",
+        "python/sglang/srt/hardware_backend/npu/layernorm_quant.py",
+        "python/sglang/srt/hardware_backend/npu/feature_evidence.py",
         "python/sglang/srt/hardware_backend/npu/dcp_piecewise.py",
         "python/sglang/srt/hardware_backend/npu/attention/dcp_gather.py",
         "python/sglang/srt/hardware_backend/npu/modules/dsa_token_residual.py",
@@ -382,7 +418,11 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
     deadline = time.monotonic() + args.hours * 3600
     for index, case in enumerate(cases):
         # Reserve bounded attempts for the three MegaMoE cases at the end.
-        reserve = min(8100, args.case_minutes * 180) if index < len(cases) - 3 else 0
+        reserve = (
+            min(8100, args.case_minutes * 180)
+            if args.round != "kernels" and index < len(cases) - 3
+            else 0
+        )
         remaining = deadline - time.monotonic()
         if remaining < 1200 + reserve:
             records.append(dict(case, status="skipped-budget"))

@@ -310,6 +310,10 @@ def native_add_rmsnorm_quant(
             epsilon=eps,
             output_mask=[True, False],
         )
+        from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+        if residual is not None:
+            record("add-rmsnorm-quant-" + contract.kind, residual=True)
         return NormQuantizedReadout(
             _int_operand(q, scale, x, contract),
             None if residual is None else residual_out,

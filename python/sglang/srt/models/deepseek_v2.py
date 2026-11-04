@@ -1301,6 +1301,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
+                record("tp-shared-stream", start="pre_gate", token_sharded=False)
 
         # router_logits: (num_tokens, n_experts)
         if _is_hip:
@@ -1492,16 +1493,29 @@ class DeepseekV2MoE(nn.Module):
             import torch_npu
 
             group = get_parallel().attn_tp_group
-            x_q, x_scale = torch_npu.npu_dynamic_quant(
-                hidden_states, dst_type=torch.int8
-            )
+            from sglang.srt.hardware_backend.npu.moe.contracts import INT8, QuantizedOperand
+
+            if boundary_operand is not None:
+                boundary_operand.validate(INT8)
+                boundary_operand.record_stream()
+                x_q, x_scale = boundary_operand
+                x_scale = x_scale.flatten()
+            else:
+                x_q, x_scale = torch_npu.npu_dynamic_quant(
+                    hidden_states, dst_type=torch.int8
+                )
             x_q_full = x_q.new_empty((x_q.shape[0] * group.world_size,) + x_q.shape[1:])
             group.all_gather_into_tensor(x_q_full, x_q)
             x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
             group.all_gather_into_tensor(x_scale_full, x_scale)
-            hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
+            source_dtype = hidden_states.dtype
+            hidden_states = x_q_full.to(source_dtype) * x_scale_full.unsqueeze(
                 -1
-            ).to(hidden_states.dtype)
+            ).to(source_dtype)
+            if boundary_operand is not None:
+                boundary_operand = QuantizedOperand(
+                    x_q_full, x_scale_full, INT8, tuple(hidden_states.shape), source_dtype
+                )
         defer_shared = not self.experts.moe_runner_config.inplace and not (
             self._fuse_npu_tp_shared and not get_is_capture_mode()
         )
@@ -1509,6 +1523,7 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        shared_stream = None
         if hidden_states.shape[0] > 0:
             # The boundary operand (fused add+RMSNorm+quant) replaces the
             # quantize-once pass: gate, W13 and shared experts share it.
@@ -1522,7 +1537,32 @@ class DeepseekV2MoE(nn.Module):
                 )
             )
             if (
-                not defer_shared
+                token_sharded
+                and self._npu_tp_shared_overlap
+                and not self._fuse_npu_tp_shared
+                and not skip_shared_experts
+                and not get_is_capture_mode()
+                and not torch.compiler.is_compiling()
+                and hidden_states.shape[0]
+                >= envs.SGLANG_NPU_TP_MOE_EAGER_MULTI_STREAM_MIN_TOKENS.get()
+            ):
+                shared_stream = self.alt_stream
+                current_stream = torch.get_device_module(
+                    hidden_states.device
+                ).current_stream()
+                shared_stream.wait_stream(current_stream)
+                with torch.get_device_module(hidden_states.device).stream(shared_stream):
+                    hidden_states.record_stream(shared_stream)
+                    if pre_quant_input is not None:
+                        pre_quant_input.record_stream()
+                    shared_output = self._forward_shared_experts(
+                        hidden_states,
+                        gemm_output_zero_allocator,
+                        pre_quant_input=pre_quant_input,
+                    )
+            if (
+                shared_stream is None
+                and not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
@@ -1637,8 +1677,15 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
+        if shared_stream is not None:
+            current_stream.wait_stream(shared_stream)
+            shared_output.record_stream(current_stream)
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("tp-shared-stream", start="pre_gate", token_sharded=True)
         if (
-            defer_shared
+            shared_stream is None
+            and defer_shared
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
@@ -1767,6 +1814,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        device_module = torch.get_device_module(hidden_states.device)
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -1781,8 +1829,9 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
+                    self.alt_stream.wait_stream(device_module.current_stream())
+                    with device_module.stream(self.alt_stream):
+                        hidden_states.record_stream(self.alt_stream)
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
@@ -1792,7 +1841,7 @@ class DeepseekV2MoE(nn.Module):
                         # the shared experts overlap nothing. The alt stream
                         # is kept for record_stream: without that marking the
                         # allocator recycles shared_output across the break.
-                        torch.cuda.current_stream().wait_event(shared_event)
+                        device_module.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1967,7 +2016,12 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
-            torch.cuda.current_stream().wait_event(shared_event)
+            device_module.current_stream().wait_event(shared_event)
+            shared_output.record_stream(device_module.current_stream())
+            if _is_npu and getattr(self.experts, "_use_ascend_fuseep", False):
+                from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+                record("megamoe-shared-stream")
 
         return _scale_routed_and_add_shared(
             final_hidden_states,
@@ -3327,7 +3381,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = (
-            torch.cuda.Stream()
+            (torch.npu.Stream() if _is_npu else torch.cuda.Stream())
             if (
                 _is_cuda
                 or _is_musa

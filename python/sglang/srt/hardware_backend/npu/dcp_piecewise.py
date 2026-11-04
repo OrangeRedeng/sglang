@@ -33,6 +33,16 @@ def eager_attention_scope():
 def stage_tensor(owner, role, value):
     if value is None:
         return None
+    from sglang.srt.hardware_backend.npu.moe.contracts import QuantizedOperand
+
+    if isinstance(value, QuantizedOperand):
+        return QuantizedOperand(
+            stage_tensor(owner, role + "_data", value.data),
+            stage_tensor(owner, role + "_scale", value.scale),
+            value.contract,
+            value.source_shape,
+            value.source_dtype,
+        )
     buffers = getattr(owner, "_npu_dcp_piecewise_buffers", None)
     if buffers is None:
         buffers = {}

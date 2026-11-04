@@ -94,6 +94,7 @@ class QuantizedMoEGateMethod(QuantizeMethodBase):
 
     @torch.no_grad()
     def process_weights_after_loading(self, layer):
+        layer._npu_gate_prepared = False
         arguments = ("pertoken_scale", "output_dtype")
         if self.contract == MXFP8:
             arguments += ("scale_dtype", "pertoken_scale_dtype", "group_sizes")
@@ -130,7 +131,9 @@ class QuantizedMoEGateMethod(QuantizeMethodBase):
             q, scale = torch.ops.npu.npu_dynamic_quant(weight.to(torch.bfloat16))
             if q.dtype != torch.int8 or q.shape != weight.shape:
                 raise RuntimeError("Unsupported online gate INT8 quantization output")
-            gate_weight = q.transpose(0, 1)
+            from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+            gate_weight = npu_format_cast(q).transpose(0, 1)
             gate_scale = scale.flatten().contiguous()
         layer.register_buffer("gate_quant_weight", gate_weight, persistent=False)
         layer.register_buffer("gate_quant_scale", gate_scale, persistent=False)
@@ -146,6 +149,7 @@ class QuantizedMoEGateMethod(QuantizeMethodBase):
             raise RuntimeError(
                 f"Online {self.scheme} projection probe returned non-finite output"
             )
+        layer._npu_gate_prepared = True
         logger.info(
             "Online %s router gate: %s weights converted after loading "
             "(this changes routing numerics)",
@@ -203,6 +207,10 @@ class QuantizedMoEGateMethod(QuantizeMethodBase):
                 f"Quantized gate matmul returned {logits.dtype}, "
                 f"expected {self.output_dtype}"
             )
+        if self.contract == INT8 and getattr(layer, "_npu_gate_prepared", False):
+            from sglang.srt.hardware_backend.npu.feature_evidence import record
+
+            record("gate-int8-executed", output_dtype=str(logits.dtype))
         # Downstream routing (correction bias, grouped top-k, renormalize)
         # consumes FP32 logits; the cast here is explicit, and for INT8 it is
         # NOT FP32 accumulation.

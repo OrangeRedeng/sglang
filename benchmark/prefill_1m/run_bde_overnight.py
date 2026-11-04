@@ -78,6 +78,12 @@ MOE_VARIANTS = (
     "tp-routed-scale",
     "tp-finalize",
     "tp-prequant",
+    "tp-shared-stream",
+    "tp-shared-stream-combined",
+    "gate-int8-norm-probe",
+    "gate-int8-norm",
+    "gate-int8-norm-stream",
+    "megamoe-gate-int8",
     "tp-shared",
     "tp-shared-activation",
     "multistream",
@@ -355,6 +361,8 @@ def variant_launch(harness, repo, config):
             for n in (16, 128, 1024, 4096, 16384, 32768)
             if n <= min(config["chunk"], config["context"])
         ]
+    if scenario.get("quant"):
+        command += ["--online-quantization", scenario["quant"]]
     if scenario.get("separate_shared"):
         command.append("--disable-shared-experts-fusion")
     if scenario.get("fuseep"):
@@ -430,7 +438,9 @@ def timed_activation(log, variant, scenario=None):
         except (ValueError, KeyError, TypeError):
             continue
     required = set(scenario.get("expected", [])) if scenario is not None else set()
-    if not variant.startswith("legacy-") and variant != "graph-piecewise-probe":
+    if not variant.startswith("legacy-") and variant not in (
+        "graph-piecewise-probe", "gate-int8-norm-probe"
+    ):
         required.add("dsa-residual-shard")
     if "megamoe" in variant:
         required.add("megamoe")
