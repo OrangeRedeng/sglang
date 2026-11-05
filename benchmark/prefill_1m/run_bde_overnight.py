@@ -244,6 +244,35 @@ def ais_metrics(text, requests):
     return metrics
 
 
+def batch_metrics(log):
+    prefill, cached, decode = [], [], []
+    for line in log.splitlines():
+        if "Prefill batch," in line:
+            match = re.search(r"#new-seq: (\d+)", line)
+            if match:
+                prefill.append(int(match[1]))
+                hit = re.search(r"#cached-token: (\d+)", line)
+                if hit and int(hit[1]) > 0:
+                    cached.append(int(match[1]))
+        elif "Decode batch," in line:
+            match = re.search(r"#running-req: (\d+)", line)
+            if match:
+                decode.append(int(match[1]))
+
+    def mean(values):
+        return statistics.mean(values) if values else None
+
+    return dict(
+        scope="AISBench invocation including cold-prefix preparation; sampled scheduler logs",
+        mean_prefill_batch=mean(prefill),
+        mean_cached_prefill_batch=mean(cached),
+        mean_decode_batch=mean(decode),
+        prefill_samples=len(prefill),
+        cached_prefill_samples=len(cached),
+        decode_samples=len(decode),
+    )
+
+
 def wait_benchmark(process, worker_process, limit):
     deadline = time.monotonic() + limit
     while True:
@@ -279,9 +308,19 @@ def server_failure(log):
         (r"out of memory|NPU out of memory", "server out of memory"),
         (r"Scheduler watchdog timeout", "scheduler watchdog timeout"),
         (r"TypeError: _weak_ref_tensor", "piecewise graph output type error"),
+        (
+            r"capture model contains a stream that was not joined|GetCaptureEventFromTask",
+            "piecewise graph has an unjoined communication stream",
+        ),
+        (
+            r"capture failed:.*HcclAllGather",
+            "piecewise graph HcclAllGather capture failed",
+        ),
     ):
         match = re.search(pattern, log, re.IGNORECASE)
         if match:
+            if "unjoined" in reason and "HcclAllGather" in log:
+                reason += "; HcclAllGather capture failed"
             return reason
     return None
 
@@ -603,7 +642,8 @@ def worker():
             required = required_kv_capacity(config, resolved)
             if not capacities or min(map(int, capacities)) < required:
                 raise RuntimeError(
-                    f"KV capacity cannot cover shared-prefix working set {required}"
+                    f"KV capacity {min(map(int, capacities)) if capacities else 'unknown'} "
+                    f"cannot cover shared-prefix working set {required}"
                 )
             emit(
                 {
@@ -1255,6 +1295,13 @@ def main():
                             expect_json=False,
                         )
                         (folder / f"cache-flush-{repeat}.txt").write_text(flushed)
+                        server_offset = 0
+                        if args.performance_only:
+                            server_before = subprocess.check_output(
+                                [*docker, "wc", "-c", f"{remote}/{variant}/server.log"],
+                                text=True,
+                            )
+                            server_offset = int(server_before.split()[0])
                         phase = f"aisbench/{repeat}"
                         logpath = folder / f"aisbench-{repeat}.log"
                         command = [
@@ -1303,6 +1350,13 @@ def main():
                                 [*docker, "cat", f"{remote}/{variant}/server.log"],
                                 text=True,
                             )
+                            invocation_log = log.encode()[server_offset:].decode(
+                                errors="replace"
+                            )
+                            batches = batch_metrics(invocation_log)
+                            save(folder / f"batch-metrics-{repeat}.json", batches)
+                            metrics.update(batches)
+                            save(folder / f"metrics-{repeat}.json", metrics)
                             features = timed_activation(
                                 log, variant, ready.get("scenario")
                             )
@@ -1316,6 +1370,7 @@ def main():
                                 if diagnostic
                                 else None,
                                 "metrics": metrics,
+                                "cold_prefix_metrics": cold,
                             }
                         )
                         persist()

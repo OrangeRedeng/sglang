@@ -132,6 +132,7 @@ def get_o_proj_stream_shard(layer_id: int) -> Optional[torch.Tensor]:
     return _o_proj_stream_shards.get(layer_id)
 
 
+@torch.compiler.disable
 def dsa_cp_reduce_scatter_tokens(x: torch.Tensor) -> torch.Tensor:
     """``[rows * tp, ...]`` -> ``[rows, ...]`` over the attention-TP group.
 

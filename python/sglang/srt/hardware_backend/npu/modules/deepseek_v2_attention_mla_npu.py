@@ -611,6 +611,13 @@ def forward_dsa_prepare_npu(
 _dcp_pipeline = None
 
 
+def _dcp_prefix_output_capacity():
+    context = runtime_context.get_model().context_length or 0
+    requests = max(1, runtime_context.get_schedule().prefill_max_requests or 1)
+    page = forward_context.get_attn_backend().page_size
+    return (context + page * runtime_context.get_parallel().dcp_size) * requests
+
+
 def _prepare_dcp_prefix(m, batch, hidden_states):
     global _dcp_pipeline
     from sglang.srt.hardware_backend.npu.attention.dcp_gather import (
@@ -660,7 +667,10 @@ def _prepare_dcp_prefix(m, batch, hidden_states):
     if active_requests == 2:
         from sglang.srt.hardware_backend.npu.feature_evidence import record
 
-        record("dcp-prefill-batch-2", layout="request-contiguous" if packed is None else "packed")
+        record(
+            "dcp-prefill-batch-2",
+            layout="request-contiguous" if packed is None else "packed",
+        )
     prefetch = envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
     if prefetch:
         if _dcp_pipeline is None:
@@ -734,7 +744,8 @@ def _take_dcp_prefix(m, batch, k_nope, k_pe):
                 plan,
                 parallel.dcp_size,
                 True,
-                buffer_slot=m.layer_id % 2,
+                buffer_slot=0,
+                output_capacity=_dcp_prefix_output_capacity(),
             ).finish((k_nope, k_pe))
         else:
             return _dcp_gather_extend_kv_npu(m, batch, k_nope, k_pe)
@@ -798,8 +809,12 @@ def _dcp_gather_extend_kv_npu(
         forward_batch.npu_dcp_extend_gather = plan
 
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
-    out_nope = dcp_layout.dcp_extend_gather_buffer("latent", k_nope, total_rows)
-    out_rope = dcp_layout.dcp_extend_gather_buffer("rope", k_pe, total_rows)
+    out_nope = dcp_layout.dcp_extend_gather_buffer(
+        "latent", k_nope, total_rows, capacity_rows=_dcp_prefix_output_capacity()
+    )
+    out_rope = dcp_layout.dcp_extend_gather_buffer(
+        "rope", k_pe, total_rows, capacity_rows=_dcp_prefix_output_capacity()
+    )
     scratches = [
         (
             dcp_layout.dcp_extend_gather_buffer(

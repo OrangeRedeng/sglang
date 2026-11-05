@@ -78,6 +78,11 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
                 ]
                 entry.input_addresses = input_addresses
+            from sglang.srt.runtime_context import get_parallel
+
+            if get_parallel().dcp_enabled:
+                # Eager HCCL/prefetch events must finish before a new capture starts.
+                torch.npu.synchronize()
             npugraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:

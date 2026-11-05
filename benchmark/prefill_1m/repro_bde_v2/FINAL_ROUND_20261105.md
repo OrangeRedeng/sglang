@@ -1,5 +1,7 @@
 # Focused A3 final round
 
+Superseded for the next launch by [RETEST_REPAIR_20261105.md](RETEST_REPAIR_20261105.md).
+
 Source evidence: `retest-nightly-20261105-004431`, commit d295528925.
 A3 x16, GLM5.2 ModelSlim W4A8, CANN9.1.0, torch2.10.0+cpu,
 torch_npu2.10.0.post6, sgl-kernel-npu2026.9.0, DeepEP00db6cd6,

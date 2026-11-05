@@ -2901,6 +2901,7 @@ class KVCacheConfigurator:
                 self.model,
                 tokens,
                 context_tokens=self.model_config.context_len,
+                page_size=getattr(get_schedule(), "page_size", 128),
                 prefill_requests=max(
                     1,
                     get_schedule().prefill_max_requests

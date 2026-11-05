@@ -16,6 +16,45 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_forward, get_parallel
 
 
+@torch.compiler.disable
+def gather_moe_input(hidden_states, boundary_operand=None, *, owner=None):
+    # HCCL's internal streams must stay outside each captured compute piece.
+    import torch_npu
+
+    group = get_parallel().attn_tp_group
+    from sglang.srt.hardware_backend.npu.moe.contracts import INT8, QuantizedOperand
+
+    if boundary_operand is not None:
+        boundary_operand.validate(INT8)
+        boundary_operand.record_stream()
+        x_q, x_scale = boundary_operand
+        x_scale = x_scale.flatten()
+    else:
+        x_q, x_scale = torch_npu.npu_dynamic_quant(hidden_states, dst_type=torch.int8)
+    x_q_full = x_q.new_empty((x_q.shape[0] * group.world_size,) + x_q.shape[1:])
+    group.all_gather_into_tensor(x_q_full, x_q)
+    x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
+    group.all_gather_into_tensor(x_scale_full, x_scale)
+    source_dtype = hidden_states.dtype
+    hidden_states = x_q_full.to(source_dtype) * x_scale_full.unsqueeze(-1).to(
+        source_dtype
+    )
+    if boundary_operand is not None:
+        boundary_operand = QuantizedOperand(
+            x_q_full, x_scale_full, INT8, tuple(hidden_states.shape), source_dtype
+        )
+    from sglang.srt.hardware_backend.npu import dcp_piecewise
+
+    if owner is not None and dcp_piecewise.active():
+        # Replayed compute consumes fixed addresses across eager collectives.
+        hidden_states = dcp_piecewise.stage_tensor(owner, "moe_input", hidden_states)
+        boundary_operand = dcp_piecewise.stage_tensor(
+            owner, "moe_operand", boundary_operand
+        )
+        record("graph-piecewise-moe-boundary")
+    return hidden_states, boundary_operand
+
+
 def supports_token_sharded_ep(parallel, backend, fuseep_mode):
     return (
         backend.is_ascend_fuseep()
@@ -270,7 +309,13 @@ def gather_logit_rows(hidden, batch):
 
 
 def runtime_gather_reserve_bytes(
-    model, tokens, *, context_tokens=0, prefill_requests=1, capture_tokens=()
+    model,
+    tokens,
+    *,
+    context_tokens=0,
+    prefill_requests=1,
+    capture_tokens=(),
+    page_size=128,
 ):
     row_bytes = 0
     prefix_row_bytes = 0
@@ -279,8 +324,8 @@ def runtime_gather_reserve_bytes(
         # Prepared projection rings are already resident in the free-memory sample.
         if getattr(layer, "w_vc_qrep", None) is not None:
             hidden = layer.o_proj.output_size
-            # Two ring slots: global dense inputs plus local FFN/residual/output.
-            staging_rows = (2 + 6 / get_parallel().attn_tp_size) * sum(capture_tokens)
+            # Dense/MoE/operand rings plus local FFN/residual/output.
+            staging_rows = (5 + 6 / get_parallel().attn_tp_size) * sum(capture_tokens)
             row_bytes = max(
                 row_bytes,
                 int(
@@ -298,6 +343,9 @@ def runtime_gather_reserve_bytes(
                 (layer.kv_lora_rank + layer.qk_rope_head_dim)
                 * layer.w_vc_qrep.element_size(),
             )
+    # Packed prefixes can pad one virtual page beyond a request's context.
+    if context_tokens:
+        context_tokens += page_size * get_parallel().attn_tp_size
     slots = 2 if envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get() else 1
     # The generic layout holds both contiguous output and rank-major scratch.
     copies = (
@@ -307,7 +355,7 @@ def runtime_gather_reserve_bytes(
     )
     prefix_bytes = context_tokens * prefill_requests * prefix_row_bytes * slots * copies
     local_sends = (
-        2 * context_tokens * prefill_requests * prefix_row_bytes * slots
+        (2 + slots) * context_tokens * prefill_requests * prefix_row_bytes
         + get_parallel().attn_tp_size
         - 1
     ) // get_parallel().attn_tp_size
@@ -316,7 +364,31 @@ def runtime_gather_reserve_bytes(
         rank = get_parallel().attn_tp_size
         local_rows = (context_tokens + tokens + rank - 1) // rank + 128
         decode_scratch = local_rows * prefill_requests * 2 * decode_row_bytes
-    return row_bytes + prefix_bytes + local_sends + decode_scratch
+    # Serial fallback retains a packed output and a contiguous output, but only
+    # one bounded generic scratch. Native EP kernels also need non-Torch memory.
+    serial_scratch = 0
+    if not (
+        envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.get()
+        or envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.get()
+    ):
+        # Packed and generic outputs use separate names and may coexist.
+        prefix_bytes = 2 * context_tokens * prefill_requests * prefix_row_bytes
+        piece_rows = envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.get()
+        piece_rows = (
+            min(context_tokens * prefill_requests, piece_rows)
+            if piece_rows > 0
+            else context_tokens * prefill_requests
+        )
+        serial_scratch = (piece_rows + tokens) * prefix_row_bytes
+    native_headroom = (1 << 30) if getattr(get_parallel(), "moe_ep_size", 1) > 1 else 0
+    return (
+        row_bytes
+        + prefix_bytes
+        + local_sends
+        + decode_scratch
+        + serial_scratch
+        + native_headroom
+    )
 
 
 def prepare_quantized_q_projection(m, group):

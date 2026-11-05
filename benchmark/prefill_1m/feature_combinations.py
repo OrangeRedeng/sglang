@@ -141,6 +141,7 @@ def add_combinations(scenarios):
             "graph-piecewise-capture",
             "graph-piecewise-replay",
             "graph-piecewise-dcp",
+            "graph-piecewise-moe-boundary",
         ],
     )
     scenarios["graph-piecewise-probe"] = dict(
@@ -220,7 +221,13 @@ def add_combinations(scenarios):
             prefill_max_requests=2,
             max_prefill_tokens=32768,
             kv_rows=63616,
+            mem_fraction=0.85,
         ),
+    )
+    # Two live prefixes use serial, bounded scratch instead of full prefetch rings.
+    scenarios["best-int8-batch2"]["env"].update(
+        SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH="False",
+        SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP="False",
     )
     scenarios["best-int8-batch2"]["expected"].append("dcp-prefill-batch-2")
     scenarios["best-int8-packed-batch2"] = copy.deepcopy(scenarios["best-int8-batch2"])
@@ -234,6 +241,7 @@ def add_combinations(scenarios):
             prefill_max_requests=2,
             max_prefill_tokens=32768,
             kv_rows=63616,
+            mem_fraction=0.85,
         ),
     )
     scenarios["best-int8-packed-batch2"]["expected"].append("dcp-packed-read-batch2")

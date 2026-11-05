@@ -315,7 +315,9 @@ def dcp_extend_gathers_kv(
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 
 
-def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
+def dcp_extend_gather_buffer(
+    name: str, ref: torch.Tensor, rows: int, *, capacity_rows: int = 0
+) -> torch.Tensor:
     """A reusable ``rows``-row buffer shaped and typed like ``ref``. Grow-only.
 
     Allocated per layer, the peak moved with whatever the allocator held when a
@@ -328,7 +330,11 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
-        buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        # Growth leaves large cached blocks unavailable to native HCCL/CANN.
+        capacity = max(rows, capacity_rows)
+        buf = torch.empty(
+            (capacity, *ref.shape[1:]), dtype=ref.dtype, device=ref.device
+        )
         _dcp_extend_gather_buffers[key] = buf
         if envs.SGLANG_NPU_DEBUG_DCP.get():
             logger.info(

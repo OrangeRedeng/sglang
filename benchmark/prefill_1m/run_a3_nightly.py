@@ -81,7 +81,8 @@ def final_plan():
         "graph-piecewise-dcp16",
         "megamoe-no-lookahead",
         "megamoe-no-lookahead",
-        "tp-shared-stream-bounded",
+        "gate-int8-norm",
+        "moe-fused-combined",
         "best-int8-fused",
         "best-int8-metadata",
         "best-int8-batch2",
@@ -644,7 +645,10 @@ print(json.dumps(dict(python=sys.version, executable=sys.executable, versions=ve
         if failure:
             record["status"] = "failed-or-blocked"
             record["reason"] = failure.get("error", "")[:400]
-            if "out of memory" in record["reason"].lower():
+            if (
+                "out of memory" in record["reason"].lower()
+                or "KV capacity" in record["reason"]
+            ):
                 record["status"] = "capacity-blocked"
             elif "missing activation" in record["reason"].lower():
                 record["status"] = "incomplete-activation"

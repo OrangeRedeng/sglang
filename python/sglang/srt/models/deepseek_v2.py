@@ -1490,33 +1490,16 @@ class DeepseekV2MoE(nn.Module):
         # reduce-scatter onto this rank's slice.
         token_sharded = getattr(get_forward(), "npu_dsa_cp_token_sharded", False)
         if token_sharded:
-            import torch_npu
+            from sglang.srt.hardware_backend.npu.modules.dsa_token_residual import (
+                gather_moe_input,
+            )
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                shared_stream_rows_eligible,
+            )
 
-            group = get_parallel().attn_tp_group
-            from sglang.srt.hardware_backend.npu.moe.contracts import INT8, QuantizedOperand
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_stream_rows_eligible
-
-            if boundary_operand is not None:
-                boundary_operand.validate(INT8)
-                boundary_operand.record_stream()
-                x_q, x_scale = boundary_operand
-                x_scale = x_scale.flatten()
-            else:
-                x_q, x_scale = torch_npu.npu_dynamic_quant(
-                    hidden_states, dst_type=torch.int8
-                )
-            x_q_full = x_q.new_empty((x_q.shape[0] * group.world_size,) + x_q.shape[1:])
-            group.all_gather_into_tensor(x_q_full, x_q)
-            x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
-            group.all_gather_into_tensor(x_scale_full, x_scale)
-            source_dtype = hidden_states.dtype
-            hidden_states = x_q_full.to(source_dtype) * x_scale_full.unsqueeze(
-                -1
-            ).to(source_dtype)
-            if boundary_operand is not None:
-                boundary_operand = QuantizedOperand(
-                    x_q_full, x_scale_full, INT8, tuple(hidden_states.shape), source_dtype
-                )
+            hidden_states, boundary_operand = gather_moe_input(
+                hidden_states, boundary_operand, owner=self
+            )
         defer_shared = not self.experts.moe_runner_config.inplace and not (
             self._fuse_npu_tp_shared and not get_is_capture_mode()
         )

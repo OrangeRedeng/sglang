@@ -148,7 +148,7 @@ def prepare_batch(runner, batch):
         model._npu_dcp_piecewise_buffers = buffers
         # Adjacent layers alternate storage; eager boundaries consume the prior slot first.
         for index, layer in enumerate(getattr(model, "layers", ())):
-            for owner in (layer, layer.self_attn):
+            for owner in (layer, layer.self_attn, layer.mlp):
                 owner._npu_dcp_piecewise_buffers = buffers
                 owner._npu_dcp_piecewise_slot = index % 2
     from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (

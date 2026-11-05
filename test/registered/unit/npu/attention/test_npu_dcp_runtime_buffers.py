@@ -164,3 +164,41 @@ def test_kv_profile_adds_gather_reserve_to_runtime_headroom():
                 ValueError, match="Runtime reserves leave no KV capacity"
             ):
                 cfg._profile_available_bytes(60)
+
+
+def test_serial_batch2_reserves_retained_outputs_and_bounded_scratch():
+    layer = SimpleNamespace(
+        w_vc_qrep=torch.empty(1, 1, 1, dtype=torch.bfloat16),
+        o_proj=SimpleNamespace(output_size=6144),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    model = SimpleNamespace(modules=lambda: [layer])
+    with (
+        patch.object(
+            residual,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=16, moe_ep_size=1),
+        ),
+        residual.envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.override(False),
+        residual.envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.override(False),
+    ):
+        serial = residual.runtime_gather_reserve_bytes(
+            model, 32768, context_tokens=1048576, prefill_requests=2
+        )
+        # Both output layouts can remain resident across single/ragged forwards.
+        assert serial > 2 * 2 * 1048576 * 576 * 2
+        with residual.envs.SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH.override(True):
+            prefetch = residual.runtime_gather_reserve_bytes(
+                model, 32768, context_tokens=1048576, prefill_requests=2
+            )
+        assert serial < prefetch
+        with patch.object(
+            residual,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=16, moe_ep_size=16),
+        ):
+            ep = residual.runtime_gather_reserve_bytes(
+                model, 32768, context_tokens=1048576, prefill_requests=2
+            )
+        assert ep >= serial + (1 << 30)

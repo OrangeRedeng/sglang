@@ -158,7 +158,15 @@ class PendingGather:
 
 
 def start_prefix_gather(
-    group, sends, refs, plan, dcp_size, packed=False, *, buffer_slot=None
+    group,
+    sends,
+    refs,
+    plan,
+    dcp_size,
+    packed=False,
+    *,
+    buffer_slot=None,
+    output_capacity=0,
 ):
     """Retain sends and disjoint per-piece scratch until all work completes."""
 
@@ -167,7 +175,12 @@ def start_prefix_gather(
             return ref.new_empty((rows, *ref.shape[1:]))
         from sglang.srt.layers.dcp.layout import dcp_extend_gather_buffer
 
-        return dcp_extend_gather_buffer(f"pipeline-{buffer_slot}-{name}", ref, rows)
+        return dcp_extend_gather_buffer(
+            f"pipeline-{buffer_slot}-{name}",
+            ref,
+            rows,
+            capacity_rows=output_capacity if name.startswith("out-") else 0,
+        )
 
     works, scratches = [], []
     if packed and hasattr(plan, "requests"):
