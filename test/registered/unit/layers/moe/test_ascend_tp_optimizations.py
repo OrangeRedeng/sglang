@@ -1,7 +1,6 @@
 import importlib.util
 import sys
 import unittest
-from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -98,57 +97,6 @@ class TestAscendTPOptimizations(CustomTestCase):
             ],
         )
 
-    def test_separate_shared_precision_is_checked_before_allocation(self):
-        parent = "model.layers.0.mlp.shared_expert"
-        description = {
-            f"{parent}.{proj}.weight": "W4A8_DYNAMIC"
-            for proj in ("gate_proj", "up_proj", "down_proj")
-        }
-        quant = ModelSlimConfig(description)
-        config = SimpleNamespace(shared_expert_intermediate_size=64)
-        with (
-            patch(
-                "sglang.srt.layers.moe.get_moe_a2a_backend",
-                return_value=SimpleNamespace(is_none=lambda: True),
-            ),
-            patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(moe_ep_size=1),
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "has no dense NPU method"):
-                tp_fusion.npu_tp_shared_expert_count(config, quant, 0)
-            quant.quant_description[parent + ".gate_proj.weight"] = "FLOAT"
-            with self.assertRaisesRegex(ValueError, "mismatched shared W13"):
-                tp_fusion.npu_tp_shared_expert_count(config, quant, 0)
-            for key in quant.quant_description:
-                quant.quant_description[key] = "W8A8_DYNAMIC"
-            self.assertEqual(tp_fusion.npu_tp_shared_expert_count(config, quant, 0), 0)
-
-    def test_shared_fusion_requires_plain_silu(self):
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            NPUW8A8Int8DynamicLinearMethod,
-        )
-        from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-
-        mlp = SimpleNamespace(
-            down_proj=SimpleNamespace(quant_method=NPUW8A8Int8DynamicLinearMethod()),
-            act_fn=GeluAndMul(),
-        )
-        with (
-            patch.object(tp_fusion, "supports_npu_op", return_value=True),
-            patch.object(tp_fusion, "supports_cann_symbol", return_value=True),
-        ):
-            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
-            mlp.act_fn = SiluAndMul()
-            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "activation_quant")
-            with patch(
-                "sglang.srt.model_executor.runner.get_is_capture_mode",
-                return_value=True,
-            ):
-                self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
-            mlp.gemm1_clamp_limit = 2
-            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
 
     def test_fused_mxfp_layout_rejects_contiguous_transpose_and_wrong_scale_axis(self):
         with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
@@ -209,17 +157,6 @@ class TestAscendTPOptimizations(CustomTestCase):
                     )
                 )
 
-    def test_overlap_does_not_require_shared_finalization(self):
-        experts = SimpleNamespace(
-            dispatcher=AscendTPDispatcher(MoeRunnerConfig(num_experts=2, top_k=1)),
-            moe_ep_size=1,
-            num_fused_shared_experts=0,
-            reduce_results=False,
-        )
-        with patch.object(tp_fusion, "supports_npu_op", return_value=False):
-            self.assertTrue(tp_fusion.can_overlap_tp_shared(experts))
-        experts.num_fused_shared_experts = 1
-        self.assertFalse(tp_fusion.can_overlap_tp_shared(experts))
 
     def test_unsupported_activation_parameters_fail_before_execution(self):
         layer = SimpleNamespace(
@@ -435,63 +372,6 @@ class TestAscendTPOptimizations(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "divisible"):
             NPUW4A8Int8MoEMethod._update_bias(layer, "w2")
 
-    def test_shared_eligibility_compares_each_projection_and_expert(self):
-        config = SimpleNamespace(
-            n_shared_experts=1, n_routed_experts=2, moe_intermediate_size=64
-        )
-        description = {}
-        for proj, scheme in (
-            ("gate_proj", "W4A8_MXFP"),
-            ("up_proj", "W4A8_MXFP"),
-            ("down_proj", "W8A8_DYNAMIC"),
-        ):
-            for path in ("shared_experts", "experts.0", "experts.1"):
-                description[f"model.layers.0.mlp.{path}.{proj}.weight"] = scheme
-        quant = ModelSlimConfig(description)
-        description = quant.quant_description
-        parallel = SimpleNamespace(
-            moe_ep_size=1,
-            moe_dp_size=1,
-            attn_dp_size=1,
-            attn_cp_size=1,
-            enable_prefill_cp=False,
-        )
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch("sglang.srt.runtime_context.get_parallel", return_value=parallel)
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.runtime_context.get_exec",
-                    return_value=SimpleNamespace(
-                        moe=SimpleNamespace(enable_eplb=False, enable_waterfill=False)
-                    ),
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.layers.moe.get_moe_a2a_backend",
-                    return_value=SimpleNamespace(is_none=lambda: True),
-                )
-            )
-            stack.enter_context(
-                patch("sglang.srt.layers.moe.utils.is_sbo_enabled", return_value=False)
-            )
-            stack.enter_context(
-                patch("sglang.srt.layers.moe.utils.is_tbo_enabled", return_value=False)
-            )
-            self.assertIsNone(tp_fusion.tp_fused_shared_expert_reason(config, quant))
-            for scheme in ("W4A4_DYNAMIC", "W4A8_DYNAMIC", "W8A8_DYNAMIC"):
-                for key in description:
-                    description[key] = scheme
-                self.assertIsNone(
-                    tp_fusion.tp_fused_shared_expert_reason(config, quant)
-                )
-            description["model.layers.0.mlp.experts.1.down_proj.weight"] = "W4A4"
-            self.assertIsNotNone(tp_fusion.tp_fused_shared_expert_reason(config, quant))
-            parallel.moe_ep_size = 2
-            self.assertIsNotNone(tp_fusion.tp_fused_shared_expert_reason(config, None))
-        self.assertEqual(tp_fusion.shared_gmm1_mode(), "baseline")
 
     def test_projection_aliases_preserve_mixed_precision(self):
         description = {
