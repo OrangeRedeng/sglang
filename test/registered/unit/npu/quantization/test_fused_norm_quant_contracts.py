@@ -181,16 +181,6 @@ class TestFusedNormABI(unittest.TestCase):
         torch.testing.assert_close(fused.call_args.args[2], norm.gemma_weight)
         torch.testing.assert_close(fused.call_args.args[1], residual + post)
 
-    def test_packed_routing_storage_is_integer_not_fp4(self):
-        from sglang.srt.hardware_backend.npu.moe.contracts import INT4
-        from sglang.srt.hardware_backend.npu.moe.init_routing import _packed_payload
-
-        bytes_ = torch.arange(64, dtype=torch.uint8).reshape(2, 32)
-        packed, scale = _packed_payload(bytes_, torch.ones(2), (2, 64), INT4)
-        self.assertEqual(packed.dtype, torch.int32)
-        self.assertEqual(packed.shape, (2, 8))
-        self.assertTrue(torch.equal(packed.view(torch.uint8), bytes_))
-
 
 class TestOfflineRouterLoading(unittest.TestCase):
     def test_custom_gate_uses_checkpoint_scheme_and_preserves_bias(self):

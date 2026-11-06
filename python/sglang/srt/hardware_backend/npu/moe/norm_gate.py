@@ -67,7 +67,7 @@ def select_moe_boundary_quant_format(moe_block) -> str:
     experts) to accept one typed activation contract: a floating-point gate
     without online quantization disables the fused boundary (the unfused
     reference norm + independent quantization stays). Packed contracts
-    (MXFP4/INT4) additionally require installed routing payload support.
+    (MXFP4/INT4) keep the separate norm and quantization path.
     """
     from sglang.srt.hardware_backend.npu.layernorm_quant import (
         can_fuse_norm_quant,
@@ -116,12 +116,8 @@ def select_moe_boundary_quant_format(moe_block) -> str:
     if contract is None:
         logger.info_once("NPU fused MoE norm+quant declined: %s", reason)
         return ""
-    from sglang.srt.hardware_backend.npu.moe.init_routing import supports_packed_routing
-
-    if contract.kind == "int4" or (
-        contract.kind == "mxfp4" and not supports_packed_routing("mxfp4", True)
-    ):
-        # INT4 has no passthrough ABI; MXFP4 requires a matching device probe.
+    if contract.kind in ("int4", "mxfp4"):
+        # Packed passthrough is unavailable; keep norm and quantization separate.
         logger.info(
             "NPU fused MoE norm+quant declined: %s passthrough unavailable",
             contract.kind,

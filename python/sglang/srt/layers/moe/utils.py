@@ -295,7 +295,6 @@ class DispatcherOutputDtype(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
-    INT4 = "int4"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
