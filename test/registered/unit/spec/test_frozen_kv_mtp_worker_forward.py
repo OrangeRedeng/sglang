@@ -71,8 +71,6 @@ class TestFrozenKVMTPForward(CustomTestCase):
                     topk=1,
                     speculative_num_steps=3,
                     speculative_num_draft_tokens=4,
-                    _topk1_parents_prealloc=torch.tensor([[-1, 0, 1]]).repeat(2, 1),
-                    _topk1_score_indices_prealloc=torch.tensor([[0, 1, 2]]).repeat(2, 1),
                     draft_attn_backend=object(),
                     draft_model_runner=SimpleNamespace(forward=forward),
                     _set_positions=Mock(
@@ -88,10 +86,7 @@ class TestFrozenKVMTPForward(CustomTestCase):
                     ),
                 ):
                     result = FrozenKVMTPDraftWorker.draft_forward(worker, batch)
-                parents, indices, tokens = result
-                torch.testing.assert_close(parents, worker._topk1_parents_prealloc)
-                torch.testing.assert_close(indices, worker._topk1_score_indices_prealloc)
-                torch.testing.assert_close(tokens, torch.tensor([[2, 2, 2], [0, 0, 0]]))
+                self.assertEqual(result, "tree")
                 self.assertEqual(len(observations), 3)
                 for positions in observations:
                     torch.testing.assert_close(positions, torch.tensor(lengths) - 1)
@@ -202,6 +197,7 @@ class TestFrozenKVMTPForward(CustomTestCase):
                 worker.draft_worker._draft_extend_for_decode.assert_called_once_with(
                     batch, output
                 )
+
 
 
 if __name__ == "__main__":

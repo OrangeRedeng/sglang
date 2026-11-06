@@ -13,6 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import msgspec
@@ -23,7 +24,9 @@ from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedO
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-class DeclaredSum(msgspec.Struct, frozen=True):
+# Forward-created handoffs need Python constructors that Dynamo can trace.
+@dataclass(frozen=True, slots=True)
+class DeclaredSum:
     """A sum every output owes to its declared input edge. complete_sum is
     the producer's custom implementation bound to this invocation, or None
     for the ordinary group all-reduce."""
@@ -37,7 +40,8 @@ class DeclaredSum(msgspec.Struct, frozen=True):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+@dataclass(slots=True)
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
@@ -77,7 +81,8 @@ class Contribution(msgspec.Struct):
         self.update = None
 
 
-class OwedOutput(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, slots=True)
+class OwedOutput:
     """Opaque model-facing handle. Only its boundary may read the contribution."""
 
     contribution: Contribution

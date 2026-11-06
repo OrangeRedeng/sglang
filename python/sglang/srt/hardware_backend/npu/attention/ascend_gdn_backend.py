@@ -11,6 +11,7 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -354,6 +355,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         h = k.new_empty(
             len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
         )  # [NT, NH, DV, Dk]
+
+        # FP32 initial state is only supported on arch35.
+        if (
+            initial_state is not None
+            and initial_state.dtype == torch.float32
+            and not is_npu_arch35()
+        ):
+            initial_state = initial_state.to(q.dtype)
 
         core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
             q,

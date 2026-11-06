@@ -16,6 +16,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.exit import ExitPolicy
 from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.runtime_context import get_forward
@@ -113,6 +114,37 @@ def published_flags():
 
 
 class TestFfnExit(CustomTestCase):
+    def test_fullgraph_decision_completes_ffn_handoff(self):
+        policy = ExitPolicy(types.SimpleNamespace(fusions=None))
+        steps = types.SimpleNamespace(
+            returns_over_dp=False,
+            exit=types.SimpleNamespace(sum_in_reduce_scatter=False),
+            output=OutputContract(
+                Layout(frozenset()), group=None, may_defer_to_next=False
+            ),
+            output_move=keep_output,
+            writes_at_handoff=True,
+        )
+        batch = types.SimpleNamespace()
+
+        def forward(value, residual):
+            decision = policy._decide(batch, steps, update=comm.PLAIN_ADD)
+            assert not decision.defer_moe_finalize
+            assert not decision.sum_in_reduce_scatter
+            output, remaining = decision.complete(value, residual)
+            assert remaining is None
+            return output
+
+        try:
+            compiled = torch.compile(forward, backend="eager", fullgraph=True)
+            for rows in (2, 5):
+                value = torch.arange(rows * 4).reshape(rows, 4).float()
+                residual = torch.ones_like(value)
+                expected = value + residual
+                torch.testing.assert_close(compiled(value, residual), expected)
+        finally:
+            torch._dynamo.reset()
+
     def setUp(self):
         patches = patch_communicator("_batch_shards_over_cp", return_value=False)
         patches.__enter__()

@@ -168,7 +168,14 @@ def alloc_extend_kernel(
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
     )
-    BLOCK_EXTEND: tl.constexpr = 4096
+    # 512, not 4096: the loop body keeps several BLOCK_EXTEND-wide i64
+    # temporaries live in the hardware unified buffer, and Ascend A3 parts
+    # carry only a 192KB UB budget (BiShengHIR rejects 4096 with
+    # "requires 1712128 bits while 1572864 bits available", even with
+    # code-motion and multi-buffer disabled). At 512 each temporary is 4KB
+    # and the kernel compiles everywhere; more loop iterations cost nothing
+    # because the bound is a runtime value -- no extra kernel variants.
+    BLOCK_EXTEND: tl.constexpr = 512
     num_blocks = (num_part2 + BLOCK_EXTEND - 1) // BLOCK_EXTEND
     for block_id in range(num_blocks):
         offset_in_block = tl.arange(0, BLOCK_EXTEND)

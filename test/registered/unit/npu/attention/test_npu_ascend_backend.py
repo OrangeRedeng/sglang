@@ -51,7 +51,6 @@ class TestFrozenKvSwaMetadata(CustomTestCase):
                 backend = object.__new__(AscendAttnBackend)
                 backend.reuse_fia_metadata = False
                 backend.reuse_fia_kv_views = False
-                backend.use_fia = False
                 backend.token_to_kv_pool = object()
                 backend.page_size = 4
                 backend.use_mla = False
@@ -103,7 +102,7 @@ class TestFrozenKvSwaMetadata(CustomTestCase):
                     self.assertIsNone(backend.forward_metadata.block_tables_swa)
 
 
-class TestFiaLengthMetadata(CustomTestCase):
+class TestFiaLengthMetadata(unittest.TestCase):
     def test_refreshes_plain_lengths_once_per_batch(self):
         for reuse in (False, True):
             backend = object.__new__(AscendAttnBackend)
@@ -525,7 +524,7 @@ class TestMTPAttentionLayout(unittest.TestCase):
                 )
                 torch.testing.assert_close(result, query)
 
-    def test_frozen_draft_full_graph_reads_prefix_with_v1_bsh(self):
+    def test_frozen_draft_full_graph_reads_prefix_with_v2_bsnd(self):
         backend = object.__new__(AscendAttnBackend)
         backend.is_frozen_kv_draft = True
         backend.use_fia = True
@@ -555,14 +554,15 @@ class TestMTPAttentionLayout(unittest.TestCase):
         query = torch.randn(2, 512)
         with patch(
             "sglang.srt.hardware_backend.npu.attention.ascend_backend."
-            "torch_npu.npu_fused_infer_attention_score",
-            return_value=(query.reshape(2, 1, 512), None),
+            "torch_npu.npu_fused_infer_attention_score_v2",
+            return_value=(query.reshape(2, 1, 1, 512), None),
         ) as fia:
             result = backend.forward_decode_graph(
                 query, None, None, layer, SimpleNamespace(), False
             )
-        self.assertEqual(fia.call_args.kwargs["input_layout"], "BSH")
-        self.assertIs(fia.call_args.kwargs["actual_seq_lengths_kv"], lengths)
+        self.assertEqual(fia.call_args.kwargs["input_layout"], "BSND")
+        self.assertIs(fia.call_args.kwargs["actual_seq_kvlen"], lengths)
+        self.assertEqual(fia.call_args.kwargs["actual_seq_qlen"], [1, 1])
         torch.testing.assert_close(result, query)
 
 

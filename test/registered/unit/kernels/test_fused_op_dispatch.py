@@ -384,6 +384,34 @@ def test_backend_eligible_override_gates_per_call(monkeypatch):
 # --- torch.compile protocol -----------------------------------------------------
 
 
+def test_fullgraph_compile_resolves_cold_npu_dispatch(monkeypatch):
+    import sglang.srt.utils as utils
+
+    class _NpuOp(BaseFusedOp):
+        def forward_native(self, x):
+            return x - 1
+
+        def forward_npu(self, x):
+            return x + 1
+
+    monkeypatch.setattr(fo, "_oot_dispatch_key", lambda: None)
+    monkeypatch.setattr(utils, "is_cuda", lambda: False)
+    monkeypatch.setattr(utils, "is_hip", lambda: False)
+    monkeypatch.setattr(utils, "is_cpu", lambda: torch.cpu.is_available())
+    monkeypatch.setattr(utils, "cpu_has_amx_support", lambda: False)
+    monkeypatch.setattr(utils, "is_npu", lambda: True)
+    fo._platform_key.cache_clear()
+    try:
+        op = _NpuOp()
+        compiled = torch.compile(op, backend="eager", fullgraph=True)
+        for size in (4, 8):
+            x = torch.zeros(size)
+            torch.testing.assert_close(compiled(x), torch.ones_like(x))
+    finally:
+        fo._platform_key.cache_clear()
+        torch._dynamo.reset()
+
+
 def test_enter_leave_torch_compile_roundtrip(monkeypatch):
     _mock_platform(monkeypatch, key="cuda", info=_CUDA)
     op = _CudaOnlyPlatformOp()
