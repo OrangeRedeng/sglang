@@ -114,8 +114,11 @@ class PrefillDelayer:
             get_schedule().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
+        self._local_only = (
+            get_schedule().disable_overlap_schedule and parallel.tp_size == 1
+        )
         tp_group = parallel.tp_group
-        if use_nccl:
+        if use_nccl and not self._local_only:
             self._gather_group = tp_group.device_group
             self._gather_device = tp_group.device
         else:
@@ -137,8 +140,8 @@ class PrefillDelayer:
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
 
-        assert not get_schedule().disable_overlap_schedule, (
-            "To use PrefillDelayer, disable_overlap_schedule must be False."
+        assert not get_schedule().disable_overlap_schedule or self._local_only, (
+            "PrefillDelayer requires overlap scheduling when TP size exceeds one."
         )
 
     def _negotiate_should_allow_prefill(
@@ -372,6 +375,9 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
+        # TP1 normal scheduling needs no device collective or synchronization.
+        if self._local_only:
+            return local_info.unsqueeze(0)
         all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,

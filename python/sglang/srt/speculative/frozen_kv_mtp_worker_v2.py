@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -391,6 +392,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         graph_runner_cls = FrozenKVMTPCudaGraphRunner
         if self.target_worker.device == "npu":
+            if envs.SGLANG_DISABLE_NPU_MTP_DRAFT_GRAPH.get():
+                logger.info("Frozen-KV NPU draft graph disabled for isolation.")
+                return
             from sglang.srt.hardware_backend.npu.graph_runner.frozen_kv_mtp_npu_graph_runner import (
                 FrozenKVMTPNpuGraphRunner,
             )
@@ -792,6 +796,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -809,6 +814,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
+
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             batch_output.new_seq_lens = batch.seq_lens

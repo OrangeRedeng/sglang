@@ -36,6 +36,62 @@ def _all_gather_over_tp(output, local, group=None):
 
 
 class TestPrefillDelayerGather(CustomTestCase):
+    def test_tp1_normal_scheduler_delays_without_a_device_collective(self):
+        for dp_size in (1, 2):
+            with (
+                self.subTest(dp_size=dp_size),
+                published_topology(
+                    tp_size=1,
+                    dp_size=dp_size,
+                    disable_overlap_schedule=True,
+                    prefill_delayer_queue_min_ratio=0.5,
+                    prefill_delayer_max_delay_ms=50,
+                    prefill_max_requests=6,
+                ),
+                patch(
+                    "sglang.srt.managers.prefill_delayer.all_gather_single"
+                ) as gather,
+                get_parallel().override(
+                    tp_group=SimpleNamespace(cpu_group=None, device_group=None)
+                ),
+            ):
+                delayer = PrefillDelayer(
+                    max_delay_passes=4, token_usage_low_watermark=None
+                )
+                delayer.skip_first_delayer = False
+                delayed = delayer._negotiate_should_allow_prefill_pure(
+                    prev_state=None,
+                    local_prefillable=True,
+                    token_usage=0.8,
+                    running_batch=12,
+                    max_prefill_bs=6,
+                    max_running_requests=64,
+                    waiting_queue_len=1,
+                )
+                self.assertFalse(delayed.output_allow)
+                released = delayer._negotiate_should_allow_prefill_pure(
+                    prev_state=delayed.next_state,
+                    local_prefillable=True,
+                    token_usage=0.8,
+                    running_batch=12,
+                    max_prefill_bs=6,
+                    max_running_requests=64,
+                    waiting_queue_len=6,
+                )
+                self.assertTrue(released.output_allow)
+                expired = delayer._negotiate_should_allow_prefill_pure(
+                    prev_state=_State(start_time=time.perf_counter() - 1),
+                    local_prefillable=True,
+                    token_usage=0.8,
+                    running_batch=12,
+                    max_prefill_bs=6,
+                    max_running_requests=64,
+                    waiting_queue_len=1,
+                )
+                self.assertTrue(expired.output_allow)
+                self.assertEqual(delayer._gather_device, "cpu")
+                gather.assert_not_called()
+
     def test_gather_returns_the_first_rank_of_each_dp_group(self):
         for name, topology in TOPOLOGIES.items():
             with (
