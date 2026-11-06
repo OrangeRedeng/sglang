@@ -635,6 +635,31 @@ class TestVerifyGraphMetadata(CustomTestCase):
                             )
                     self.assertFalse(hasattr(backend, "_npu_prefill_graph_update"))
 
+    def test_ordinary_prefill_still_refreshes_extend_lengths(self):
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        ):
+            backend = self.make_backend(False)
+            batch = SimpleNamespace(
+                batch_size=2,
+                forward_mode=ForwardMode.EXTEND,
+                req_pool_indices=torch.tensor([1, 2]),
+                seq_lens=torch.tensor([3, 4]),
+                seq_lens_cpu=torch.tensor([3, 4]),
+                out_cache_loc=None,
+                spec_info=None,
+                extend_seq_lens_cpu=[2, 0],
+            )
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+            metadata = backend.forward_metadata
+            self.assertIs(metadata, backend.prefill_graph_state["metadata"][2])
+            self.assertEqual(metadata.extend_seq_lens[:2].tolist(), [2, 0])
+            self.assertEqual(metadata.seq_lens_list_cumsum, [2, 2])
+            self.assertEqual(
+                backend._npu_prefill_graph_update,
+                [{"actual_seq_qlen": [2, 2]}, {"actual_seq_kvlen": [3, 4]}],
+            )
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):

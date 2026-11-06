@@ -18,9 +18,6 @@ import logging
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig, PreTrainedModel
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import (
@@ -36,6 +33,8 @@ from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 from sglang.srt.utils import add_prefix, is_npu
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 
 logger = logging.getLogger(__name__)
 

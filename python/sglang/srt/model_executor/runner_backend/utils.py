@@ -120,6 +120,31 @@ def resolve_prefill_backend(
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
+    model_runner = cuda_graph_runner.model_runner
+    if backend_name == Backend.TC_PIECEWISE:
+        if model_runner.device != "npu":
+            raise ValueError("tc_piecewise prefill is only supported on NPU")
+        from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+            TcPiecewiseCudaGraphBackend,
+        )
+
+        return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
+
+    if model_runner.device == "npu":
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUPrefillGraphBackend,
+        )
+
+        if backend_name not in (Backend.FULL, Backend.DISABLED):
+            raise ValueError(
+                f"NPU only supports cuda_graph_config prefill backend 'full', "
+                f"got '{backend_name}'"
+            )
+        return NPUPrefillGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+        )
+
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,

@@ -319,6 +319,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"backend; got '{backend}'."
             )
         super().__init__(model_runner)
+        # Lazy: npu_cudagraph_backend participates in an import cycle through
+        # the runner package; by the time a prefill runner is constructed the
+        # package is fully initialized.
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUPrefillGraphBackend,
+        )
+
+        self._NPUPrefillGraphBackend = NPUPrefillGraphBackend
         self.dllm_attention = model_runner.attn_backend.dllm_attention
         self._backend_can_run_prefill_cuda_graph = (
             self.dllm_attention.can_run_prefill_cuda_graph
@@ -343,6 +351,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        if (
+            model_runner.device == "npu"
+            and self.prefill_backend_name == Backend.TC_PIECEWISE
+        ):
+            # Attention runs eagerly, so full-graph host-list updates are unnecessary.
+            self._backend_can_run_prefill_cuda_graph = None
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
@@ -509,7 +523,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = isinstance(
+            self.backend,
+            (FullCudaGraphBackend, self._NPUPrefillGraphBackend),
+        )
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
@@ -523,7 +540,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
         self._capture_lora = self.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
         )
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
@@ -585,7 +607,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if isinstance(
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
+        ):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -658,7 +687,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if isinstance(
+            self.backend,
+            (
+                BreakableCudaGraphBackend,
+                FullCudaGraphBackend,
+                self._NPUPrefillGraphBackend,
+            ),
+        ):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
@@ -859,6 +895,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
+                elif self.buffer_registry.has_slot("input_embeds"):
+                    # Embeds-capable models (multimodal, EAGLE3 draft): the
+                    # captured body reads the static input_embeds slot, and
+                    # replay fills it via _fill_input_embeds_slot before the
+                    # graph replays. The layer model's own guard rejects
+                    # input_ids and input_embeds both set, so capture the
+                    # explicit-embedding branch exactly like replay runs it.
+                    dummy_ids = forward_batch.input_ids
+                    input_ids = None
+                    for embeds_name in ("input_embeds", "inputs_embeds"):
+                        if embeds_name in kwargs:
+                            kwargs[embeds_name] = forward_batch.input_embeds
+                            break
+                    # Warmups + capture see real embedding magnitudes
+                    # (all-zero activations would make dynamic-quant scales
+                    # degenerate during capture-time tiling).
+                    embed = getattr(
+                        self.model_runner.model, "get_input_embeddings", None
+                    )
+                    if embed is not None and dummy_ids is not None:
+                        self.buffer_registry.get_slot("input_embeds").slice_for(
+                            1, num_tokens
+                        )[: dummy_ids.shape[0]].copy_(embed()(dummy_ids))
                 output = self.layer_model.forward(
                     input_ids,
                     positions,

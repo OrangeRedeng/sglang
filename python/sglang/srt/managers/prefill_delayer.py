@@ -71,6 +71,7 @@ class _NegotiateOutput(NamedTuple):
     # cannot convey it to the metrics observation.
     wait_forward_passes: int = 0
     wait_seconds: float = 0.0
+    diagnostic_details: Optional[dict] = None
 
 
 class PrefillDelayer:
@@ -213,7 +214,18 @@ class PrefillDelayer:
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
+        details = None
+        if getattr(self, "_debug_log_enabled", False):
+            details = dict(
+                trigger="conditions_met",
+                queue=waiting_queue_len,
+                target=0,
+                running=running_batch,
+                max_delay_ms=self._max_delay_ms,
+                max_delay_passes=self._max_delay_passes,
+            )
         debug_info = dict(
+            diagnostic_details=details,
             input_estimation=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
@@ -234,6 +246,8 @@ class PrefillDelayer:
             # Safety valve: low KV usage means GPU is underutilized, skip
             # delay. Mirrors the check in the "mixed" branch.
             if global_exists_token_watermark_force_allow:
+                if details is not None:
+                    details["trigger"] = "low_kv_usage"
                 return _NegotiateOutput(
                     next_state=None,
                     output_allow=True,
@@ -250,6 +264,10 @@ class PrefillDelayer:
             global_running_batch_max = int(global_running_batch.max().item())
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
+            if details is not None:
+                details.update(
+                    queue=global_waiting_queue_max, running=global_running_batch_max
+                )
 
             # Queue-based trigger: delay prefill until the waiting queue
             # reaches queue_min = min(running_req * ratio, max_prefill_bs),
@@ -267,12 +285,16 @@ class PrefillDelayer:
                     int(global_running_batch_max * self._queue_min_ratio),
                     queue_capacity,
                 )
+                if details is not None:
+                    details["target"] = queue_min_effective
                 queue_condition = (
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
                 if queue_condition and tp0_info[:, 5].max().item() > 0:
                     queue_condition = False
+                    if details is not None:
+                        details["trigger"] = "wallclock_limit"
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -283,6 +305,8 @@ class PrefillDelayer:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
                 if self.skip_first_delayer:
+                    if details is not None:
+                        details["trigger"] = "first_bypass"
                     self.skip_first_delayer = False
                     pass
                 else:
@@ -299,6 +323,8 @@ class PrefillDelayer:
                             output_reason="delay",
                             **debug_info,
                         )
+                    if details is not None:
+                        details["trigger"] = "pass_limit"
                     return _NegotiateOutput(
                         next_state=None,
                         output_allow=True,
@@ -325,6 +351,8 @@ class PrefillDelayer:
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
+                if details is not None:
+                    details["trigger"] = "low_kv_usage"
                 return _NegotiateOutput(
                     next_state=None,
                     output_allow=True,
@@ -344,6 +372,8 @@ class PrefillDelayer:
                     **debug_info,
                 )
             else:
+                if details is not None:
+                    details["trigger"] = "pass_limit"
                 return _NegotiateOutput(
                     next_state=None,
                     output_allow=True,
@@ -404,6 +434,7 @@ class PrefillDelayerSinglePassExecutor:
 
         _record_single_pass_result(
             actual_execution=actual_prefill_bs > 0,
+            actual_prefill_bs=actual_prefill_bs,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
             debug_log_enabled=self._prefill_delayer._debug_log_enabled,
@@ -467,29 +498,26 @@ def _record_single_pass_result(
     metrics_collector: Optional["SchedulerMetricsCollector"],
     *,
     debug_log_enabled: bool,
+    actual_prefill_bs: int = 0,
 ) -> None:
-    if debug_log_enabled:
-        if output.output_allow and (output.output_reason == "wait_timeout"):
-            logger.info(
-                f"PrefillDelayer timeout thus not forbid prefill "
-                f"(num_prefillable={output.num_prefillable}, "
-                f"actual_execution={actual_execution})"
-            )
-        elif output.output_allow and (output.output_reason == "token_watermark"):
-            logger.info(
-                f"PrefillDelayer force allow prefill due to low watermark. "
-                f"(num_prefillable={output.num_prefillable}, "
-                f"num_token_watermark_force_allow={output.num_token_watermark_force_allow}, "
-                f"actual_execution={actual_execution})"
-            )
-        else:
-            assert output.output_reason in {
-                "",
-                "wait_success",
-                "no_wait",
-                "delay",
-            }
-
+    if debug_log_enabled and actual_execution:
+        details = output.diagnostic_details or {}
+        logger.info(
+            "PrefillDelayer release: actual_bs=%s allow=%s reason=%s trigger=%s "
+            "wait_ms=%.2f passes=%s queue=%s target=%s running=%s "
+            "max_delay_ms=%s max_delay_passes=%s",
+            actual_prefill_bs,
+            output.output_allow,
+            output.output_reason,
+            details.get("trigger", "unknown"),
+            output.wait_seconds * 1000.0,
+            output.wait_forward_passes,
+            details.get("queue"),
+            details.get("target"),
+            details.get("running"),
+            details.get("max_delay_ms"),
+            details.get("max_delay_passes"),
+        )
     if metrics_collector is not None:
         metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=output.wait_forward_passes,

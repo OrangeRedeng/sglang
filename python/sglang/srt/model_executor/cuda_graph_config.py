@@ -40,7 +40,7 @@ class Phase:
 class Backend:
     """CUDA graph capture backends a phase can use."""
 
-    # Temporary internal name while unreachable legacy branches are removed.
+    # Opt-in torch.compile piecewise capture for Ascend prefill.
     TC_PIECEWISE = "tc_piecewise"
     FULL = "full"
     BREAKABLE = "breakable"
@@ -61,6 +61,7 @@ ALLOWED_BACKENDS_PER_PHASE = {
     Phase.PREFILL: (
         Backend.FULL,
         Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
 }
@@ -180,7 +181,10 @@ class CudaGraphConfig:
             if phase not in Phase.ALL or not isinstance(phase_settings, dict):
                 continue
             phase_cfg = getattr(cfg, phase)
-            if phase_settings.get("backend") == "tc_piecewise":
+            if (
+                phase == Phase.DECODE
+                and phase_settings.get("backend") == "tc_piecewise"
+            ):
                 raise ValueError(
                     "tc_piecewise was removed; select breakable, full, or disabled"
                 )
@@ -235,12 +239,18 @@ def cuda_graph_fully_disabled() -> bool:
 
 
 def parse_cuda_graph_backend_arg(raw: str) -> str:
-    """Reject the retired backend before argparse checks supported choices."""
+    """Decode does not support torch.compile piecewise capture."""
     if raw == "tc_piecewise":
         raise argparse.ArgumentTypeError(
             "tc_piecewise was removed; select breakable, full, or disabled"
         )
     return raw
+
+
+def parse_cuda_graph_prefill_backend_arg(raw: str) -> str:
+    if raw == Backend.TC_PIECEWISE:
+        return raw
+    return parse_cuda_graph_backend_arg(raw)
 
 
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
@@ -271,7 +281,12 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
                 f"{type(phase_settings).__name__}"
             )
         if "backend" in phase_settings:
-            parse_cuda_graph_backend_arg(phase_settings["backend"])
+            parser = (
+                parse_cuda_graph_prefill_backend_arg
+                if phase == Phase.PREFILL
+                else parse_cuda_graph_backend_arg
+            )
+            parser(phase_settings["backend"])
         allowed = ALLOWED_KEYS_PER_PHASE[phase]
         result[phase] = {}
         for key, value in phase_settings.items():

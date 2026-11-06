@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -25,6 +26,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 
+logger = logging.getLogger(__name__)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -208,3 +210,72 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+
+
+class NPUPrefillGraphBackend(NPUCudaGraphBackend):
+    """NPU backend for the prefill (extend) phase body capture.
+
+    Same torch.npu.NPUGraph capture/replay mechanics as decode; the prefill
+    runner treats this as a full-style body-capture backend: one graph per
+    token bucket records the transformer stack (layer_model.forward), while
+    the embedding and logits tails run eagerly at replay with live request
+    metadata.
+
+    Attention metadata is capture-stable on device (block tables, seq_lens
+    tensor: refreshed in place via copy_). The two FIA TND host-side inputs
+    (actual_seq_qlen cumsum and actual_seq_kvlen lists) cannot be baked at
+    capture, so the ascend backend stashes fresh values in
+    ``_npu_prefill_graph_update`` at metadata refresh time and replay routes
+    through NPUGraph.update, exactly like the decode runner's seq_lens
+    rebinding.
+    """
+
+    def __init__(self, cuda_graph_runner, *, enable_memory_saver: bool = False) -> None:
+        super().__init__(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
+        self._prefill_state_source = cuda_graph_runner.model_runner.attn_backend
+        # Optimistic until a capture probe proves otherwise: the extend
+        # metadata stashes a host rebinding on every init, and replay applies
+        # it through NPUGraph.update. Whether the dispatcher actually
+        # registered updatable records is only observable after capture, so
+        # capture_one probes each graph once and downgrades to eager prefill
+        # (via the capability flag) when the graph is record-less.
+        self._prefill_state_source._prefill_graph_updates_available = True
+
+    def capture_one(self, shape_key, forward_fn, **kwargs) -> None:
+        super().capture_one(shape_key, forward_fn, **kwargs)
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is None:
+            return
+        self._prefill_state_source._npu_prefill_graph_update = None
+        try:
+            # Apply the capture-consistent values: a no-op semantically, but
+            # it is the only reliable probe for "did the dispatcher record
+            # any updatable host args" on this torch_npu.
+            self._graphs[shape_key].update(cpu_update_input=pending)
+        except RuntimeError as exc:
+            if "0 operators" not in str(exc):
+                raise
+            self._prefill_state_source._prefill_graph_updates_available = False
+            logger.warning(
+                "NPU prefill graph: captured attention ops expose no updatable "
+                "host records on this torch_npu (the TND length lists were not "
+                "registered during capture); prefill will run eager while decode "
+                "keeps its graphs. %s",
+                exc,
+            )
+
+    def replay(
+        self,
+        shape_key: ShapeKey,
+        static_forward_batch: "ForwardBatch",
+        **kwargs,
+    ) -> Any:
+        pending = getattr(self._prefill_state_source, "_npu_prefill_graph_update", None)
+        if pending is not None:
+            self._prefill_state_source._npu_prefill_graph_update = None
+            return self.replay_with_input_update(
+                shape_key, seq_lens=None, cpu_update_input=pending
+            )
+        return super().replay(shape_key, static_forward_batch, **kwargs)

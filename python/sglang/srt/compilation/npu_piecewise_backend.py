@@ -7,6 +7,10 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.compile_phase import (
+    get_pcg_capture_stream,
+    is_in_torch_compile_warmup,
+)
 from sglang.srt.compilation.cuda_piecewise_backend import (
     CUDAPiecewiseBackend,
     weak_ref_tensors,
@@ -39,6 +43,14 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
         )
 
     def __call__(self, *args):
+        if not self.first_run_finished:
+            self.first_run_finished = True
+            self.check_for_ending_compilation()
+            return self.compiled_graph_for_general_shape(*args)
+
+        if not self.sym_shape_indices:
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
@@ -49,9 +61,17 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
         if entry.runnable is None:
             entry.runnable = self.compiled_graph_for_general_shape
 
+        if is_in_torch_compile_warmup():
+            return entry.runnable(*args)
+
         if entry.cudagraph is None:
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
+                return entry.runnable(*args)
+
+            # Dynamo can create new pieces during serving, outside capture_session.
+            stream = get_pcg_capture_stream()
+            if stream is None:
                 return entry.runnable(*args)
 
             if self.compile_config.get_enable_debug_mode():
@@ -73,7 +93,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.npu.graph(npugraph, pool=self.graph_pool):
+                with torch.npu.graph(npugraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:

@@ -1,7 +1,8 @@
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.norm.l1_norm import l1_norm
+from sgl_kernel_npu.norm.l1_norm import l1_norm as _l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -10,10 +11,21 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+
+
+def _l1_norm_fake(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.new_empty.default(input, input.shape, dtype=torch.float32)
+
+
+@register_custom_op(op_name="npu_topk_l1_norm", fake_impl=_l1_norm_fake)
+def l1_norm(input: torch.Tensor) -> torch.Tensor:
+    # Keep external allocation and Triton launch code outside Dynamo tracing.
+    return _l1_norm(input)
 
 
 def fused_topk_npu(
@@ -24,6 +36,43 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
+    if topk_config.num_fused_shared_experts:
+        if (
+            topk_config.num_fused_shared_experts != 1
+            or not topk_config.apply_routed_scaling_factor_on_output
+        ):
+            raise ValueError(
+                "NPU fused shared routing requires one expert and scaled TopK"
+            )
+        routed = fused_topk_npu(
+            hidden_states,
+            router_logits,
+            replace(
+                topk_config, top_k=topk_config.top_k - 1, num_fused_shared_experts=0
+            ),
+            num_token_non_padded,
+            expert_location_dispatch_info,
+            layer_id,
+        )
+        shared_weight = topk_config.fused_shared_experts_scaling_factor
+        weights = torch.cat(
+            (
+                routed.topk_weights,
+                torch.full_like(
+                    routed.topk_weights[:, :1],
+                    1.0 if shared_weight is None else shared_weight,
+                ),
+            ),
+            dim=-1,
+        )
+        ids = torch.cat(
+            (
+                routed.topk_ids,
+                torch.full_like(routed.topk_ids[:, :1], router_logits.shape[-1]),
+            ),
+            dim=-1,
+        )
+        return StandardTopKOutput(weights, ids, router_logits)
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
@@ -52,7 +101,12 @@ def fused_topk_npu(
         topk_weights = topk_weights.to(torch.float32)
 
     # Fast path: simple top-k without grouped routing and bias
-    elif not use_grouped_topk and correction_bias is None:
+    elif (
+        not use_grouped_topk
+        and correction_bias is None
+        and topk_config.scoring_func == "softmax"
+        and num_token_non_padded is None
+    ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -65,6 +119,8 @@ def fused_topk_npu(
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)
+        if topk_config.apply_routed_scaling_factor_on_output:
+            topk_weights *= topk_config.routed_scaling_factor
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (

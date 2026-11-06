@@ -39,7 +39,7 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType,RadixAttention
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -65,6 +65,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _is_prefill_graph_mode(forward_mode: ForwardMode) -> bool:
+    # is_extend() also includes target verification, which owns decode graph state.
+    return forward_mode.is_extend() and not forward_mode.is_target_verify()
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -505,6 +510,27 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Prefill body-capture capability (NPU prefill CUDA graph).
+
+        The captured extend path requires the FIA TND kernel, whose
+        per-request lengths are plain host lists that NPUGraph.update can
+        rebind at replay. The per-request BSND loop, DCP metadata paths and
+        sparsity/offload paths build variable host structures that cannot be
+        capture-stable, so those configurations keep the eager prefill.
+
+        ``_prefill_graph_updates_available`` is set True by the prefill
+        backend's construction and is NOT gated on graph introspection:
+        torch_npu's NPUGraph does not expose a dispatch-records view on this
+        stack, and decode replay has always rebound host lists without one.
+        """
+        return (
+            self.use_fia
+            and getattr(self, "_prefill_graph_updates_available", False)
+            and not get_parallel().dcp_enabled
+            and not self.enable_sparsity_driven_kv_offload
+            and not self.is_dllm_model
+        )
 
     def _get_kv_lens_and_block_tables(
         self,
@@ -571,7 +597,13 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
+            extend_seq_lens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
         )
+        if _is_prefill_graph_mode(forward_batch.forward_mode):
+            # The captured extend kernels read this metadata object; replay
+            # refreshes its contents in place before each NPUGraph replay.
+            self.forward_metadata = self.prefill_graph_state["metadata"][bs]
+            self.graph_mode = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -857,6 +889,51 @@ class AscendAttnBackend(AttentionBackend):
         """
         pass
 
+    def _ensure_prefill_graph_state(self, bs: int) -> dict:
+        """Lazily allocate the prefill (extend) body-capture state.
+
+        Kept separate from ``graph_metadata``: the prefill phase captures
+        BEFORE the decode runner calls init_cuda_graph_state, and decode's
+        re-init replaces that dict wholesale, which would orphan the buffers
+        the already-captured prefill graphs recorded. Buffers are sized with
+        headroom on first use; growing them after capture would invalidate
+        recorded addresses, so a later larger bs raises instead.
+        """
+        state = getattr(self, "prefill_graph_state", None)
+        if state is None:
+            total_context_len = self.max_context_len + self.page_size - 1
+            width = total_context_len // self.page_size
+            cap = max(bs, 64)
+            state = {
+                "cap": cap,
+                "block_tables": torch.empty(
+                    (cap, width), dtype=torch.int32, device=self.device
+                ),
+                "extend_seq_lens": torch.zeros(
+                    cap, dtype=torch.int32, device=self.device
+                ),
+                "metadata": {},
+            }
+            if self.is_hybrid_swa:
+                state["block_tables_swa"] = torch.empty(
+                    (cap, width), dtype=torch.int32, device=self.device
+                )
+                state["swa_mask"] = torch.ones(
+                    (cap, 1, total_context_len),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                state["swa_indices"] = torch.arange(
+                    total_context_len, device=self.device, dtype=torch.int32
+                )
+            self.prefill_graph_state = state
+        if state["cap"] < bs:
+            raise RuntimeError(
+                "NPU prefill graph state was sized for "
+                f"{state['cap']} slots but capture/replay needs {bs}; "
+                "all buckets must use one request-slot count."
+            )
+        return state
 
     def _init_cuda_graph_metadata(
         self,
@@ -875,6 +952,23 @@ class AscendAttnBackend(AttentionBackend):
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
+        if _is_prefill_graph_mode(forward_mode):
+            # Prefill body capture: the graph reads extend lengths from a
+            # stable device buffer; host-side cumsum/kv-len lists are rebound
+            # at replay via NPUGraph.update (see _apply_cuda_graph_metadata).
+            state = self._ensure_prefill_graph_state(bs)
+            metadata.extend_seq_lens = state["extend_seq_lens"][:bs]
+            if state.get("seq_lens") is None:
+                state["seq_lens"] = torch.zeros(
+                    state["cap"], dtype=torch.int32, device=self.device
+                )
+            metadata.seq_lens = state["seq_lens"][:bs]
+            metadata.block_tables = state["block_tables"][:bs, :]
+            if self.is_hybrid_swa:
+                metadata.block_tables_swa = state["block_tables_swa"][:bs, :]
+                metadata.swa_mask = state["swa_mask"][:bs, :, :]
+            state["metadata"][bs] = metadata
+            return metadata
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if get_parallel().dcp_enabled:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -980,17 +1074,41 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
-        metadata = self.graph_metadata[bs]
+        prefill_state = None
+        if _is_prefill_graph_mode(forward_mode):
+            prefill_state = self._ensure_prefill_graph_state(bs)
+            metadata = prefill_state["metadata"][bs]
+        else:
+            metadata = self.graph_metadata[bs]
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            buf = self.cuda_graph_swa_out_cache_loc
+            if _is_prefill_graph_mode(forward_mode):
+                # Prefill owns a separate stable token buffer (allocated at
+                # first _apply, i.e. the largest bucket during reversed-order
+                # capture); decode's cuda_graph_swa_out_cache_loc does not
+                # exist yet at prefill capture time.
+                buf = prefill_state.get("swa_out_cache_loc")
+                if buf is None:
+                    buf = torch.zeros(n, dtype=torch.int64, device=self.device)
+                    prefill_state["swa_out_cache_loc"] = buf
+                elif buf.shape[0] < n:
+                    raise RuntimeError(
+                        "NPU prefill graph swa_out_cache_loc was sized for "
+                        f"{buf.shape[0]} tokens but this batch has {n}; "
+                        "growth after capture would invalidate recorded "
+                        "addresses."
+                    )
+                metadata.swa_out_cache_loc = buf
+            else:
+                buf = self.cuda_graph_swa_out_cache_loc
             buf[n:].zero_()
             buf[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
@@ -1047,7 +1165,11 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     seq_lens_int = seq_lens[:bs].int()
                 starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-                indices = self.graph_metadata["swa_indices"]
+                indices = (
+                    prefill_state["swa_indices"]
+                    if prefill_state is not None
+                    else self.graph_metadata["swa_indices"]
+                )
                 start_exp = starts.unsqueeze(1)
                 seq_exp = seq_lens_int.unsqueeze(1)
                 mask = (indices.unsqueeze(0) < start_exp) | (
@@ -1061,6 +1183,38 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
 
+        if _is_prefill_graph_mode(forward_mode):
+            # Prefill replay/capture refresh: extend lengths go through the
+            # stable device buffer; the FIA TND kernel additionally consumes
+            # two host-side lists (actual_seq_qlen cumsum and
+            # actual_seq_kvlen). Those cannot be captured with per-batch
+            # values, so stash them for NPUGraph.update right before replay
+            # (NPUPrefillGraphBackend.replay pops _npu_prefill_graph_update).
+            assert extend_seq_lens_cpu is not None, (
+                "NPU prefill graph metadata requires extend_seq_lens_cpu"
+            )
+            extend_lens_cpu = [int(v) for v in extend_seq_lens_cpu[:bs]]
+            metadata.extend_seq_lens[:bs].copy_(
+                torch.tensor(extend_lens_cpu, dtype=torch.int32, device=self.device)
+            )
+            metadata.extend_seq_lens_cpu_int = torch.tensor(
+                extend_lens_cpu, dtype=torch.int32
+            )
+            metadata.seq_lens_list_cumsum = np.cumsum(extend_lens_cpu).tolist()
+            metadata.seq_lens_cpu_int = [int(v) for v in seq_lens_cpu[:bs]]
+            self._npu_prefill_graph_update = [
+                # NPUGraph.update rebinds recorded host arguments by their
+                # aclnn parameter name (decode does the same with
+                # "actual_seq_lengths_kv"); these are the two IntArray args
+                # of npu_fused_infer_attention_score_v2 in the TND call.
+                {"actual_seq_qlen": metadata.seq_lens_list_cumsum},
+                {"actual_seq_kvlen": metadata.seq_lens_cpu_int},
+            ]
+            metadata.seq_lens_cpu_list = (
+                metadata.seq_lens_cpu_int
+                if self.reuse_fia_metadata
+                else [int(v) for v in seq_lens_cpu[:bs]]
+            )
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
