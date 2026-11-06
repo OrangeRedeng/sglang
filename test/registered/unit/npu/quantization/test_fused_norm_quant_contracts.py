@@ -1,5 +1,4 @@
-"""CPU-safe tests for the Ascend fused norm+quant capability selection, the
---online-quantization grammar, and the quantized router-gate schemes.
+"""CPU-safe tests for Ascend fused norm+quant and offline router loading.
 
 No torch_npu install or NPU device is required: operator probes are mocked
 and only pure selection logic runs.
@@ -14,64 +13,11 @@ import sglang.srt.layers.quantization  # noqa: F401  (canonical import entry)
 from sglang.srt.hardware_backend.npu.layernorm_quant import (
     NormQuantizedReadout,
     can_fuse_norm_quant,
-    parse_online_quantization,
 )
 from sglang.srt.hardware_backend.npu.moe.contracts import INT8, MXFP8
-from sglang.srt.hardware_backend.npu.moe.norm_gate import (
-    GATE_SCHEME_DECLINED,
-    QuantizedMoEGateMethod,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class TestOnlineQuantizationGrammar(unittest.TestCase):
-    def test_empty(self):
-        self.assertEqual(parse_online_quantization(None), {})
-        self.assertEqual(parse_online_quantization(""), {})
-
-    def test_single_pair(self):
-        self.assertEqual(
-            parse_online_quantization("gate:w8a8_mxfp8"), {"gate": "W8A8_MXFP8"}
-        )
-        self.assertEqual(
-            parse_online_quantization("gate:w4a8_mxfp"), {"gate": "W4A8_MXFP"}
-        )
-        self.assertEqual(
-            parse_online_quantization("GATE:W8A8_DYNAMIC"), {"gate": "W8A8_DYNAMIC"}
-        )
-
-    def test_multiple_pairs(self):
-        parsed = parse_online_quantization(
-            "gate:w8a8_mxfp8, moe:w4a8_mxfp ,qkv:w4a4_mxfp4"
-        )
-        self.assertEqual(
-            parsed,
-            {
-                "gate": "W8A8_MXFP8",
-                "moe": "W4A8_MXFP",
-                "qkv": "W4A4_MXFP4",
-            },
-        )
-
-    def test_all_expands(self):
-        parsed = parse_online_quantization("all:w8a8_dynamic")
-        self.assertEqual(parsed["gate"], "W8A8_DYNAMIC")
-        self.assertEqual(parsed["dense"], "W8A8_DYNAMIC")
-        self.assertNotIn("all", parsed)
-
-    def test_rejects_unknown_target(self):
-        with self.assertRaises(ValueError):
-            parse_online_quantization("router:w8a8_mxfp8")
-
-    def test_rejects_missing_scheme(self):
-        with self.assertRaises(ValueError):
-            parse_online_quantization("gate")
-
-    def test_rejects_unknown_scheme(self):
-        with self.assertRaises(ValueError):
-            parse_online_quantization("gate:int4")
 
 
 class TestNormQuantSelection(unittest.TestCase):
@@ -108,32 +54,6 @@ class TestNormQuantSelection(unittest.TestCase):
         self.assertIs(readout.normalized_float, None)
         self.assertIs(readout.operand, q)
         self.assertIs(readout.updated_residual, residual)
-
-
-class TestGateSchemes(unittest.TestCase):
-    def test_supported_schemes(self):
-        method = QuantizedMoEGateMethod("W8A8_MXFP8")
-        self.assertEqual(method.contract, MXFP8)
-        self.assertEqual(method.output_dtype, torch.float32)
-
-    def test_int8_scheme_uses_bf16_output(self):
-        method = QuantizedMoEGateMethod("W8A8_DYNAMIC")
-        self.assertEqual(method.contract, INT8)
-        self.assertEqual(method.output_dtype, torch.bfloat16)
-
-    def test_declined_schemes_fail_closed(self):
-        for scheme in ("W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"):
-            self.assertIn(scheme, GATE_SCHEME_DECLINED)
-            with self.assertRaises(ValueError):
-                QuantizedMoEGateMethod(scheme)
-
-    def test_unknown_scheme_rejected(self):
-        with self.assertRaises(ValueError):
-            QuantizedMoEGateMethod("FP16")
-
-    def test_create_weights_is_noop(self):
-        method = QuantizedMoEGateMethod("W8A8_MXFP8")
-        self.assertIsNone(method.create_weights(object()))
 
 
 class TestNpuNormQuantKernelDispatch(unittest.TestCase):
@@ -271,14 +191,6 @@ class TestFusedNormABI(unittest.TestCase):
         self.assertEqual(packed.shape, (2, 8))
         self.assertTrue(torch.equal(packed.view(torch.uint8), bytes_))
 
-    def test_explicit_online_targets_override_all(self):
-        self.assertEqual(
-            parse_online_quantization("all:w8a8_mxfp8,gate:w8a8_dynamic")["gate"],
-            "W8A8_DYNAMIC",
-        )
-        with self.assertRaises(ValueError):
-            parse_online_quantization("gate:w8a8_mxfp8,gate:w8a8_dynamic")
-
 
 class TestOfflineRouterLoading(unittest.TestCase):
     def test_custom_gate_uses_checkpoint_scheme_and_preserves_bias(self):
@@ -286,7 +198,7 @@ class TestOfflineRouterLoading(unittest.TestCase):
         from unittest.mock import Mock
 
         from sglang.srt.hardware_backend.npu.moe.norm_gate import (
-            configure_online_gate,
+            configure_offline_gate,
             gate_input_contract,
         )
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
@@ -311,7 +223,7 @@ class TestOfflineRouterLoading(unittest.TestCase):
         )
         with patch.object(ModelSlimLinearMethod, "create_weights") as create:
             self.assertFalse(
-                configure_online_gate(gate, "model.layers.0.mlp.gate", config)
+                configure_offline_gate(gate, "model.layers.0.mlp.gate", config)
             )
         create.assert_called_once()
         self.assertIs(gate.e_score_correction_bias, correction)
@@ -330,23 +242,6 @@ class TestOfflineRouterLoading(unittest.TestCase):
         config.linear_scheme_types.return_value = {"W8A8_MXFP8": object}
         self.assertIsNone(offline_gate_config(config, "model.layers.0.mlp.gate"))
         self.assertIs(offline_gate_config(config, "model.layers.1.mlp.gate"), config)
-
-
-class TestOnlineSharedFallback(unittest.TestCase):
-    def test_online_mxfp8_weight_buffers_do_not_use_offline_views(self):
-        from types import SimpleNamespace
-
-        from sglang.srt.hardware_backend.npu.moe.norm_gate import OnlineLinearMethod
-        from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_gmm1_mode
-        from sglang.srt.layers.activation import SiluAndMul
-
-        linear = SimpleNamespace(
-            quant_method=OnlineLinearMethod("W8A8_MXFP8", torch.bfloat16), bias=None
-        )
-        mlp = SimpleNamespace(
-            gate_up_proj=linear, down_proj=linear, act_fn=SiluAndMul()
-        )
-        self.assertEqual(shared_gmm1_mode(mlp), "baseline")
 
 
 if __name__ == "__main__":

@@ -204,16 +204,10 @@ class Gemma4Router(nn.Module):
         self._scale_fused = False
         if _is_npu:
             from sglang.srt.hardware_backend.npu.moe.norm_gate import (
-                configure_online_gate,
+                configure_offline_gate,
             )
 
-            # Opt-in --online-quantization gate:SCHEME converts the loaded FP
-            # router projection once after loading (changes routing numerics).
-            # Without the flag this returns False and the router keeps its
-            # checkpoint precision; offline-quantized router checkpoints are
-            # picked up by the same call when the prefix resolves to a
-            # ModelSlim scheme.
-            self._npu_gate_online = configure_online_gate(
+            configure_offline_gate(
                 self.proj, add_prefix("proj", prefix), quant_config
             )
 
@@ -229,8 +223,7 @@ class Gemma4Router(nn.Module):
             self.fuse_scale()
         x = self.norm(x)
         if _is_npu and getattr(self, "_npu_gate_method", None) is not None:
-            # Quantized gate path (online conversion or offline ModelSlim
-            # router); returns FP32 logits directly.
+            # Offline ModelSlim router; returns FP32 logits directly.
             from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
 
             return gate_forward(self.proj, x)

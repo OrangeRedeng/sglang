@@ -501,29 +501,11 @@ Shared append and a separate shared MLP are alternative executions. Compatible s
 
 Fused W13 selection checks the W2 input contract, activation/clamp/bias semantics and installed CANN support. Unsupported fusion uses the existing multi-op path. These eligibility checks and CPU regression tests do not establish A5 accuracy or performance: validate the exact checkpoint in eager and decode NPUGraph modes before claiming a gain. `rint` is the accuracy-oriented rounding policy; model-level superiority over other policies has not been measured for this change. See the [native MX quantization API](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_mx_quant.md) for its supported parameters.
 
-### Fused norm and scoped online conversion
+### Fused norm and checkpoint precision
 
 An offline-quantized router loads its own ModelSlim descriptor, independently of the expert weights. GLM, DeepSeek and Qwen routers retain floating-point weights when their descriptor is `FLOAT` or absent. Correction biases and Qwen's shared sigmoid gate keep their original precision.
 
 GLM and DeepSeek can fuse the FFN input norm with dynamic activation quantization when every input consumer accepts the same contract. GLM also supports its QKV boundary, and both families support dense FFN inputs. Selection checks the installed operator ABI and output layouts. A floating-point router, mismatched consumers, unsupported packed routing, or an unsupported topology keeps the existing norm path. Qwen's shared sigmoid gate and Qwen3.5's GDN dual consumers retain their BF16 input; no approximate reconstruction replaces it.
-
-Online weight conversion is optional and changes model numerics. Use `--online-quantization TARGET:SCHEME[,TARGET:SCHEME...]` on Ascend to convert selected floating-point weights after checkpoint loading:
-
-```bash
-python -m sglang.launch_server --model-path /path/to/model --device npu \
-  --attention-backend ascend --moe-a2a-backend none \
-  --online-quantization gate:w8a8_mxfp8
-```
-
-| Target | Online schemes |
-|---|---|
-| `gate` (routed router), `shared_expert`, `qkv`, `dense` | `w8a8_mxfp8` (alias `w8a8_mxfp`), `w8a8_dynamic` |
-| `moe` | `w8a8_mxfp8` |
-| `all` | Expands to every target; explicit targets override it |
-
-Dense targets cover MLP gate/up/down projections; QKV targets cover standard and MLA input projections. Attention output projections, embeddings and shared sigmoid gates are excluded. Offline-quantized weights retain their checkpoint method. Role-specific MoE/shared conversion keeps shared experts separate. Unsupported online INT4/FP4 schemes fail at startup; offline INT4/FP4 checkpoint methods remain available.
-
-MXFP8 online router matmul requests FP32 logits and verifies the actual projection dimensions after loading. INT8 routers use BF16 matmul output followed by an FP32 cast; this does not provide FP32 accumulation. Original floating-point online weights remain available for comparison. Validate routing accuracy, eager/graph execution and serving performance on the target A5 before deployment; host tests do not establish those results.
 
 ## Diffusion Model Quantization on Ascend NPU
 

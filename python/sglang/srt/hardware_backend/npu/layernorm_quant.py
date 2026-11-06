@@ -39,56 +39,6 @@ logger = logging.getLogger(__name__)
 # depending on the torch_npu version.
 E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
-# --online-quantization grammar: TARGET:SCHEME pairs.
-ONLINE_QUANT_TARGETS = ("gate", "moe", "shared_expert", "qkv", "dense", "all")
-ONLINE_QUANT_SCHEMES = {
-    "w8a8_mxfp8": "W8A8_MXFP8",
-    "w8a8_mxfp": "W8A8_MXFP8",
-    "w4a8_mxfp": "W4A8_MXFP",
-    "w4a4_mxfp4": "W4A4_MXFP4",
-    "w8a8_dynamic": "W8A8_DYNAMIC",
-    "w8a8_int8": "W8A8_DYNAMIC",
-    # Friendly alias: dynamic INT8 (per-token activation, per-channel weight).
-    "int8": "W8A8_DYNAMIC",
-    "w4a4_dynamic": "W4A4_DYNAMIC",
-}
-
-
-def parse_online_quantization(spec: Optional[str]) -> dict:
-    """Parse 'TARGET:SCHEME[,TARGET:SCHEME...]' into {target: scheme}.
-
-    Raises ValueError on malformed input; 'all' expands to every target.
-    """
-    if not spec:
-        return {}
-    parsed = {}
-    for pair in spec.split(","):
-        pair = pair.strip().lower()
-        if not pair:
-            continue
-        target, sep, scheme = pair.partition(":")
-        target, scheme = target.strip(), scheme.strip()
-        if not sep or target not in ONLINE_QUANT_TARGETS:
-            raise ValueError(
-                f"--online-quantization expects TARGET:SCHEME pairs; got {pair!r}"
-            )
-        if scheme not in ONLINE_QUANT_SCHEMES:
-            raise ValueError(
-                f"--online-quantization scheme {scheme!r} is not one of "
-                f"{sorted(ONLINE_QUANT_SCHEMES)}"
-            )
-        if target in parsed:
-            raise ValueError(f"Duplicate --online-quantization target: {target}")
-        parsed[target] = ONLINE_QUANT_SCHEMES[scheme]
-    if "all" in parsed:
-        scheme = parsed.pop("all")
-        parsed = {
-            **{target: scheme for target in ONLINE_QUANT_TARGETS if target != "all"},
-            **parsed,
-        }
-    return parsed
-
-
 @dataclass(frozen=True)
 class NormQuantizedReadout:
     """A boundary readout: quantized norm operand plus the updated residual.
