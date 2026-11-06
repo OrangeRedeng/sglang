@@ -10,20 +10,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.hardware_backend.npu.moe.contracts import MXFP4
-
-
-def quantize_mxfp4_activation(hidden_states, dst_type):
-    # Share the conversion policy so dense and expert consumers agree at ties.
-    return torch.ops.npu.npu_dynamic_mx_quant(
-        hidden_states,
-        dst_type=dst_type,
-        axis=-1,
-        block_size=MXFP4.block_size,
-        round_mode=MXFP4.round_mode,
-        scale_alg=MXFP4.scale_alg,
-    )
-
 
 class BaseHiddenStatesQuant(ABC):
     """Abstract base for NPU hidden state quantisation."""
@@ -49,11 +35,8 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def __init__(
-        self, quant_dtype: torch.dtype, use_mx_quant: bool = False, contract=None
-    ) -> None:
+    def __init__(self, quant_dtype: torch.dtype, use_mx_quant: bool = False) -> None:
         super().__init__(quant_dtype)
-        self.contract = contract
         if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
@@ -64,8 +47,6 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     def __call__(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.contract == MXFP4:
-            return quantize_mxfp4_activation(hidden_states, self.quant_dtype)
         quantized, scale = self._op(hidden_states, dst_type=self.quant_dtype)
         return quantized, scale
 

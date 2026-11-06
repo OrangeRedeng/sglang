@@ -41,11 +41,10 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
         topk_weights: torch.Tensor,
         expanded_row_idx: torch.Tensor,
         topk_ids: torch.Tensor,
-        skip1: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
-            skip1=skip1,
+            skip1=None,
             skip2=None,
             bias=None,
             scales=topk_weights,
