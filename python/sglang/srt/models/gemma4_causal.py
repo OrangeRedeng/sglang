@@ -74,9 +74,11 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, make_pp_layers
+from sglang.srt.utils import add_prefix, is_npu, make_pp_layers
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token

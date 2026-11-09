@@ -68,11 +68,6 @@ logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
 
-def _is_prefill_graph_mode(forward_mode: ForwardMode) -> bool:
-    # is_extend() also includes target verification, which owns decode graph state.
-    return forward_mode.is_extend() and not forward_mode.is_target_verify()
-
-
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -440,16 +435,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
-        self.is_hybrid_swa = model_runner.is_hybrid_swa
-        if self.is_hybrid_swa:
-            self.full_to_swa_index_mapping = (
-                model_runner.token_to_kv_pool.full_to_swa_index_mapping
-            )
-            self.sliding_window_size = model_runner.sliding_window_size
-        self.use_sliding_window_kv_pool = (
-            isinstance(self.token_to_kv_pool, SWAKVPool)
-            and self.token_to_kv_pool.swa_layer_nums > 0
-        )
+        self._init_swa_metadata(model_runner)
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -504,6 +490,7 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
+
 
     def _get_kv_lens_and_block_tables(
         self,
@@ -856,6 +843,7 @@ class AscendAttnBackend(AttentionBackend):
         """
         pass
 
+
     def _init_cuda_graph_metadata(
         self,
         bs: int,
@@ -988,25 +976,7 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            if _is_prefill_graph_mode(forward_mode):
-                # Prefill owns a separate stable token buffer (allocated at
-                # first _apply, i.e. the largest bucket during reversed-order
-                # capture); decode's cuda_graph_swa_out_cache_loc does not
-                # exist yet at prefill capture time.
-                buf = prefill_state.get("swa_out_cache_loc")
-                if buf is None:
-                    buf = torch.zeros(n, dtype=torch.int64, device=self.device)
-                    prefill_state["swa_out_cache_loc"] = buf
-                elif buf.shape[0] < n:
-                    raise RuntimeError(
-                        "NPU prefill graph swa_out_cache_loc was sized for "
-                        f"{buf.shape[0]} tokens but this batch has {n}; "
-                        "growth after capture would invalidate recorded "
-                        "addresses."
-                    )
-                metadata.swa_out_cache_loc = buf
-            else:
-                buf = self.cuda_graph_swa_out_cache_loc
+            buf = self.cuda_graph_swa_out_cache_loc
             buf[n:].zero_()
             buf[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
@@ -3051,7 +3021,6 @@ class AscendAttnBackend(AttentionBackend):
                         if layer.sliding_window_size != -1
                         else FULL_ATTENTION_WINDOW
                     ),
-                    # Match eager SWA and target verification: no lookahead.
                     next_tokens=(
                         0 if layer.sliding_window_size != -1 else FULL_ATTENTION_WINDOW
                     ),

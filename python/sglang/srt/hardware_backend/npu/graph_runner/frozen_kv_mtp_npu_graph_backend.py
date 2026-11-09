@@ -6,7 +6,6 @@ Follows vLLM-Ascend's UpdatableGraph task/event protocol:
 https://github.com/vllm-project/vllm-ascend/blob/0f515fe1e246a967dc41c9aa3d4e8ecb24cbbae2/vllm_ascend/compilation/updatable_graph.py
 """
 
-import logging
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -15,13 +14,11 @@ from types import MappingProxyType
 
 import numpy as np
 import torch
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
 
 _capture = ContextVar("frozen_kv_fia_capture", default=None)
-logger = logging.getLogger(__name__)
 
 
 def reject_unhandled_fia_capture():
@@ -204,14 +201,6 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         self._update_stream = self._device_module.Stream(device=self._device_id)
         self._inflight = deque()
         self._failed = False
-        self._logged_replay = False
-        self._debug_graph_sync = envs.SGLANG_DEBUG_NPU_MTP_GRAPH_SYNC.get()
-        self._debugged_shapes = set()
-        self._role = (
-            "draft"
-            if getattr(getattr(runner, "model_runner", None), "is_draft_worker", False)
-            else "verify"
-        )
 
     @contextmanager
     def _graph_capture_context(self, graph):
@@ -229,12 +218,6 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         if not self._graphs[shape_key]._frozen_fia_tasks:
             raise ValueError("Frozen-KV graph captured no FIA update tasks")
         _release_capture_workspaces(self._graphs[shape_key])
-        logger.info(
-            "Frozen-KV NPU %s bucket %s captured %d FIA tasks.",
-            self._role,
-            shape_key.size,
-            len(self._graphs[shape_key]._frozen_fia_tasks),
-        )
 
     def replay_with_input_update(
         self, shape_key, seq_lens, attr_name=None, attr_type=None, cpu_update_input=None
@@ -256,44 +239,6 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
         while self._inflight and self._inflight[0][0].query():
             self._inflight.popleft()
         stream = self._device_module.current_stream()
-        if self._debug_graph_sync:
-            # Tensor metadata only: do not copy tensors to CPU or add waits here.
-            logger.info(
-                "Frozen-KV NPU %s replay submit: bucket=%s tasks=%s "
-                "kv_lens=%s compute_stream=%s update_stream=%s",
-                self._role,
-                shape_key.size,
-                len(tasks),
-                resolved[0].get(
-                    "actual_seq_kvlen", resolved[0].get("actual_seq_lengths_kv")
-                ),
-                stream,
-                self._update_stream,
-            )
-            if shape_key not in self._debugged_shapes:
-                for index, params in enumerate(resolved):
-                    logger.info(
-                        "Frozen-KV NPU %s FIA task %s: bucket=%s layout=%s "
-                        "q_shape=%s q_stride=%s q_dtype=%s k_shape=%s "
-                        "v_shape=%s block_table_shape=%s mask_shape=%s "
-                        "q_lens=%s workspace_bytes=%s",
-                        self._role,
-                        index,
-                        shape_key.size,
-                        params.get("input_layout"),
-                        tuple(params["query"].shape),
-                        tuple(params["query"].stride()),
-                        params["query"].dtype,
-                        tuple(params["key"].shape),
-                        tuple(params["value"].shape),
-                        tuple(params["block_table"].shape)
-                        if params.get("block_table") is not None else None,
-                        tuple(params["atten_mask"].shape)
-                        if params.get("atten_mask") is not None else None,
-                        params.get("actual_seq_qlen"),
-                        params["workspace"].numel() * params["workspace"].element_size(),
-                    )
-                self._debugged_shapes.add(shape_key)
         self._update_stream.wait_stream(stream)
         done = self._device_module.Event()
         # Keep the snapshots even if submission fails: a partial graph cannot be retried.
@@ -309,23 +254,9 @@ class FrozenKVMTPNpuGraphBackend(NPUCudaGraphBackend):
                     self._device_module.graph_task_update_end(self._update_stream)
                     task.event.record(self._update_stream)
             done.record(stream)
-            if self._debug_graph_sync:
-                logger.info(
-                    "Frozen-KV NPU %s replay submitted: bucket=%s updates=%s",
-                    self._role,
-                    shape_key.size,
-                    len(tasks),
-                )
         except Exception:
             self._failed = True
             raise
-        if not self._logged_replay:
-            logger.info(
-                "Frozen-KV NPU %s explicit FIA graph replay active (bucket %s).",
-                self._role,
-                shape_key.size,
-            )
-            self._logged_replay = True
         return self._outputs[shape_key]
 
     def replay(self, shape_key, static_forward_batch, **kwargs):

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.runtime_context import get_parallel
@@ -14,14 +13,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _make_backend():
+def _make_backend(*, frozen_kv=False):
     device_module = SimpleNamespace(
         current_device=mock.Mock(return_value=3),
         synchronize=mock.Mock(),
         set_device=mock.Mock(),
         Event=mock.Mock(),
     )
-    runner = SimpleNamespace(device_module=device_module, enable_torch_compile=False)
+    runner = SimpleNamespace(
+        device_module=device_module,
+        enable_torch_compile=False,
+        model_runner=SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_frozen_kv_mtp=lambda: frozen_kv)
+        ),
+    )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
