@@ -1143,9 +1143,7 @@ def _dcp_extend_all_gather(parallel, piece, pairs) -> None:
         )
 
 
-_enable_dcp_gather_prefetch = (
-    envs.SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH.get()
-)
+_enable_dcp_gather_prefetch = envs.SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH.get()
 
 _enable_dcp_sfa_gather_overlap = envs.SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP.get()
 _enable_dsa_cp_local_topk = envs.SGLANG_NPU_DSA_CP_LOCAL_TOPK.get()
@@ -1262,6 +1260,7 @@ class _DcpGatherPrefetcher:
         )
         self.ready: list = [None, None]
         self.filled: list = [None, None]
+        self.pending: list = [None, None]
         self.prev_layer: Optional[int] = None
         self._max_layer: Optional[int] = None
         # The layer whose prefix prime() issued in prepare, before any take().
@@ -1327,6 +1326,9 @@ class _DcpGatherPrefetcher:
         of hidden_states on a prime(), before the QKV has produced them.
         """
         slot = layer_id % 2
+        if self.pending[slot] is not None:
+            raise RuntimeError("DCP prefetch slot overwritten before completion")
+        works, sends = [], []
         pool = get_token_to_kv_pool()
         # BUG 15: under F2 use a single uint8 key buffer, no rope.
         _f2 = (
@@ -1334,9 +1336,7 @@ class _DcpGatherPrefetcher:
             and envs.SGLANG_NPU_SFA_KV_QUANT_READ.get()
         )
         if _f2:
-            _ref = ref_nope.new_empty(
-                (1, 1, pool.kv_cache_dim), dtype=torch.uint8
-            )
+            _ref = ref_nope.new_empty((1, 1, pool.kv_cache_dim), dtype=torch.uint8)
             out_nope = dcp_extend_gather_buffer(
                 f"packed_latent_{slot}", _ref, plan.rows
             )
@@ -1359,8 +1359,11 @@ class _DcpGatherPrefetcher:
                         layer_id, md.dcp_local_prefix_kv_indices
                     ).unsqueeze(1)
                     send = _pad_dcp_packed_send(send, plan, parallel.dcp_rank)
-                    _dcp_issue_gather_chunks(
-                        parallel.dcp_group, out_nope, send, plan
+                    sends.append(send)
+                    works.extend(
+                        _dcp_issue_gather_chunks(
+                            parallel.dcp_group, out_nope, send, plan, wait=False
+                        )
                     )
                 else:
                     send_nope, send_rope = pool.get_mla_kv_buffer(
@@ -1368,20 +1371,18 @@ class _DcpGatherPrefetcher:
                         md.dcp_local_prefix_kv_indices,
                         layer_id=layer_id,
                     )
-                    send_nope = _pad_dcp_packed_send(
-                        send_nope, plan, parallel.dcp_rank
+                    send_nope = _pad_dcp_packed_send(send_nope, plan, parallel.dcp_rank)
+                    send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
+                    sends.extend((send_nope, send_rope))
+                    works.extend(
+                        _dcp_issue_gather_chunks(
+                            parallel.dcp_group, out_nope, send_nope, plan, wait=False
+                        )
                     )
-                    send_rope = _pad_dcp_packed_send(
-                        send_rope, plan, parallel.dcp_rank
-                    )
-                    # The work handles are dropped on purpose: every collective
-                    # is enqueued on this side stream, so the ready event below
-                    # orders the compute stream after all of them.
-                    _dcp_issue_gather_chunks(
-                        parallel.dcp_group, out_nope, send_nope, plan
-                    )
-                    _dcp_issue_gather_chunks(
-                        parallel.dcp_group, out_rope, send_rope, plan
+                    works.extend(
+                        _dcp_issue_gather_chunks(
+                            parallel.dcp_group, out_rope, send_rope, plan, wait=False
+                        )
                     )
             # The KV-only ready event is recorded here, before the o_proj
             # gather, so the SFA read does not wait for the weight assembly.
@@ -1394,6 +1395,8 @@ class _DcpGatherPrefetcher:
                 o_shard = get_o_proj_stream_shard(layer_id)
                 if o_shard is not None:
                     self._issue_o_proj_gather(layer_id, o_shard)
+        # Keep both source storage and Work alive until the attention consumer.
+        self.pending[slot] = (works, sends)
         self.filled[slot] = layer_id
 
     def _issue_o_proj_gather(self, layer_id: int, o_shard: torch.Tensor) -> None:
@@ -1408,9 +1411,7 @@ class _DcpGatherPrefetcher:
         """
         parallel = get_parallel()
         if not self._o_proj_ranks_checked:
-            if list(parallel.dcp_group.ranks) != list(
-                parallel.attn_tp_group.ranks
-            ):
+            if list(parallel.dcp_group.ranks) != list(parallel.attn_tp_group.ranks):
                 raise RuntimeError(
                     "SGLANG_NPU_STREAM_O_PROJ assembles the attention-TP "
                     "o_proj shards on the DCP group, which requires both "
@@ -1465,9 +1466,9 @@ class _DcpGatherPrefetcher:
         # [out, in] directly, every o_proj GEMM would multiply by a permuted
         # weight and the output would be fluent but wrong.
         parallel.dcp_group.all_gather_into_tensor(gather_buf, o_shard)
-        slot_buf.view(
-            full_shape[0], parallel.attn_tp_size, o_shard.shape[1]
-        ).copy_(gather_buf.movedim(0, 1))
+        slot_buf.view(full_shape[0], parallel.attn_tp_size, o_shard.shape[1]).copy_(
+            gather_buf.movedim(0, 1)
+        )
         # A separate event: the o_proj GEMM waits on this one, and it is
         # ordered after the KV ready event by the side stream itself.
         self.o_proj_ready[slot] = self.stream.record_event()
@@ -1566,22 +1567,29 @@ class _DcpGatherPrefetcher:
             and envs.SGLANG_NPU_SFA_KV_QUANT_READ.get()
         )
         if _f2:
-            _ref = k_nope.new_empty(
-                (1, 1, pool.kv_cache_dim), dtype=torch.uint8
-            )
+            _ref = k_nope.new_empty((1, 1, pool.kv_cache_dim), dtype=torch.uint8)
             out_nope = dcp_extend_gather_buffer(
                 f"packed_latent_{slot}", _ref, plan.rows
             )
             out_rope = None
         else:
             out_nope, out_rope = self.slots(plan, k_nope, k_pe, slot)
+        pending = self.pending[slot]
+        if pending is None:
+            raise RuntimeError("DCP prefetch completion is missing")
+        for work in pending[0]:
+            if work is not None:
+                work.wait()
+        self.pending[slot] = None
         torch.npu.current_stream().wait_event(self.ready[slot])
         # The one part that could not be prefetched: this chunk's own KV.
         if _f2:
             n = plan.extend_len
-            packed_tail = pool.pack_sfa_kv_cache(
-                k_nope[:n], k_pe[:n]
-            ).view(torch.uint8).unsqueeze(1)
+            packed_tail = (
+                pool.pack_sfa_kv_cache(k_nope[:n], k_pe[:n])
+                .view(torch.uint8)
+                .unsqueeze(1)
+            )
             out_nope[plan.gathered_rows :] = packed_tail
         else:
             _write_packed_extend_tail(out_nope, out_rope, k_nope, k_pe, plan)
@@ -1744,9 +1752,7 @@ def _dcp_gather_extend_kv_packed_npu(
     if _enable_dcp_gather_prefetch:
         # The prefetcher is shared with the prepare-side prime, so it is created
         # (on first use) in one place: _dcp_gather_prefetcher_get().
-        return _dcp_gather_prefetcher_get().take(
-            m, md, plan, k_nope, k_pe, m.layer_id
-        )
+        return _dcp_gather_prefetcher_get().take(m, md, plan, k_nope, k_pe, m.layer_id)
 
     pool = get_token_to_kv_pool()
     # BUG 15: under F2 the operator expects raw 656-byte uint8 rows, not
@@ -1767,9 +1773,9 @@ def _dcp_gather_extend_kv_packed_npu(
             _dcp_issue_gather_chunks(parallel.dcp_group, out_nope, send, plan)
         # Own-chunk tail: pack the bf16 KV into raw 656-byte rows.
         n = plan.extend_len
-        packed_tail = pool.pack_sfa_kv_cache(k_nope[:n], k_pe[:n]).view(
-            torch.uint8
-        ).unsqueeze(1)
+        packed_tail = (
+            pool.pack_sfa_kv_cache(k_nope[:n], k_pe[:n]).view(torch.uint8).unsqueeze(1)
+        )
         out_nope[plan.gathered_rows :] = packed_tail
         return out_nope, None
 
@@ -1817,7 +1823,12 @@ def _write_packed_extend_tail(
 
 
 def _dcp_issue_gather_chunks(
-    group, out: torch.Tensor, send: torch.Tensor, plan: "DcpPackedReadPlan"
+    group,
+    out: torch.Tensor,
+    send: torch.Tensor,
+    plan: "DcpPackedReadPlan",
+    *,
+    wait=True,
 ):
     """Fill ``out``'s prefix region with the all-gather of ``send``.
 
@@ -1840,6 +1851,10 @@ def _dcp_issue_gather_chunks(
     """
     c = plan.dcp_size
     if plan.chunks <= 1:
+        if not wait:
+            return (
+                group.all_gather_into_tensor_async(out[: plan.gathered_rows], send),
+            )
         group.all_gather_into_tensor(out[: plan.gathered_rows], send)
         return ()
     q, rem = divmod(plan.send_rows, plan.chunks)
@@ -1854,9 +1869,10 @@ def _dcp_issue_gather_chunks(
             )
         )
         st += sz
-    for work in works:
-        if work is not None:
-            work.wait()
+    if wait:
+        for work in works:
+            if work is not None:
+                work.wait()
     return tuple(works)
 
 
@@ -2261,9 +2277,7 @@ def _dcp_start_extend_gather_packed_npu(
                 out_rope[: plan.gathered_rows], send_rope
             )
         )
-    return _DcpSfaGatherPending(
-        "packed", works, plan, out_nope, out_rope, k_nope, k_pe
-    )
+    return _DcpSfaGatherPending("packed", works, plan, out_nope, out_rope, k_nope, k_pe)
 
 
 def _dcp_start_extend_gather_npu(
@@ -2321,9 +2335,11 @@ def _dcp_finish_extend_gather_npu(
             # BUG 15: F2 packed path -- pack the bf16 tail into raw uint8.
             pool = get_token_to_kv_pool()
             n = pending.plan.extend_len
-            packed_tail = pool.pack_sfa_kv_cache(
-                pending.k_nope[:n], pending.k_pe[:n]
-            ).view(torch.uint8).unsqueeze(1)
+            packed_tail = (
+                pool.pack_sfa_kv_cache(pending.k_nope[:n], pending.k_pe[:n])
+                .view(torch.uint8)
+                .unsqueeze(1)
+            )
             pending.out_nope[pending.plan.gathered_rows :] = packed_tail
         else:
             _write_packed_extend_tail(
@@ -2376,9 +2392,7 @@ def _issue_dcp_gather_prefetch(
     with torch.npu.stream(state.stream):
         if release is not None:
             state.stream.wait_event(release)
-        sends = _dcp_extend_send_rows(
-            pool, m.attn_mqa, md, plan, nxt, packed_kv, f2
-        )
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt, packed_kv, f2)
         pairs = [(scratch, s) for (scratch, _), s in zip(scratches, sends)]
         for piece in plan.pieces:
             _dcp_extend_all_gather(parallel, piece, pairs)
