@@ -42,6 +42,8 @@ class TestW4A8TPBias(unittest.TestCase):
     def setUp(self):
         self.namespace = dict(
             torch=torch,
+            get_moe_a2a_backend=lambda: SimpleNamespace(is_ascend_fuseep=lambda: False),
+            get_exec=lambda: SimpleNamespace(moe=SimpleNamespace(fuseep_mode=3)),
             FusedMoeWeightScaleSupported=SimpleNamespace(
                 CHANNEL=SimpleNamespace(value="channel"),
                 GROUP=SimpleNamespace(value="group"),
@@ -83,6 +85,13 @@ class TestW4A8TPBias(unittest.TestCase):
             intermediate_size_per_partition=32 // tp,
         )
         return layer
+
+    def test_megamoe_missing_compensation_remains_detectable(self):
+        self.namespace["get_moe_a2a_backend"] = lambda: SimpleNamespace(
+            is_ascend_fuseep=lambda: True
+        )
+        layer = self.make_layer(1)
+        self.assertTrue(torch.isnan(layer.w2_scale_bias).all())
 
     def test_tp_shards_reconstruct_unsplit_compensation(self):
         # Distinct partials make copying the full bias on every rank observable.
