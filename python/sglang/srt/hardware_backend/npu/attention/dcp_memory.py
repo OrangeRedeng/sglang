@@ -1,7 +1,7 @@
 """DCP runtime headroom ported from glm52-a3-optimizations f204b928a3."""
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 def _flag(name, default=False):
@@ -43,7 +43,17 @@ def runtime_gather_reserve_bytes(
             )
             latent, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
             decode_row_bytes = max(
-                decode_row_bytes, latent + rope * 2 + latent // 128 * 4 + latent * 4 + 8
+                decode_row_bytes,
+                latent
+                + rope * 2
+                + latent // 128 * 4
+                + latent * 4
+                + 8
+                + (
+                    (latent + rope) * projection.element_size()
+                    if _flag("SGLANG_NPU_SFA_F1_PREALLOC")
+                    else 0
+                ),
             )
             prefix_row_bytes = max(
                 prefix_row_bytes,
@@ -86,6 +96,34 @@ def runtime_gather_reserve_bytes(
         )
         serial_scratch = (piece_rows + tokens) * prefix_row_bytes
     native_headroom = (1 << 30) if getattr(get_parallel(), "moe_ep_size", 1) > 1 else 0
+    if native_headroom and get_exec().moe.fuseep_mode == 3:
+        from deep_ep import Buffer
+
+        hints = [
+            Buffer.get_low_latency_rdma_size_hint(
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
+                layer.hidden_size,
+                get_parallel().moe_ep_size,
+                layer.num_experts,
+            )
+            for layer in model.modules()
+            if getattr(layer, "moe_ep_size", 1) > 1
+            and hasattr(layer, "hidden_size")
+            and hasattr(layer, "num_experts")
+        ]
+        if not hints:
+            raise RuntimeError(
+                "Cannot budget MegaMoE communication: no EP expert geometry"
+            )
+        # The installed DeepEP communication hint supplements native workspace slack.
+        native_headroom += max(hints)
+        import logging
+
+        logging.getLogger(__name__).info(
+            "MegaMoE memory reserve: communication hint=%d bytes; native workspace allowance=%d bytes",
+            max(hints),
+            1 << 30,
+        )
     return (
         row_bytes
         + prefix_bytes
