@@ -33,6 +33,7 @@ class TestReserve(unittest.TestCase):
         namespace = dict(
             envs=envs,
             get_parallel=lambda: SimpleNamespace(attn_tp_size=16, moe_ep_size=ep),
+            get_exec=lambda: SimpleNamespace(moe=SimpleNamespace(fuseep_mode=0)),
         )
         tree = ast.parse(SOURCE.read_text())
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
