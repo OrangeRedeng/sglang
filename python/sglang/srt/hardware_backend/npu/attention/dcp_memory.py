@@ -99,12 +99,16 @@ def runtime_gather_reserve_bytes(
     if native_headroom and get_exec().moe.fuseep_mode == 3:
         from deep_ep import Buffer
 
+        from sglang.srt.hardware_backend.npu.moe.fuseep import (
+            fuseep_dispatch_expert_count,
+        )
+
         hints = [
             Buffer.get_low_latency_rdma_size_hint(
                 envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
                 layer.hidden_size,
                 get_parallel().moe_ep_size,
-                layer.num_experts,
+                fuseep_dispatch_expert_count(layer),
             )
             for layer in model.modules()
             if getattr(layer, "moe_ep_size", 1) > 1
