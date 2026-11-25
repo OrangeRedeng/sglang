@@ -1250,7 +1250,6 @@ class Envs:
     # supported on A5. Takes precedence over the MXFP8 path when both are set.
     # Refused loudly together with prefill CP (attn_cp_size > 1).
     SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
-    SGLANG_NPU_INDEXER_INT8_V2 = EnvBool(False)
     # DSA SFA latent KV (F): store the MLA latent KV packed at 8 bits in the
     # pool regardless of --kv-cache-dtype, which stays the model's COMPUTE dtype
     # (bf16 here). Row = latent | rope BF16 | per-128-tile FP32 scales
