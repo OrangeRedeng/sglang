@@ -1,6 +1,7 @@
 """DCP runtime headroom ported from glm52-a3-optimizations f204b928a3."""
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dcp_extend_gather_capacity
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 
@@ -68,7 +69,9 @@ def runtime_gather_reserve_bytes(
     copies = (
         1 if _flag("SGLANG_NPU_ENABLE_DCP_PACKED_READ") and prefill_requests == 1 else 2
     )
-    prefix_bytes = context_tokens * prefill_requests * prefix_row_bytes * slots * copies
+    prefix_rows = context_tokens * prefill_requests
+    reserved_prefix_rows = dcp_extend_gather_capacity(prefix_rows) if prefix_rows else 0
+    prefix_bytes = reserved_prefix_rows * prefix_row_bytes * slots * copies
     local_sends = (
         (2 + slots) * context_tokens * prefill_requests * prefix_row_bytes
         + get_parallel().attn_tp_size
@@ -87,7 +90,7 @@ def runtime_gather_reserve_bytes(
         or _flag("SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP")
     ):
         # Packed and generic outputs use separate names and may coexist.
-        prefix_bytes = 2 * context_tokens * prefill_requests * prefix_row_bytes
+        prefix_bytes = 2 * reserved_prefix_rows * prefix_row_bytes
         piece_rows = _flag("SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS", 262144)
         piece_rows = (
             min(context_tokens * prefill_requests, piece_rows)

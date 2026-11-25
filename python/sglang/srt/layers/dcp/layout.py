@@ -300,6 +300,14 @@ def _dcp_gather_buf_params() -> Tuple[bool, int, int]:
     )
 
 
+def dcp_extend_gather_capacity(rows: int, prealloc: bool = True) -> int:
+    round_on, grid, prealloc_rows = _dcp_gather_buf_params()
+    capacity = -(-rows // grid) * grid if round_on else rows
+    if prealloc and prealloc_rows > 0:
+        capacity = max(capacity, -(-prealloc_rows // grid) * grid)
+    return capacity
+
+
 def dcp_extend_gather_buffer(
     name: str, ref: torch.Tensor, rows: int, prealloc: bool = True
 ) -> torch.Tensor:
@@ -319,16 +327,7 @@ def dcp_extend_gather_buffer(
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
-        round_on, grid, prealloc_rows = _dcp_gather_buf_params()
-        alloc_rows = -(-rows // grid) * grid if (round_on and grid > 1) else rows
-        if prealloc and prealloc_rows > 0:
-            # Pre-grow this context-sized buffer to its expected maximum on
-            # first use so the grow-only path never orphans an intermediate
-            # size into the free list (see PREALLOC_ROWS). Grid-rounded so the
-            # reservation stays on the grid. The per-piece scratch opts out
-            # (prealloc=False): its natural size is one piece, not the context.
-            floor = -(-prealloc_rows // grid) * grid if grid > 1 else prealloc_rows
-            alloc_rows = max(alloc_rows, floor)
+        alloc_rows = dcp_extend_gather_capacity(rows, prealloc)
         buf = torch.empty(
             (alloc_rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device
         )
