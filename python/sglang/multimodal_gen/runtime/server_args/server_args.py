@@ -435,6 +435,7 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
+    minimax_h3_ffn_active_fraction: float = 1.0
     # Optional decoder-only ModelTC LightVAE checkpoint; keep the base encoder.
     minimax_h3_lightvae_decoder_path: str | None = None
     # None lets the model choose; False explicitly keeps resident projections.
@@ -743,6 +744,17 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        if self.minimax_h3_ffn_active_fraction not in (0.5, 0.75, 1.0):
+            raise ValueError("minimax_h3_ffn_active_fraction must be 0.5, 0.75, or 1.0")
+        if self.minimax_h3_ffn_active_fraction < 1.0:
+            from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+                MiniMaxH3PipelineConfig,
+            )
+
+            if type(self.pipeline_config) is not MiniMaxH3PipelineConfig:
+                raise ValueError(
+                    "Selective FFN supports the native H3 video pipeline only"
+                )
         if self.minimax_h3_lightvae_decoder_path:
             from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
                 MiniMaxH3PipelineConfig,
@@ -2359,6 +2371,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 "server, each request on its task's; the automatic memory "
                 "policy keeps both resident when they fit)."
             ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ffn-active-fraction",
+            type=float,
+            choices=(0.5, 0.75, 1.0),
+            default=ServerArgs.minimax_h3_ffn_active_fraction,
+            help="Experimental video FFN row fraction in middle H3 blocks; requires eager execution.",
         )
         parser.add_argument(
             "--minimax-h3-lightvae-decoder-path",

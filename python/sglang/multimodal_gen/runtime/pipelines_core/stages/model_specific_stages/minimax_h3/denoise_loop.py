@@ -225,6 +225,7 @@ class MiniMaxH3DenoiseBranch:
         token_tags: torch.Tensor,
         device: torch.device,
         video_query_indices: torch.Tensor | None = None,
+        ffn_active_fraction: float = 1.0,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -362,6 +363,20 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if ffn_active_fraction < 1.0:
+            from sglang.multimodal_gen.runtime.models.dits.minimax_h3_selective import (
+                selective_ffn_rows,
+            )
+
+            self.static_kwargs["selective_ffn_rows"] = selective_ffn_rows(
+                seq_len=seq_len,
+                row_start=local_row_start,
+                row_stop=local_row_stop,
+                video_spans=packed.get("video_spans"),
+                target_rows=self.img_pos[self.update_mask],
+                active_fraction=ffn_active_fraction,
+                device=device,
+            )
         if subblock_sparse_query_block_mask is not None:
             self.static_kwargs["subblock_sparse_query_block_mask"] = (
                 subblock_sparse_query_block_mask

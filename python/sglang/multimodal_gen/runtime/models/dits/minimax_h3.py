@@ -274,6 +274,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "selective_ffn_rows",
         "subblock_sparse_query_block_mask",
         "skip_mask_out_condition",
         "prompt_embeds",
@@ -1979,6 +1980,7 @@ class MiniMaxH3DiTBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_index = layer_index
+        self.num_layers = arch.num_layers
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         MINIMAX_H3_NORM_MODULATE.mark(self)
@@ -2017,6 +2019,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
+        selective_ffn_rows: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -2072,7 +2075,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        if self._fuses_gate_norm2(
+        active_rows = None
+        if selective_ffn_rows is not None:
+            protected = max(1, (self.num_layers + 9) // 10)
+            if protected <= self.layer_index < self.num_layers - protected:
+                active_rows = selective_ffn_rows[self.layer_index % 4]
+        if active_rows is None and self._fuses_gate_norm2(
             residual, gate_msa, h, shift_mlp, scale_mlp, combined_indices
         ):
             # the gated residual and norm2 in one pass, at the same roundings
@@ -2098,6 +2106,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             allow_inplace=not self.preserve_input_for_cache_dit,
         )
 
+        full_residual = x
+        if active_rows is not None:
+            if active_rows.numel() == 0:
+                return x
+            x = x.index_select(0, active_rows)
+            combined_indices = combined_indices.index_select(0, active_rows)
         residual = x
         if _accepts_mxfp8_input(self.mlp.fc1):
             h = self.norm2(x)
@@ -2122,15 +2136,17 @@ class MiniMaxH3DiTBlock(nn.Module):
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
             h = self.mlp(h)
-        # `residual` is block-local here (see above), so this stays in-place
-        # even while Cache-DiT is attached.
-        return _modulate_gate(
+        # Compact residuals are private; scatter only their completed updates.
+        result = _modulate_gate(
             residual,
             gate_mlp,
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
         )
+        if active_rows is not None:
+            return full_residual.index_copy_(0, active_rows, result)
+        return result
 
     def _fuses_gate_norm2(
         self,
@@ -2624,15 +2640,21 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             or self.adaln_cache is not None
             or get_tp_world_size() > 1
             or torch.compiler.is_compiling()
-            # CUDA only: torch.cuda's capture query is a stub on other builds
-            or adaln_input.device.type != "cuda"
-            or torch.cuda.is_current_stream_capturing()
+            or adaln_input.device.type not in ("cuda", "npu")
             or envs.SGLANG_CACHE_DIT_ENABLED
             or hasattr(self, "_sglang_cache_dit_adapter")
             or is_layerwise_offloaded_module(self)
             or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
             or any(block.adaln_proj is None for block in self.blocks)
         ):
+            return None
+        # Query the owning backend; CUDA's capture query is a stub on NPU builds.
+        is_capturing = getattr(
+            torch.get_device_module(adaln_input.device),
+            "is_current_stream_capturing",
+            None,
+        )
+        if is_capturing is None or is_capturing():
             return None
         weights = [block.adaln_proj.linear.weight for block in self.blocks]
         version = (
@@ -3604,6 +3626,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         spectrum_on = self._h3_spectrum_requested(sp_ws=sp_ws)
+        if kwargs.get("selective_ffn_rows") is not None and spectrum_on:
+            raise ValueError("Selective FFN cannot be combined with Spectrum")
         run_transformer_blocks = self.begin_spectrum_step() if spectrum_on else True
         if spectrum_on:
             try:
@@ -3667,6 +3691,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
                     block_adaln_params=block_adaln_params,
+                    selective_ffn_rows=kwargs.get("selective_ffn_rows"),
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(

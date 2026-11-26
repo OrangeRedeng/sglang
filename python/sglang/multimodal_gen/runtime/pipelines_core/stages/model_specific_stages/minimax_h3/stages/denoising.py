@@ -884,12 +884,24 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     server_args=server_args,
                     device=device,
                 )
+            if server_args.minimax_h3_ffn_active_fraction < 1.0:
+                if (
+                    server_args.enable_torch_compile
+                    or server_args.enable_breakable_cuda_graph
+                    or self._cache_dit_requested_for_batch(batch)
+                    or getattr(batch, "rollout", False)
+                    or batch.sampling_params.enable_spectrum
+                ):
+                    raise ValueError(
+                        "Selective FFN requires eager execution without caches or rollout"
+                    )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
                 video_query_indices=video_query_indices,
                 device=device,
+                ffn_active_fraction=server_args.minimax_h3_ffn_active_fraction,
             )
             _precompute_refined_prompt_embeds(
                 model,
