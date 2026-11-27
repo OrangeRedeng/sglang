@@ -561,12 +561,13 @@ def test_windowed_loop_reuses_global_state_and_native_updates(steps, global_step
     audio = torch.arange(120 * 32, dtype=torch.float32).reshape(120, 32) / 100
     original_video, original_audio = video.clone(), audio.clone()
 
-    def run(window_forward, prefix=global_steps):
+    def run(window_forward, prefix=global_steps, policy=None):
         return minimax_h3_denoise_loop(
             model=model,
             model_forward=forward,
             window_forward=window_forward,
             global_steps=prefix,
+            window_policy=policy,
             positive=MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=embeddings,
@@ -601,6 +602,27 @@ def test_windowed_loop_reuses_global_state_and_native_updates(steps, global_step
 
     counts.clear()
     observed.clear()
+    repacked = prepare_windows(
+        packed,
+        packed["token_tags"],
+        embeddings,
+        latent_shape=shape,
+        audio_t=60,
+        sigmas=sigmas,
+        overlap=0.2,
+        device=device,
+        full_window=True,
+    )
+    actual_repack = run(partial(repacked.predict, forward), policy="L" * steps)
+    assert counts == list(range(steps))
+    for actual, reference in zip(actual_repack, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for seen, reference in zip(observed, full_inputs):
+        for value, expected_value in zip(seen, reference):
+            torch.testing.assert_close(value, expected_value, rtol=0, atol=0)
+
+    counts.clear()
+    observed.clear()
     actual = run(partial(window.predict, forward))
     assert counts == [
         step for step in range(steps) for _ in range(1 if step < global_steps else 2)
@@ -622,3 +644,12 @@ def test_windowed_loop_reuses_global_state_and_native_updates(steps, global_step
             torch.testing.assert_close(seen, reference, rtol=2e-6, atol=2e-6)
     assert torch.equal(video, original_video)
     assert torch.equal(audio, original_audio)
+
+    counts.clear()
+    policy = "L" * (steps - 2) + "GL"
+    actual_late = run(partial(window.predict, forward), policy=policy)
+    assert counts == [
+        step for step, mode in enumerate(policy) for _ in range(1 if mode == "G" else 2)
+    ]
+    for actual_state, expected_state in zip(actual_late, expected):
+        torch.testing.assert_close(actual_state, expected_state, rtol=2e-6, atol=2e-6)

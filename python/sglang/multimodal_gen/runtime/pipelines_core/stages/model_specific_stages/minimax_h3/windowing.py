@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two-window T2VA prediction fusion over a shared H3 latent timeline."""
+"""Full-window repacking and two-window T2VA prediction fusion."""
 
 from dataclasses import dataclass
 import math
@@ -19,31 +19,47 @@ class Window:
 
 
 def prepare_windows(
-    packed, tags, embeddings, *, latent_shape, audio_t, sigmas, overlap, device
+    packed,
+    tags,
+    embeddings,
+    *,
+    latent_shape,
+    audio_t,
+    sigmas,
+    overlap,
+    device,
+    full_window=False,
 ):
     frames, height, width = latent_shape
-    if frames < 4 or not math.isfinite(overlap) or not 0 < overlap <= 0.5:
-        raise ValueError(
-            "H3 window overlap must be in (0, 0.5], with at least four latent frames"
-        )
-    overlap_frames = min(frames - 2, max(1, round(frames * overlap)))
-    right_start = (frames - overlap_frames) // 2
-    left_stop = right_start + overlap_frames
     frame_rows = packed["img_pos"].numel() // frames
     audio_pos = packed["audio_pos"].reshape(-1, audio_t)
     positions = packed["img_position_ids"]
-    video_times = positions[packed["img_pos"][::frame_rows], 0]
-    audio_times = positions[audio_pos[0], 0]
-    audio_start = int(torch.searchsorted(audio_times, video_times[right_start]))
-    audio_stop = int(torch.searchsorted(audio_times, video_times[left_stop]))
-    if not 0 < audio_start < audio_stop < audio_t:
-        raise ValueError("H3 window split does not produce overlapping audio ranges")
+    if full_window:
+        ranges = ((0, frames, 0, audio_t),)
+        video_ramp = audio_ramp = None
+    else:
+        if frames < 4 or not math.isfinite(overlap) or not 0 < overlap <= 0.5:
+            raise ValueError(
+                "H3 window overlap must be in (0, 0.5], with at least four latent frames"
+            )
+        overlap_frames = min(frames - 2, max(1, round(frames * overlap)))
+        right_start = (frames - overlap_frames) // 2
+        left_stop = right_start + overlap_frames
+        video_times = positions[packed["img_pos"][::frame_rows], 0]
+        audio_times = positions[audio_pos[0], 0]
+        audio_start = int(torch.searchsorted(audio_times, video_times[right_start]))
+        audio_stop = int(torch.searchsorted(audio_times, video_times[left_stop]))
+        if not 0 < audio_start < audio_stop < audio_t:
+            raise ValueError("H3 window split does not produce overlapping audio ranges")
+        ranges = (
+            (0, left_stop, 0, audio_stop),
+            (right_start, frames, audio_start, audio_t),
+        )
+        video_ramp = _ramp(overlap_frames, device).repeat_interleave(frame_rows)
+        audio_ramp = _ramp(audio_stop - audio_start, device)
 
     windows = []
-    for v_start, v_stop, a_start, a_stop in (
-        (0, left_stop, 0, audio_stop),
-        (right_start, frames, audio_start, audio_t),
-    ):
+    for v_start, v_stop, a_start, a_stop in ranges:
         video = slice(v_start * frame_rows, v_stop * frame_rows)
         audio = torch.arange(audio_pos.numel()).reshape_as(audio_pos)[:, a_start:a_stop]
         layout = minimax_h3_packed_sequence(
@@ -79,9 +95,7 @@ def prepare_windows(
         )
         windows.append(Window(video, audio.to(device), branch, timesteps))
 
-    video_ramp = _ramp(overlap_frames, device).repeat_interleave(frame_rows)
-    audio_ramp = _ramp(audio_stop - audio_start, device)
-    return WindowPredictions(*windows, video_ramp, audio_ramp)
+    return WindowPredictions(tuple(windows), video_ramp, audio_ramp)
 
 
 def _ramp(length, device):
@@ -89,15 +103,10 @@ def _ramp(length, device):
 
 
 class WindowPredictions:
-    def __init__(self, left, right, video_ramp, audio_ramp):
-        self.left = left
-        self.right = right
+    def __init__(self, windows, video_ramp, audio_ramp):
+        self.windows = windows
         self.video_ramp = video_ramp
         self.audio_ramp = audio_ramp
-
-    @property
-    def windows(self):
-        return (self.left, self.right)
 
     def predict(self, forward, model, video, audio, step, slot):
         outputs = []
@@ -109,9 +118,11 @@ class WindowPredictions:
                 adaln_slot=slot,
             )
             outputs.append(forward(model, kwargs, step))
+        if len(outputs) == 1:
+            return outputs[0]
         (left_video, left_audio), (right_video, right_audio) = outputs
         video_prediction = _blend(left_video, right_video, self.video_ramp)
-        channels = self.left.audio.shape[0]
+        channels = self.windows[0].audio.shape[0]
         audio_prediction = _blend(
             left_audio.reshape(channels, -1, left_audio.shape[-1]).transpose(0, 1),
             right_audio.reshape(channels, -1, right_audio.shape[-1]).transpose(0, 1),

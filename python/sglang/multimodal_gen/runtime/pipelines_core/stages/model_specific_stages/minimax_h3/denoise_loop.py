@@ -563,6 +563,7 @@ def minimax_h3_denoise_loop(
     ) = None,
     window_forward: Callable | None = None,
     global_steps: int = 0,
+    window_policy: str | None = None,
     positive: MiniMaxH3DenoiseBranch,
     initial_video_rows: torch.Tensor,
     initial_audio_rows: torch.Tensor,
@@ -705,7 +706,11 @@ def minimax_h3_denoise_loop(
                 rollout_ctx.batch._rollout_loop_step_index = step
 
             slot = None if adaln_plan_slots is None else adaln_plan_slots[step]
-            local_step = window_forward is not None and step >= global_steps
+            local_step = window_forward is not None and (
+                window_policy[step] == "L"
+                if window_policy is not None
+                else step >= global_steps
+            )
             if not local_step:
                 fk = positive.forward_kwargs(
                     video_rows=video_rows,

@@ -921,11 +921,29 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             mode = None if batch.is_warmup else os.getenv("SGLANG_H3_WINDOW_MODE")
+            num_steps = len(sigmas_video) - 1
+            evaluations = 0
+            updates = 0
+
+            def forward_dit(model, kwargs, step):
+                nonlocal evaluations
+                result = self._forward_dit(
+                    model,
+                    kwargs,
+                    step,
+                    batch=batch,
+                    attn_metadata=attn_metadata,
+                    build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                    num_steps=num_steps,
+                )
+                evaluations += 1
+                return result
+
             windows = None
             window_forward = None
-            global_steps = 0
+            window_policy = None
             if mode is not None:
-                if mode not in ("single", "local", "global-local"):
+                if mode not in ("single", "repack", "local", "global-local"):
                     raise ValueError("Invalid SGLANG_H3_WINDOW_MODE")
                 if (
                     ctx.is_ref2va
@@ -950,7 +968,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     raise ValueError(
                         "H3 windowing requires eager deterministic T2VA with dense attention"
                     )
-                num_steps = len(sigmas_video) - 1
                 if num_steps not in (4, 8):
                     raise ValueError(
                         "H3 windowing requires a verified 4- or 8-step schedule"
@@ -958,19 +975,26 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 if mode != "single":
                     from ..windowing import prepare_windows
 
-                    global_steps = (
-                        int(
-                            os.getenv(
-                                "SGLANG_H3_WINDOW_GLOBAL_STEPS", str(num_steps // 4)
+                    window_policy = "L" * num_steps
+                    if mode == "global-local":
+                        window_policy = os.getenv("SGLANG_H3_WINDOW_POLICY")
+                        if window_policy is None:
+                            prefix = int(
+                                os.getenv(
+                                    "SGLANG_H3_WINDOW_GLOBAL_STEPS", str(num_steps // 4)
+                                )
                             )
-                        )
-                        if mode == "global-local"
-                        else 0
-                    )
-                    if not 0 <= global_steps < num_steps:
-                        raise ValueError(
-                            "Windowed execution requires at least one local step"
-                        )
+                            if not 0 <= prefix < num_steps:
+                                raise ValueError("Invalid H3 global-step prefix")
+                            window_policy = "G" * prefix + "L" * (num_steps - prefix)
+                        if (
+                            len(window_policy) != num_steps
+                            or set(window_policy) - {"G", "L"}
+                            or "L" not in window_policy
+                        ):
+                            raise ValueError(
+                                "H3 window policy needs one G/L per step and at least one L"
+                            )
                     windows = prepare_windows(
                         packed,
                         tags,
@@ -980,6 +1004,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         sigmas=ctx.sigmas,
                         overlap=float(os.getenv("SGLANG_H3_WINDOW_OVERLAP", "0.08")),
                         device=device,
+                        full_window=mode == "repack",
                     )
                     for window in windows.windows:
                         _precompute_refined_prompt_embeds(
@@ -989,15 +1014,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             shared_conditioning=emb,
                         )
                         _precompute_rope_cache(model, window.branch, device=device)
-                    window_forward = partial(
-                        windows.predict,
-                        partial(
-                            self._forward_dit,
-                            batch=batch,
-                            attn_metadata=attn_metadata,
-                            num_steps=num_steps,
-                        ),
-                    )
+                    window_forward = partial(windows.predict, forward_dit)
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             if model.final_layer._pdd_heads is not None:
                 initial_video, initial_audio = _scale_pdd_initial_noise(
@@ -1059,6 +1076,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    nonlocal updates
+                    updates += 1
                     self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
@@ -1066,15 +1085,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(
-                        self._forward_dit,
-                        batch=batch,
-                        attn_metadata=attn_metadata,
-                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
-                        num_steps=len(sigmas_video) - 1,
-                    ),
+                    model_forward=forward_dit,
                     window_forward=window_forward,
-                    global_steps=global_steps,
+                    window_policy=window_policy,
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -1094,22 +1107,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     rollout_ctx=rollout_ctx,
                     renoise_generator=renoise_generator,
                 )
-                if not batch.is_warmup and (
-                    mode is not None or os.getenv("SGLANG_H3_LOG_DENOISE") == "1"
-                ):
-                    updates = len(sigmas_video) - 1
-                    local_steps = updates - global_steps if window_forward else 0
-                    from sglang.multimodal_gen.runtime.distributed import (
-                        get_world_group,
-                    )
-
-                    if get_world_group().rank == 0:
+                if mode is not None or os.getenv("SGLANG_H3_LOG_DENOISE") == "1":
+                    if get_world_rank() == 0:
                         logger.info(
                             "H3 denoise mode=%s scheduler_updates=%d dit_evaluations=%d "
+                            "request=%s phase=%s policy=%s "
                             "video_rows=%d audio_rows=%d window_rows=%s sigma_video=%s sigma_audio=%s",
                             mode or "native",
                             updates,
-                            updates + local_steps,
+                            evaluations,
+                            batch.request_id,
+                            "server-warmup" if batch.is_warmup else "request",
+                            window_policy or "-",
                             video_rows.shape[0],
                             audio_rows.shape[0],
                             [
