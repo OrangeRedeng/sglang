@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -285,6 +286,23 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             ),
         }
         dmd_steps = self.dmd_denoising_steps
+        explicit_rungs = os.getenv("SGLANG_H3_DENOISE_RUNGS")
+        if explicit_rungs is not None:
+            rungs = tuple(int(value) for value in explicit_rungs.split(","))
+            if (
+                len(rungs) not in (4, 8)
+                or rungs[0] != 1000
+                or rungs[-1] <= 0
+                or any(a <= b for a, b in zip(rungs, rungs[1:]))
+            ):
+                raise ValueError(
+                    "H3 denoise rungs must descend from 1000 in 4 or 8 steps"
+                )
+            if dmd_steps is not None and tuple(dmd_steps) != rungs:
+                raise ValueError(
+                    "H3 denoise rungs conflict with model release metadata"
+                )
+            dmd_steps = rungs
         num_steps = requested_num_steps
         if dmd_steps is not None and batch.is_warmup:
             # warmup truncates the trained rungs instead of rescaling a shorter grid

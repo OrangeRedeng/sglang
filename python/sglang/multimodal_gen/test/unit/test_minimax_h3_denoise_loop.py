@@ -497,3 +497,128 @@ def test_grouped_outputs_share_prompt_refinement():
 
     assert model.calls == 1
     assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]
+
+
+@pytest.mark.parametrize("steps,global_steps", [(4, 0), (4, 1), (8, 2)])
+def test_windowed_loop_reuses_global_state_and_native_updates(steps, global_steps):
+    from functools import partial
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.windowing import (
+        prepare_windows,
+    )
+
+    device = torch.device("cpu")
+    shape = (12, 4, 4)
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=shape[0],
+        latent_h=shape[1],
+        latent_w=shape[2],
+        audio_t=60,
+        include_keyframe_cond=False,
+    )
+    embeddings = torch.zeros(3, 8)
+    sigmas = {
+        name: minimax_h3_time_shift_sigmas(num_steps=steps, shift_scale=scale)
+        for name, scale in (("video", 12), ("audio", 3))
+    }
+    counts = []
+    observed = []
+
+    def forward(_model, kwargs, step):
+        counts.append(step)
+        video_pos = kwargs["img_pos_info"]["position_ids"]
+        audio_pos = kwargs["audio_pos_info"]["position_ids"]
+        positions = kwargs["img_position_ids"][0]
+        video = kwargs["x"][0, video_pos]
+        audio = kwargs["audio_x"][0, audio_pos]
+        observed.append(
+            (
+                video.clone(),
+                audio.clone(),
+                positions[video_pos].clone(),
+                positions[audio_pos].clone(),
+            )
+        )
+        # Depend on the current shared state and global coordinates.
+        return (
+            video * 0.25 + positions[video_pos, :1] / 100,
+            audio * 0.5 + positions[audio_pos, :1] / 100,
+        )
+
+    model = SimpleNamespace(prepare_adaln_plans=lambda _: None)
+    window = prepare_windows(
+        packed,
+        packed["token_tags"],
+        embeddings,
+        latent_shape=shape,
+        audio_t=60,
+        sigmas=sigmas,
+        overlap=0.2,
+        device=device,
+    )
+    video = torch.arange(48 * 96, dtype=torch.float32).reshape(48, 96) / 100
+    audio = torch.arange(120 * 32, dtype=torch.float32).reshape(120, 32) / 100
+    original_video, original_audio = video.clone(), audio.clone()
+
+    def run(window_forward, prefix=global_steps):
+        return minimax_h3_denoise_loop(
+            model=model,
+            model_forward=forward,
+            window_forward=window_forward,
+            global_steps=prefix,
+            positive=MiniMaxH3DenoiseBranch(
+                packed=packed,
+                text_embeddings=embeddings,
+                token_tags=packed["token_tags"],
+                device=device,
+            ),
+            initial_video_rows=video,
+            initial_audio_rows=audio,
+            keyframe_cond_rows=None,
+            sigmas_video=sigmas["video"],
+            sigmas_audio=sigmas["audio"],
+            device=device,
+        )
+
+    expected = run(None)
+    full_inputs = observed.copy()
+    counts.clear()
+    observed.clear()
+
+    # A full window uses the original branch/scheduler directly (W0).
+    def unexpected_window(*args):
+        pytest.fail("A full window must use the native forward")
+
+    actual_single = run(unexpected_window, prefix=steps)
+    assert counts == list(range(steps))
+    for actual, reference in zip(actual_single, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    for seen, reference in zip(observed, full_inputs):
+        for value, expected_value in zip(seen, reference):
+            torch.testing.assert_close(value, expected_value, rtol=0, atol=0)
+
+    counts.clear()
+    observed.clear()
+    actual = run(partial(window.predict, forward))
+    assert counts == [
+        step for step in range(steps) for _ in range(1 if step < global_steps else 2)
+    ]
+    for actual_state, expected_state in zip(actual, expected):
+        torch.testing.assert_close(actual_state, expected_state, rtol=2e-6, atol=2e-6)
+    for index, step in enumerate(counts[global_steps:], start=global_steps):
+        local = window.windows[(index - global_steps) % 2]
+        v, a, vp, ap = full_inputs[step]
+        for seen, reference in zip(
+            observed[index],
+            (
+                v[local.video],
+                a[local.audio.flatten()],
+                vp[local.video],
+                ap[local.audio.flatten()],
+            ),
+        ):
+            torch.testing.assert_close(seen, reference, rtol=2e-6, atol=2e-6)
+    assert torch.equal(video, original_video)
+    assert torch.equal(audio, original_audio)

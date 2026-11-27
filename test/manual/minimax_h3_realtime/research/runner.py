@@ -129,8 +129,10 @@ def validate(suite):
     ):
         if contract.get(key) is None:
             raise ValueError(f"Fill contract.{key} before running")
-    if contract["actual_nfe"] != 4 or contract["npu_count"] != 8:
-        raise ValueError("Primary campaign requires four NFE and eight NPUs")
+    if contract["actual_nfe"] not in (4, 8) or contract["npu_count"] != 8:
+        raise ValueError(
+            "Primary campaign requires four or eight scheduler updates and eight NPUs"
+        )
     ids = [case["id"] for case in suite["cases"]]
     if len(set(ids)) != len(ids):
         raise ValueError("Case IDs must be unique")
@@ -163,7 +165,7 @@ def validate(suite):
                 raise ValueError(f"{count} must be a positive integer")
 
 
-def probe_media(path):
+def probe_media(path, *, require_stream_durations=False):
     data = subprocess.check_output(
         [
             "ffprobe",
@@ -184,6 +186,10 @@ def probe_media(path):
     if not videos or not audios:
         raise ValueError("Output must contain both video and audio")
     video, audio = videos[0], audios[0]
+    if require_stream_durations and (
+        "duration" not in video or "duration" not in audio
+    ):
+        raise ValueError("Output must report independent video and audio durations")
     numerator, denominator = map(int, video["avg_frame_rate"].split("/"))
     return dict(
         width=video["width"],
@@ -199,10 +205,17 @@ def verify_sample(path, contract, case):
     sample = json.loads(path.read_text())
     if (
         sample.get("status") != "completed"
-        or sample.get("actual_nfe") != contract["actual_nfe"]
+        or sample.get("scheduler_updates", sample.get("actual_nfe"))
+        != contract["actual_nfe"]
     ):
         raise ValueError(
-            "Adapter must report completed generation and measured actual_nfe"
+            "Adapter must report completed generation and measured scheduler updates"
+        )
+    if "dit_evaluations" in sample and (
+        type(sample["dit_evaluations"]) is not int or sample["dit_evaluations"] < 1
+    ):
+        raise ValueError(
+            "DiT evaluations must count logical forwards, without TP/SP replication"
         )
     if sample.get("contract_hash") != digest(contract):
         raise ValueError("Adapter contract hash does not match campaign")
@@ -219,6 +232,8 @@ def verify_sample(path, contract, case):
             raise ValueError(f"Output {key} differs from contract")
     if abs(observed["fps"] - contract["fps"]) > 0.01:
         raise ValueError("Output FPS differs from contract")
+    if "frame_count" in case and observed["frames"] != case["frame_count"]:
+        raise ValueError("Output frame count differs from the case")
     target = case.get("duration_s", 15)
     tolerance = case.get("duration_tolerance_s", 17 / contract["fps"])
     if not target <= observed["duration_s"] <= target + tolerance:

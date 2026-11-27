@@ -6,6 +6,7 @@ single-branch execution, and payload validation.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -914,6 +915,84 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 positive,
                 device=device,
             )
+            mode = None if batch.is_warmup else os.getenv("SGLANG_H3_WINDOW_MODE")
+            windows = None
+            window_forward = None
+            global_steps = 0
+            if mode is not None:
+                if mode not in ("single", "local", "global-local"):
+                    raise ValueError("Invalid SGLANG_H3_WINDOW_MODE")
+                if (
+                    ctx.is_ref2va
+                    or ctx.include_cond
+                    or ctx.audio_ref_rows is not None
+                    or self.stochastic_sampling
+                    or getattr(model, "hyperflow", None) is not None
+                    or model.final_layer._pdd_heads is not None
+                    or server_args.enable_torch_compile
+                    or server_args.enable_breakable_cuda_graph
+                    or self._cache_dit_requested_for_batch(batch)
+                    or sampling.enable_spectrum
+                    or getattr(batch, "rollout", False)
+                    or server_args.minimax_h3_ffn_active_fraction != 1.0
+                    or (transformer_backend or "fa").lower()
+                    not in ("fa", "laser_attn", "torch_sdpa")
+                    or subblock_enabled
+                    or attn_metadata is not None
+                    and not isinstance(attn_metadata, AscendFAMetadata)
+                    or build_vsa_h3_step_metadata is not None
+                ):
+                    raise ValueError(
+                        "H3 windowing requires eager deterministic T2VA with dense attention"
+                    )
+                num_steps = len(sigmas_video) - 1
+                if num_steps not in (4, 8):
+                    raise ValueError(
+                        "H3 windowing requires a verified 4- or 8-step schedule"
+                    )
+                if mode != "single":
+                    from ..windowing import prepare_windows
+
+                    global_steps = (
+                        int(
+                            os.getenv(
+                                "SGLANG_H3_WINDOW_GLOBAL_STEPS", str(num_steps // 4)
+                            )
+                        )
+                        if mode == "global-local"
+                        else 0
+                    )
+                    if not 0 <= global_steps < num_steps:
+                        raise ValueError(
+                            "Windowed execution requires at least one local step"
+                        )
+                    windows = prepare_windows(
+                        packed,
+                        tags,
+                        emb["hidden_states"],
+                        latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                        audio_t=ctx.audio_t,
+                        sigmas=ctx.sigmas,
+                        overlap=float(os.getenv("SGLANG_H3_WINDOW_OVERLAP", "0.08")),
+                        device=device,
+                    )
+                    for window in windows.windows:
+                        _precompute_refined_prompt_embeds(
+                            model,
+                            window.branch,
+                            device=device,
+                            shared_conditioning=emb,
+                        )
+                        _precompute_rope_cache(model, window.branch, device=device)
+                    window_forward = partial(
+                        windows.predict,
+                        partial(
+                            self._forward_dit,
+                            batch=batch,
+                            attn_metadata=attn_metadata,
+                            num_steps=num_steps,
+                        ),
+                    )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             if model.final_layer._pdd_heads is not None:
                 initial_video, initial_audio = _scale_pdd_initial_noise(
@@ -989,6 +1068,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
                         num_steps=len(sigmas_video) - 1,
                     ),
+                    window_forward=window_forward,
+                    global_steps=global_steps,
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -1008,6 +1089,33 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     rollout_ctx=rollout_ctx,
                     renoise_generator=renoise_generator,
                 )
+                if not batch.is_warmup and (
+                    mode is not None or os.getenv("SGLANG_H3_LOG_DENOISE") == "1"
+                ):
+                    updates = len(sigmas_video) - 1
+                    local_steps = updates - global_steps if window_forward else 0
+                    from sglang.multimodal_gen.runtime.distributed import (
+                        get_world_group,
+                    )
+
+                    if get_world_group().rank == 0:
+                        logger.info(
+                            "H3 denoise mode=%s scheduler_updates=%d dit_evaluations=%d "
+                            "video_rows=%d audio_rows=%d window_rows=%s sigma_video=%s sigma_audio=%s",
+                            mode or "native",
+                            updates,
+                            updates + local_steps,
+                            video_rows.shape[0],
+                            audio_rows.shape[0],
+                            [
+                                (w.video.stop - w.video.start, w.audio.numel())
+                                for w in windows.windows
+                            ]
+                            if windows is not None
+                            else [],
+                            sigmas_video,
+                            ctx.sigmas["audio"],
+                        )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()

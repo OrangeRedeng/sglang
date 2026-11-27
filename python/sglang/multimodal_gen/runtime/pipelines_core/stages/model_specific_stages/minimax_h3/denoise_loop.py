@@ -549,7 +549,9 @@ class MiniMaxH3DenoiseBranch:
                 r_video=None if video_endpoints is None else video_endpoints[step],
                 r_audio=None if audio_endpoints is None else audio_endpoints[step],
             )
-            for step, (t_video, t_audio) in enumerate(zip(video_timesteps, audio_timesteps))
+            for step, (t_video, t_audio) in enumerate(
+                zip(video_timesteps, audio_timesteps)
+            )
         ]
 
 
@@ -559,6 +561,8 @@ def minimax_h3_denoise_loop(
     model_forward: (
         Callable[[Any, dict[str, Any], int], tuple[torch.Tensor, torch.Tensor]] | None
     ) = None,
+    window_forward: Callable | None = None,
+    global_steps: int = 0,
     positive: MiniMaxH3DenoiseBranch,
     initial_video_rows: torch.Tensor,
     initial_audio_rows: torch.Tensor,
@@ -700,25 +704,30 @@ def minimax_h3_denoise_loop(
             if rollout_ctx is not None:
                 rollout_ctx.batch._rollout_loop_step_index = step
 
-            fk = positive.forward_kwargs(
-                video_rows=video_rows,
-                audio_rows=audio_rows,
-                step_timesteps=timestep_plan[step],
-                adaln_slot=(
-                    None if adaln_plan_slots is None else adaln_plan_slots[step]
-                ),
-            )
+            slot = None if adaln_plan_slots is None else adaln_plan_slots[step]
+            local_step = window_forward is not None and step >= global_steps
+            if not local_step:
+                fk = positive.forward_kwargs(
+                    video_rows=video_rows,
+                    audio_rows=audio_rows,
+                    step_timesteps=timestep_plan[step],
+                    adaln_slot=slot,
+                )
             if attn_metadata is not None and hasattr(attn_metadata, "current_timestep"):
                 attn_metadata.current_timestep = step
-            if model_forward is None and attn_metadata is not None:
-                forward_cm: AbstractContextManager = set_forward_context(
-                    current_timestep=step,
-                    attn_metadata=attn_metadata,
-                )
-            else:
-                forward_cm = nullcontext()
+            forward_cm = (
+                set_forward_context(current_timestep=step, attn_metadata=attn_metadata)
+                if not local_step
+                and model_forward is None
+                and attn_metadata is not None
+                else nullcontext()
+            )
             with forward_cm, torch.inference_mode():
-                if model_forward is None:
+                if local_step:
+                    v_video, v_audio = window_forward(
+                        model, video_rows, audio_rows, step, slot
+                    )
+                elif model_forward is None:
                     v_video, v_audio = model(**fk)
                 else:
                     v_video, v_audio = model_forward(model, fk, step)
