@@ -12,6 +12,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -1835,7 +1836,18 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             return out
-        hidden, _ = self.fc1(x)
+        profile_scope = nullcontext()
+        if (
+            current_platform.is_npu()
+            and not torch.compiler.is_compiling()
+            and torch.autograd.profiler._is_profiler_enabled
+        ):
+            fc1_input = x[0] if isinstance(x, tuple) else x
+            profile_scope = torch.profiler.record_function(
+                f"h3_ffn_fc1_rows_{fc1_input.shape[0]}"
+            )
+        with profile_scope:
+            hidden, _ = self.fc1(x)
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
@@ -2089,17 +2101,27 @@ class MiniMaxH3DiTBlock(nn.Module):
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
-        h = self.attn(
-            h,
-            x_prequant=h_prequant,
-            rope_cache=rope_cache,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_host=cu_seqlens_host,
-            max_seqlen=max_seqlen,
-            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
-            ulysses_active=ulysses_active,
-            ring_active=ring_active,
-        )
+        profile_scope = nullcontext()
+        if (
+            current_platform.is_npu()
+            and not torch.compiler.is_compiling()
+            and torch.autograd.profiler._is_profiler_enabled
+        ):
+            profile_scope = torch.profiler.record_function(
+                f"h3_dit_attention_layer_{self.layer_index}"
+            )
+        with profile_scope:
+            h = self.attn(
+                h,
+                x_prequant=h_prequant,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
+            )
         active_rows = None
         if selective_ffn_rows is not None:
             protected = max(1, (self.num_layers + 9) // 10)
@@ -2661,12 +2683,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         touching its weight.
         """
         max_entries = 32
+        is_npu = adaln_input.device.type == "npu"
         if (
             timestep_bits is None
             or self.adaln_cache is not None
             or get_tp_world_size() > 1
             or torch.compiler.is_compiling()
             or adaln_input.device.type not in ("cuda", "npu")
+            or (is_npu and os.getenv("SGLANG_H3_NPU_ADALN_MEMO") == "0")
             or envs.SGLANG_CACHE_DIT_ENABLED
             or hasattr(self, "_sglang_cache_dit_adapter")
             or is_layerwise_offloaded_module(self)
@@ -2675,12 +2699,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         ):
             return None
         # Query the owning backend; CUDA's capture query is a stub on NPU builds.
-        is_capturing = getattr(
-            torch.get_device_module(adaln_input.device),
-            "is_current_stream_capturing",
-            None,
-        )
-        if is_capturing is None or is_capturing():
+        try:
+            is_capturing = getattr(
+                torch.get_device_module(adaln_input.device),
+                "is_current_stream_capturing",
+                None,
+            )
+            if is_capturing is None or is_capturing():
+                return None
+        except RuntimeError:
+            if not is_npu:
+                raise
+            # An unavailable NPU capture query cannot establish eager safety.
             return None
         weights = [block.adaln_proj.linear.weight for block in self.blocks]
         version = (
@@ -2703,17 +2733,22 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             adaln_input.device,
         )
         outputs = entries.pop(key, None)
-        if outputs is None:
-            outputs = [
-                block.adaln_proj.project_local(adaln_input) for block in self.blocks
-            ]
-            while len(entries) >= max_entries:
-                entries.pop(next(iter(entries)))
-        entries[key] = outputs
-        return tuple(
-            block.adaln_proj.split_output(output)
-            for block, output in zip(self.blocks, outputs)
-        )
+        profile_scope = nullcontext()
+        if is_npu and torch.autograd.profiler._is_profiler_enabled:
+            event = "h3_adaln_memo_miss" if outputs is None else "h3_adaln_memo_hit"
+            profile_scope = torch.profiler.record_function(event)
+        with profile_scope:
+            if outputs is None:
+                outputs = [
+                    block.adaln_proj.project_local(adaln_input) for block in self.blocks
+                ]
+                while len(entries) >= max_entries:
+                    entries.pop(next(iter(entries)))
+            entries[key] = outputs
+            return tuple(
+                block.adaln_proj.split_output(output)
+                for block, output in zip(self.blocks, outputs)
+            )
 
     def _can_batch_block_adaln(self) -> bool:
         return (

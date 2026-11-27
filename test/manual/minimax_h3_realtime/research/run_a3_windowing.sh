@@ -10,6 +10,7 @@ if [[ ${1:-} != --inside ]]; then
     env_args=()
     for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_FLOW_SHIFT H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
         H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
+        H3_FFN_ACTIVE_FRACTION SGLANG_H3_NPU_ADALN_MEMO \
         H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
@@ -103,6 +104,10 @@ if [[ -v H3_WINDOW_POLICY ]]; then
     fi
     export SGLANG_H3_WINDOW_POLICY="$H3_WINDOW_POLICY"
 fi
+if [[ -v H3_FFN_ACTIVE_FRACTION && -v SGLANG_H3_WINDOW_MODE ]]; then
+    echo "Run selective FFN on the native baseline." >&2
+    exit 2
+fi
 
 export ASCEND_RT_VISIBLE_DEVICES="$visible" PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK=1 SGLANG_CACHE_DIT_ENABLED=false
@@ -148,9 +153,13 @@ args=(sglang serve --model-path "$model" --model-type diffusion --model-variant 
 if [[ "$merged" != 1 ]]; then
     args+=(--lora-path "$lora" --lora-scale 1.0 --lora-alpha "${H3_LORA_ALPHA:-64}")
 fi
+if [[ -v H3_FFN_ACTIVE_FRACTION ]]; then
+    args+=(--minimax-h3-ffn-active-fraction "$H3_FFN_ACTIVE_FRACTION")
+fi
 printf '%q ' "${args[@]}" > "$output/launch.txt"
 printf '\nvisible_devices=%s\nrungs=%s\n' "$visible" "$SGLANG_H3_DENOISE_RUNGS" >> "$output/launch.txt"
 printf 'laser_sp8_pad_heads=%s\n' "${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}" >> "$output/launch.txt"
+printf 'npu_adaln_memo=%s\n' "${SGLANG_H3_NPU_ADALN_MEMO:-default}" >> "$output/launch.txt"
 printf 'window_mode=%s\nwindow_policy=%s\nwindow_global_steps=%s\nwindow_overlap=%s\nmerged_flashgen=%s\n' \
     "${SGLANG_H3_WINDOW_MODE:-native}" "${SGLANG_H3_WINDOW_POLICY:-}" \
     "${SGLANG_H3_WINDOW_GLOBAL_STEPS:-0}" "${SGLANG_H3_WINDOW_OVERLAP:-0.08}" "$merged" >> "$output/launch.txt"
