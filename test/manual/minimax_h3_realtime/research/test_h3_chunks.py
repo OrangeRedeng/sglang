@@ -68,10 +68,12 @@ def test_parallel_windows_share_one_discarded_anchor_frame(tmp_path):
         chunks.plan(cfg)
 
 
+@pytest.mark.parametrize("devices", [list(range(8, 16)), list(range(16))])
 def test_continuation_runs_native_jobs_and_reuses_generated_boundary(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, devices
 ):
     cfg = config(tmp_path)
+    cfg["endpoints"][0]["devices"] = devices
     seen = []
     extractions = []
 
@@ -118,6 +120,7 @@ def test_continuation_runs_native_jobs_and_reuses_generated_boundary(
     assert extractions == [("raw-0000.mp4", 123), ("raw-0001.mp4", 123)]
     assert result["executed_nfe"] == "unverified"
     assert result["media"]["frames"] == 362
+    assert [chunk["devices"] for chunk in result["chunks"]] == [devices] * 3
     assert (tmp_path / "result/result.json").is_file()
 
 

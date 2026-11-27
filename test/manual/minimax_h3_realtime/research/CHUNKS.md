@@ -49,6 +49,10 @@ share that partition. Supply its actual immutable revisions in this JSON:
 Keep the deployed FlashGen sigma schedule; a four-step request alone does not
 install it. The orchestrator preserves all request fields other than the
 window geometry, prompt override, seed, task, conditions, and output count.
+For a 16-NPU Laser endpoint, list device IDs 0–15 in the continuation config.
+Start the server with `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15`,
+`SGLANG_H3_LASER_SP8_PAD_HEADS=1`, and
+`--num-gpus 16 --tp-size 2 --sp-degree 8 --ulysses-degree 8 --ring-degree 1 --attention-backend laser_attn`.
 
 ```bash
 python test/manual/minimax_h3_realtime/research/h3_chunks.py \

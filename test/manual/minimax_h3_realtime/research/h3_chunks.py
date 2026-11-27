@@ -17,6 +17,9 @@ from prototypes import execute_chunks, windows
 from runner import probe_media, save
 
 
+DEVICE_BUDGET_BY_MODE = {"continuation": 16, "anchor_parallel": 8}
+
+
 def plan(config):
     canvas = config.get("expected_canvas", [1344, 768])
     if len(canvas) != 2 or any(
@@ -26,8 +29,9 @@ def plan(config):
             "expected_canvas must contain two positive 32-aligned dimensions"
         )
     mode = config["mode"]
-    if mode not in ("continuation", "anchor_parallel"):
+    if mode not in DEVICE_BUDGET_BY_MODE:
         raise ValueError("mode must be continuation or anchor_parallel")
+    budget = DEVICE_BUDGET_BY_MODE[mode]
     if not math.isfinite(config["duration_s"]) or config["duration_s"] <= 0:
         raise ValueError("duration_s must be positive and finite")
     total = math.ceil(config["duration_s"] * 24)
@@ -61,12 +65,12 @@ def plan(config):
     if (
         not groups
         or any(not group for group in groups)
-        or len(devices) > 8
+        or len(devices) > budget
         or len(set(devices)) != len(devices)
         or len(set(urls)) != len(urls)
     ):
         raise ValueError(
-            "Endpoints need unique URLs and disjoint nonempty groups within eight NPUs"
+            f"Endpoints need unique URLs and disjoint nonempty groups within {budget} NPUs"
         )
     if any(type(device) is not int or device < 0 for device in devices):
         raise ValueError("Device IDs must be nonnegative integers")
@@ -342,7 +346,10 @@ def generate(config, directory):
         return record
 
     records = execute_chunks(
-        tasks, [endpoint["devices"] for endpoint in config["endpoints"]], adapter
+        tasks,
+        [endpoint["devices"] for endpoint in config["endpoints"]],
+        adapter,
+        budget=DEVICE_BUDGET_BY_MODE[config["mode"]],
     )
     output = concatenate(
         [Path(record["committed"]) for record in records], directory, timeout
