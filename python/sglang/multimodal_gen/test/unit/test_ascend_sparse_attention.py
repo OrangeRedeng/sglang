@@ -45,7 +45,7 @@ def backend(monkeypatch):
     def make_dense(**config):
         executor = SimpleNamespace(config=config)
         executor.forward = Mock(
-            side_effect=lambda q, k, v, metadata: _reference(q, k, v)
+            side_effect=lambda q, k, v, metadata, **kwargs: _reference(q, k, v)
         )
         executors.append(executor)
         return executor
@@ -384,6 +384,7 @@ def test_a2_a3_dense_defaults_to_public_laser_backend(backend, monkeypatch, soc)
     backend.dense.assert_not_called()
     assert not backend.dense_metadata
     assert backend.executors[0].forward.call_args.args[3] is None
+    assert backend.executors[0].forward.call_args.kwargs == {"preserve_bf16_range": True}
 
 
 @pytest.mark.parametrize(

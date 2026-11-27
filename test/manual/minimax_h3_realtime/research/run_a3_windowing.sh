@@ -10,6 +10,7 @@ if [[ ${1:-} != --inside ]]; then
     env_args=()
     for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_FLOW_SHIFT H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
         H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
+        H3_NATIVE_REFERENCE H3_NATIVE_VAE H3_QUALITY H3_ATTENTION_BACKEND H3_ATTENTION_CONFIG \
         H3_FFN_ACTIVE_FRACTION SGLANG_H3_NPU_ADALN_MEMO \
         H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
@@ -61,6 +62,22 @@ if [[ ${H3_LASER16:-0} == 1 && "$devices" == 16 ]]; then
 fi
 visible=${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 "$((devices - 1))")}
 if [[ "$case_id" == B3 ]]; then visible=${H3_B3_DEVICES:-0,1,2,3}; fi
+if [[ -v H3_ATTENTION_BACKEND ]]; then
+    if [[ "$case_id" != B0 || "$devices" != 8 ||
+        ( "$H3_ATTENTION_BACKEND" != fa && "$H3_ATTENTION_BACKEND" != ascend_sparse_attn ) ]]; then
+        echo "The H08 attention override requires eight-device B0 and fa or ascend_sparse_attn." >&2
+        exit 2
+    fi
+    attention=$H3_ATTENTION_BACKEND
+fi
+if [[ -v H3_ATTENTION_CONFIG && ! -v H3_ATTENTION_BACKEND ]]; then
+    echo "H3_ATTENTION_CONFIG requires H3_ATTENTION_BACKEND." >&2
+    exit 2
+fi
+if [[ "$attention" == ascend_sparse_attn && ! -v H3_ATTENTION_CONFIG ]]; then
+    echo "Supply the sparse policy explicitly, including the dense step counts." >&2
+    exit 2
+fi
 if [[ ${SGLANG_H3_LASER_SP8_PAD_HEADS:-0} == 1 ]]; then
     IFS=, read -r -a laser_devices <<< "$visible"
     if [[ ${#laser_devices[@]} != 16 ]]; then
@@ -77,25 +94,42 @@ decoder=${H3_LIGHTVAE:-/home/weights/LightVAE/lightvae-lite-h3-decoder.safetenso
 steps=${H3_STEPS:-4}
 port=${H3_PORT:-30088}
 merged=${H3_MERGED_FLASHGEN:-0}
-if [[ "$merged" == 1 ]]; then
+native=${H3_NATIVE_REFERENCE:-0}
+native_vae=${H3_NATIVE_VAE:-0}
+use_lora=1
+if [[ "$native" == 1 ]]; then
+    : "${H3_MODEL:?Set H3_MODEL to the undistilled native checkpoint}"
+    steps=${H3_STEPS:-50}
+    if [[ "$case_id" != B0 || "$steps" != 50 || "$merged" == 1 || -v H3_LORA ||
+        -v SGLANG_H3_DENOISE_RUNGS || "$attention" == ascend_sparse_attn ]]; then
+        echo "Native reference requires dense B0, 50 steps and no adapter or explicit rungs." >&2
+        exit 2
+    fi
+    use_lora=0
+elif [[ "$merged" == 1 ]]; then
     : "${H3_MODEL:?Set H3_MODEL to the merged FlashGen checkpoint}"
     [[ ! -v H3_LORA ]] || { echo "Merged FlashGen cannot also load a runtime LoRA." >&2; exit 2; }
+    use_lora=0
 fi
-if [[ ( "$merged" == 1 || "$lora" == "$flashgen" ) && "$steps" != 4 ]]; then
-    echo "FlashGen requires four steps. Supply the verified eight-step adapter and schedule." >&2
-    exit 2
+if [[ "$native" != 1 ]]; then
+    if [[ "$merged" == 1 || "$lora" == "$flashgen" ]]; then
+        [[ "$steps" == 4 ]] || { echo "FlashGen requires four steps." >&2; exit 2; }
+        export SGLANG_H3_DENOISE_RUNGS=1000,700,400,150
+    else
+        : "${SGLANG_H3_DENOISE_RUNGS:?Supply the verified adapter schedule in thousandths}"
+    fi
+    [[ "$steps" == 4 || "$steps" == 8 ]] || exit 2
+    IFS=, read -r -a rungs <<< "$SGLANG_H3_DENOISE_RUNGS"
+    [[ ${#rungs[@]} == "$steps" ]] || { echo "Step count and adapter schedule differ" >&2; exit 2; }
 fi
-if [[ "$merged" == 1 || "$lora" == "$flashgen" ]]; then
-    export SGLANG_H3_DENOISE_RUNGS=1000,700,400,150
-else
-    : "${SGLANG_H3_DENOISE_RUNGS:?Supply the verified adapter schedule in thousandths}"
-fi
-[[ -d "$model" && -r "$decoder" && ( "$merged" == 1 || -r "$lora" ) ]] || {
+[[ -d "$model" && ( "$native_vae" == 1 || -r "$decoder" ) &&
+    ( "$use_lora" == 0 || -r "$lora" ) ]] || {
     echo "Missing model, LoRA or LightVAE inside the container." >&2; exit 1;
 }
-[[ "$steps" == 4 || "$steps" == 8 ]] || exit 2
-IFS=, read -r -a rungs <<< "$SGLANG_H3_DENOISE_RUNGS"
-[[ ${#rungs[@]} == "$steps" ]] || { echo "Step count and adapter schedule differ" >&2; exit 2; }
+case ${H3_QUALITY:-lossless} in
+    exact|lossless) ;;
+    *) echo "H3_QUALITY must be exact or lossless." >&2; exit 2 ;;
+esac
 if [[ -v H3_WINDOW_POLICY ]]; then
     if [[ ${SGLANG_H3_WINDOW_MODE:-} != global-local || ! "$H3_WINDOW_POLICY" =~ ^[GL]+$ ||
         ${#H3_WINDOW_POLICY} != "$steps" || "$H3_WINDOW_POLICY" != *L* ]]; then
@@ -148,16 +182,23 @@ args=(sglang serve --model-path "$model" --model-type diffusion --model-variant 
     --pin-cpu-memory "${H3_PIN_CPU_MEMORY:-true}"
     --attention-backend "$attention" --warmup-steps "$steps" --warmup-mode server
     --enable-breakable-cuda-graph false --component-attention-backends video-vae=fa
-    --vae-config.decoder-tile-batch 2 --minimax-h3-lightvae-decoder-path "$decoder"
+    --vae-config.decoder-tile-batch 2
     --output-path "$output/server-media")
-if [[ "$merged" != 1 ]]; then
+if [[ "$use_lora" == 1 ]]; then
     args+=(--lora-path "$lora" --lora-scale 1.0 --lora-alpha "${H3_LORA_ALPHA:-64}")
+fi
+if [[ "$native_vae" != 1 ]]; then
+    args+=(--minimax-h3-lightvae-decoder-path "$decoder")
+fi
+if [[ -v H3_ATTENTION_CONFIG ]]; then
+    args+=(--attention-backend-config "$H3_ATTENTION_CONFIG")
 fi
 if [[ -v H3_FFN_ACTIVE_FRACTION ]]; then
     args+=(--minimax-h3-ffn-active-fraction "$H3_FFN_ACTIVE_FRACTION")
 fi
 printf '%q ' "${args[@]}" > "$output/launch.txt"
-printf '\nvisible_devices=%s\nrungs=%s\n' "$visible" "$SGLANG_H3_DENOISE_RUNGS" >> "$output/launch.txt"
+printf '\nvisible_devices=%s\nrungs=%s\nquality=%s\n' \
+    "$visible" "${SGLANG_H3_DENOISE_RUNGS:-native}" "${H3_QUALITY:-lossless}" >> "$output/launch.txt"
 printf 'laser_sp8_pad_heads=%s\n' "${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}" >> "$output/launch.txt"
 printf 'npu_adaln_memo=%s\n' "${SGLANG_H3_NPU_ADALN_MEMO:-default}" >> "$output/launch.txt"
 printf 'window_mode=%s\nwindow_policy=%s\nwindow_global_steps=%s\nwindow_overlap=%s\nmerged_flashgen=%s\n' \
@@ -217,7 +258,7 @@ payload = dict(model="MiniMaxAI/MiniMax-H3", prompt=os.getenv("H3_PROMPT", "Curr
                duration_seconds=duration), num_outputs_per_prompt=1, num_inference_steps=int(steps),
                flow_shift=float(os.getenv("H3_FLOW_SHIFT", "12")), audio_flow_shift=3.0,
                seed=int(os.getenv("H3_SEED", "1101")),
-               quality="lossless")
+               quality=os.getenv("H3_QUALITY", "lossless"))
 client = Client(f"http://127.0.0.1:{port}", int(os.getenv("H3_REQUEST_TIMEOUT", "1800")))
 (out / "request.json").write_text(json.dumps(payload, indent=2))
 profiling = os.getenv("H3_PROFILE") == "1"
@@ -265,7 +306,11 @@ if mode in ("local", "repack"):
 elif mode == "global-local":
     policy = os.getenv("SGLANG_H3_WINDOW_POLICY", "G" * global_steps + "L" * (steps - global_steps))
 evaluations = steps + (policy.count("L") if mode in ("local", "global-local") else 0)
-grid = [int(rung) / 1000 for rung in os.environ["SGLANG_H3_DENOISE_RUNGS"].split(",")] + [0]
+explicit_rungs = os.getenv("SGLANG_H3_DENOISE_RUNGS")
+if explicit_rungs is None:
+    grid = [1 - step / steps for step in range(steps + 1)]
+else:
+    grid = [int(rung) / 1000 for rung in explicit_rungs.split(",")] + [0]
 pattern = re.compile(
     r"mode=(\S+) scheduler_updates=(\d+) dit_evaluations=(\d+) "
     r"request=(\S+) phase=request policy=(\S+).* sigma_video=(\[.*?\]) sigma_audio=(\[.*?\])"

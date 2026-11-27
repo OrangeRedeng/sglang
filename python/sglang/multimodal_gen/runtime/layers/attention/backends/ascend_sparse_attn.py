@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 logger = init_logger(__name__)
 
@@ -337,7 +338,15 @@ class AscendSparseAttentionImpl(AttentionImpl):
                 self._dense_backend.__name__,
                 config["precision"],
             )
-        return self._dense_impl.forward(query, key, value, self._dense_metadata)
+        with maybe_record_function(
+            f"ascend_sparse_step_{metadata.current_timestep}_dense_"
+            f"{self._dense_backend.__name__}_{config['precision']}"
+        ):
+            if self._dense_uses_laser:
+                return self._dense_impl.forward(
+                    query, key, value, self._dense_metadata, preserve_bf16_range=True
+                )
+            return self._dense_impl.forward(query, key, value, self._dense_metadata)
 
     def _sparse_attention(self, query, key, value, metadata):
         if self.causal and metadata.sparse_type in ("rf_v2", "rf_v3"):
@@ -377,18 +386,22 @@ class AscendSparseAttentionImpl(AttentionImpl):
             metadata.sparse_type,
             metadata.precision,
         )
-        return torch.cat(
-            [
-                sparse_attention(
-                    query[index : index + 1].contiguous(),
-                    key[index : index + 1].contiguous(),
-                    value[index : index + 1].contiguous(),
-                    **options,
-                )
-                for index in range(query.shape[0])
-            ],
-            dim=0,
-        )
+        with maybe_record_function(
+            f"ascend_sparse_step_{metadata.current_timestep}_"
+            f"{metadata.sparse_type}_{metadata.precision}_block_{metadata.block_size}"
+        ):
+            return torch.cat(
+                [
+                    sparse_attention(
+                        query[index : index + 1].contiguous(),
+                        key[index : index + 1].contiguous(),
+                        value[index : index + 1].contiguous(),
+                        **options,
+                    )
+                    for index in range(query.shape[0])
+                ],
+                dim=0,
+            )
 
     def forward(self, query, key, value, attn_metadata):
         if not isinstance(attn_metadata, AscendSparseAttentionMetadata):

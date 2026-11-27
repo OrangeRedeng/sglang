@@ -187,8 +187,12 @@ class LaserAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
+        preserve_bf16_range: bool = False,
     ) -> torch.Tensor:
-        return self._forward_dense(query, key, value, attn_metadata)
+        return self._forward_dense(
+            query, key, value, attn_metadata, preserve_bf16_range=preserve_bf16_range
+        )
 
     def _forward_dense(
         self,
