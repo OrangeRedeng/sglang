@@ -33,6 +33,28 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def align_d1v3_kv_rows(cache_k: torch.Tensor, cache_v: Optional[torch.Tensor], loc_rows: int):
+    """Reconcile rank-local KV rows with the allocator-global loc width.
+
+    D1v3 can produce 26 real token rows with num_tokens_pad=32 while loc is
+    padded to 32, or a loc at 26 real rows after cache_k is already padded.
+    The scatter contract is strict: rows equal loc; pad at the tail or trim.
+    """
+    if cache_k.shape[0] < loc_rows:
+        missing = loc_rows - cache_k.shape[0]
+        cache_k = torch.cat((cache_k, cache_k.new_zeros((missing, *cache_k.shape[1:]))), dim=0)
+        if cache_v is not None:
+            cache_v = torch.cat((cache_v, cache_v.new_zeros((missing, *cache_v.shape[1:]))), dim=0)
+    elif cache_k.shape[0] > loc_rows:
+        cache_k = cache_k[:loc_rows]
+        if cache_v is not None:
+            cache_v = cache_v[:loc_rows]
+    assert cache_k.shape[0] == loc_rows
+    if cache_v is not None:
+        assert cache_v.shape[0] == loc_rows
+    return cache_k, cache_v
+
+
 def _mla_fia_nz_scatter_indices(
     loc: torch.Tensor, head_dim: int, page_size: int
 ) -> torch.Tensor:
@@ -1538,10 +1560,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # num_tokens rows. Trim to the loc width before the scatter;
         # a no-op for divisible batches and for base DCP.
         n_loc = loc.numel()
-        if cache_k.shape[0] > n_loc:
-            cache_k = cache_k[:n_loc]
-            if cache_v is not None:
-                cache_v = cache_v[:n_loc]
+        cache_k, cache_v = align_d1v3_kv_rows(cache_k, cache_v, n_loc)
+        try:
+            from sglang.srt.layers.attention.dsa.dsa_token_shard import ts_debug
+            ts_debug("kv_write", loc=loc, cache_k=cache_k, cache_v=cache_v)
+        except Exception:
+            pass
         if self.sfa_packed_kv_storage:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(

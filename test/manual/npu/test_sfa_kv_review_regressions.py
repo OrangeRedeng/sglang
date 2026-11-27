@@ -32,6 +32,39 @@ def compile_nodes(nodes, namespace):
 
 
 class TestSFAReview(unittest.TestCase):
+    def test_f2_activation_only_after_operator_success(self):
+        method = next(
+            node
+            for node in ast.walk(ast.parse(BACKEND.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "_dcp_packed_quant_sfa"
+        )
+        messages = []
+        def operator(**kwargs):
+            return torch.tensor([1])
+        namespace = dict(
+            torch=torch,
+            torch_npu=SimpleNamespace(npu_kv_quant_sparse_flash_attention=operator),
+            print_info_once=messages.append,
+        )
+        compile_nodes([method], namespace)
+        tensor = torch.ones((1, 1))
+        pool = SimpleNamespace(view_packed_sfa_rows=lambda rows: (tensor, tensor, tensor))
+        instance = SimpleNamespace(
+            token_to_kv_pool=pool,
+            _f2_quant_sfa_api_ok=lambda: (True, ""),
+            _f2_dequant_rows=lambda rows: ("fallback", "fallback"),
+            qk_rope_head_dim=1,
+        )
+        arguments = (instance, tensor, tensor, tensor, tensor, SimpleNamespace(scaling=1), tensor, tensor, 0)
+        result = namespace[method.name](*arguments)
+        self.assertTrue(torch.equal(result, torch.tensor([1])))
+        self.assertIn("F2 KV_QUANT_SFA read active", messages)
+        messages.clear()
+        namespace["torch_npu"].npu_kv_quant_sparse_flash_attention = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unsupported"))
+        self.assertEqual(namespace[method.name](*arguments), ("fallback", "fallback"))
+        self.assertNotIn("F2 KV_QUANT_SFA read active", messages)
+        self.assertTrue(any("F2 KV_QUANT_SFA read failed" in message for message in messages))
+
     def test_schema_uses_real_torch_argument_names(self):
         method = next(
             n

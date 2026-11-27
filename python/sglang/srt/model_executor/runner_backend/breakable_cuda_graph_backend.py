@@ -18,6 +18,8 @@ No torch.compile.
 
 from __future__ import annotations
 
+import logging
+
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -60,6 +62,9 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+
+logger = logging.getLogger(__name__)
 
 
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
@@ -302,6 +307,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             wait_for_layer_loads(self._model_runner.token_to_kv_pool)
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
+        from sglang.srt.hardware_backend.npu.besttp12 import enabled
+        if enabled("GRAPH_EVIDENCE") and get_parallel().tp_rank == 0:
+            prefix = static_forward_batch.extend_prefix_lens_cpu
+            prefix_max = max(prefix) if prefix is not None and len(prefix) else 0
+            logger.info("TP12 BCG REPLAY rows=%d prefix=%d", shape_key.size, int(prefix_max))
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

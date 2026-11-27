@@ -31,17 +31,619 @@ if TYPE_CHECKING:
 
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
+# ---------------------------------------------------------------------------
+# E92: persistent routing-metadata staging (opt-in, numerics-identical).
+# Replaces the per-call allocation of dtype-converted topk tensors with a
+# copy into leased persistent storage; consumption is stream-ordered on the
+# calling stream, so reuse across layers is safe without host sync. A
+# same-dtype source short-circuits to the source tensor, matching the
+# baseline no-op `.to()` behavior.
+# ---------------------------------------------------------------------------
+_META_STAGING = {}
+_META_COUNTS = {"staged": 0, "noop": 0, "allocations_avoided": 0}
+
+# ---------------------------------------------------------------------------
+# E102: native shared-expert fusion (wrapper bypass). The installed native
+# mega_moe operator exposes a quantized shared payload (shared_l{1,2}_weights,
+# ..._weights_sf, ..._bias) that Buffer.fused_deep_moe does not forward. When
+# enabled, the shared expert rides the fused dispatch/GEMM/combine call on the
+# rank-local rows and the separate shared GEMMs are skipped. Requires the G3
+# saved-prompt parity gate vs separate execution before any speed claim.
+# ---------------------------------------------------------------------------
+_SHARED_PREPARED = False
+_SHARED_PREP_REASON = "not attempted"
+
+
+def _native_shared_supported() -> bool:
+    return False
+
+
+def _shared_fusion_enabled() -> bool:
+    return envs.SGLANG_NPU_EP_SHARED_FUSION.get() and _native_shared_supported()
+
+
+def fuseep_shared_fusion_active() -> bool:
+    """True when fused shared execution is enabled AND at least one payload
+    was built. Diagnostic only: per-layer gating uses
+    ``fuseep_shared_fusion_active_for`` so a layer without its own payload
+    always runs its separate shared expert.
+    """
+    return _shared_fusion_enabled() and _SHARED_PREPARED
+
+
+def fuseep_shared_fusion_active_for(experts_module) -> bool:
+    """True when THIS MoE's shared expert rides the fused dispatch call.
+
+    Per-layer binding (r8): each DeepseekV2MoE has its own shared weights, so
+    the skip in ``_forward_shared_experts`` and the payload injection in
+    ``forward_fuseep`` must agree module-by-module. A layer whose payload
+    failed to prepare keeps its separate shared GEMMs.
+    """
+    return (
+        envs.SGLANG_NPU_EP_SHARED_W4_ROUTED.get()
+        and getattr(experts_module, "_fuseep_shared_w4", None) is not None
+    ) or (
+        _shared_fusion_enabled()
+        and getattr(experts_module, "_fuseep_shared_payload", None) is not None
+    )
+
+
+def _encode_shared_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Per-channel float scales -> the MegaMoE scale-bit uint64 encoding."""
+    return (
+        scale.reshape(-1)
+        .contiguous()
+        .view(torch.int32)
+        .to(torch.int64)
+        .bitwise_and(0xFFFFFFFF)
+        .view(torch.uint64)
+    )
+
+
+def _requantize_shared_w4(weight: torch.Tensor, scale: torch.Tensor):
+    if weight.dtype != torch.int8 or weight.ndim != 2 or weight.shape[1] % 8:
+        raise ValueError(
+            "shared W4 requires INT8 [inputs, channels] with channels divisible by 8"
+        )
+    scale = scale.detach().cpu().to(torch.float32).reshape(-1)
+    if (
+        scale.numel() != weight.shape[1]
+        or not torch.isfinite(scale).all()
+        or (scale < 0).any()
+    ):
+        raise ValueError("shared W4 requires finite nonnegative per-channel scales")
+    values = weight.detach().cpu().to(torch.float32)
+    maximum = values.abs().amax(dim=0).clamp_min(1.0)
+    quantized = (values * (7.0 / maximum)).round().clamp(-7, 7).to(torch.int8)
+    low = quantized[:, 0::2].bitwise_and(15).to(torch.uint8)
+    high = quantized[:, 1::2].bitwise_and(15).to(torch.uint8).bitwise_left_shift(4)
+    packed = low.bitwise_or(high).view(torch.int8).contiguous()
+    scale4 = (scale * maximum / 7.0).contiguous()
+    bias = (8.0 * quantized.to(torch.float32).sum(dim=0) * scale4).contiguous()
+    return packed, scale4, bias
+
+
+def _route_shared_w4(
+    topk_ids, topk_weights, local_experts, ep_size, ep_rank, shared_scale
+):
+    if local_experts <= 0 or ep_size <= 1 or not 0 <= ep_rank < ep_size:
+        raise ValueError("shared W4 routing requires valid EP geometry")
+    if (
+        topk_ids.ndim != 2
+        or topk_ids.shape != topk_weights.shape
+        or topk_ids.shape[1] >= 16
+    ):
+        raise ValueError(
+            "shared W4 routing requires matching top-k tensors with room for one expert"
+        )
+    if (local_experts + 1) * ep_size > 1024 or not 0.0 < shared_scale <= 1.0:
+        raise ValueError("shared W4 routing exceeds MegaMoE limits or has invalid scale")
+    remapped = torch.where(
+        topk_ids >= 0,
+        topk_ids + torch.div(topk_ids, local_experts, rounding_mode="floor"),
+        topk_ids,
+    )
+    shared_ids = topk_ids.new_full(
+        (topk_ids.shape[0], 1), ep_rank * (local_experts + 1) + local_experts
+    )
+    shared_weights = topk_weights.new_full((topk_weights.shape[0], 1), shared_scale)
+    shared_weights = torch.where(
+        (topk_ids >= 0).any(dim=1, keepdim=True), shared_weights, 0.0
+    )
+    return torch.cat((remapped, shared_ids), dim=1), torch.cat(
+        (topk_weights, shared_weights), dim=1
+    )
+
+
+def _prepare_shared_projection(
+    proj,
+    channels: int,
+    inputs: int,
+    label: str,
+    output_scale: float,
+):
+    """Convert one shared linear (INT8 per-channel) to the expert payload format.
+
+    ``output_scale`` pre-divides the dequant scales: the fused shared output
+    rides inside the routed rows, which the epilogue still multiplies by
+    routed_scaling_factor (fused_in_topk is False on this stack). Dividing
+    the fp32 scales is exact and leaves the INT8 weights untouched — the
+    same 1/routed_scaling_factor convention the fused-slot topk kernel uses.
+    """
+    if not 0.0 < output_scale <= 1.0:
+        raise ValueError(f"shared {label} needs a positive inverse output scale")
+    weight = getattr(proj, "weight", None)
+    scale = getattr(proj, "weight_scale", None)
+    if weight is None or scale is None:
+        raise ValueError(f"shared {label} lacks INT8 weight/scale attributes")
+    shape = tuple(weight.shape)
+    if weight.dtype != torch.int8 or shape not in ((inputs, channels), (channels, inputs)):
+        raise ValueError(
+            f"shared {label} weight expected INT8 {(inputs, channels)} or "
+            f"{(channels, inputs)}, got {shape} {weight.dtype}"
+        )
+    # Loaded NPU W8A8 linears are already [inputs, channels] (transposed and
+    # format-cast by prepare_w8a8_int8_linear_weights); raw checkpoints are
+    # [channels, inputs]. The operator wants [inputs, channels].
+    if shape == (inputs, channels):
+        operator_weight = weight.data
+        if not operator_weight.is_contiguous():
+            operator_weight = operator_weight.contiguous()
+    else:
+        operator_weight = weight.data.transpose(0, 1).contiguous()
+    # r10 evidence (20261121-221805-151653): all 1200 layer-preps rejected
+    # here with the bare "finite positive" message -- the dtype term refused
+    # fp16/bf16 device scales without saying which condition failed. Cast
+    # float scales to fp32 (numerically exact for small positive values) and
+    # name the failing term when rejection is genuine.
+    if scale.dtype in (torch.float16, torch.bfloat16):
+        scale = scale.to(torch.float32)
+    scale = scale.reshape(-1)
+    finite = bool(torch.isfinite(scale).all().item())
+    nonneg = not bool((scale < 0).any().item())
+    if tuple(scale.shape) != (channels,) or not finite or not nonneg:
+        raise ValueError(
+            f"shared {label} scales unusable: shape={tuple(scale.shape)} "
+            f"(want {(channels,)}), finite={finite}, nonnegative={nonneg}, "
+            f"min={float(scale.min()) if scale.numel() else None}"
+        )
+    offset = getattr(proj, "weight_offset", None)
+    if offset is not None and torch.count_nonzero(offset).item():
+        # A nonzero zero-point cannot fold into a constant *_bias: its correction
+        # depends on the per-row input sum. Hard incompatibility, not a knob.
+        raise ValueError(f"shared {label} has nonzero weight_offset")
+    return {
+        "weights": npu_format_cast(operator_weight),
+        "weights_sf": _encode_shared_scale(scale.data * output_scale),
+        "bias": None,
+    }
+
+
+def _check_shared_geometry(hidden: int, intermediate: int) -> None:
+    """The native operator's shared-geometry envelope (same as routed)."""
+    if (
+        not 1024 <= intermediate <= 3072
+        or intermediate % 512
+        or not 1024 <= hidden <= 8192
+        or hidden % 512
+    ):
+        raise ValueError(
+            f"shared geometry outside MegaMoE limits "
+            f"(hidden={hidden}, intermediate={intermediate})"
+        )
+
+
+def prepare_fuseep_shared_w4(moe_module):
+    shared = moe_module.shared_experts
+    experts = moe_module.experts
+    if shared is None or getattr(moe_module, "num_fused_shared_experts", 0):
+        raise ValueError("shared W4 requires separate shared experts")
+    if not getattr(experts, "_mega_moe_weights_processed", False):
+        raise ValueError("shared W4 requires processed MegaMoE weights")
+    local_experts = experts.num_local_experts
+    ep_size = experts.moe_ep_size
+    if experts.moe_tp_size != 1 or experts.num_experts != local_experts * ep_size:
+        raise ValueError("shared W4 requires uniform EP experts and MoE TP=1")
+    _check_shared_geometry(experts.hidden_size, experts.intermediate_size_per_partition)
+    if (local_experts + 1) * ep_size > 1024:
+        raise ValueError("shared W4 exceeds MegaMoE expert limit")
+    output_scale = (
+        1.0
+        if moe_module.routed_scaling_factor_fused_in_topk
+        else 1.0 / float(moe_module.routed_scaling_factor)
+    )
+    if not 0.0 < output_scale <= 1.0:
+        raise ValueError("shared W4 requires a supported routed output scale")
+    prepared = {}
+    for prefix, proj, inputs, channels in (
+        (
+            "w13", shared.gate_up_proj, experts.hidden_size,
+            2 * experts.intermediate_size_per_partition,
+        ),
+        (
+            "w2", shared.down_proj,
+            experts.intermediate_size_per_partition, experts.hidden_size,
+        ),
+    ):
+        weight = proj.weight.data
+        if weight.dtype != torch.int8 or tuple(weight.shape) not in (
+            (inputs, channels), (channels, inputs)
+        ):
+            raise ValueError(f"shared W4 {prefix} has incompatible weight shape or dtype")
+        if tuple(weight.shape) != (inputs, channels):
+            weight = weight.transpose(0, 1)
+        offset = getattr(proj, "weight_offset", None)
+        if offset is not None and torch.count_nonzero(offset).item():
+            raise ValueError(f"shared W4 {prefix} has nonzero offset")
+        linear_bias = getattr(proj, "bias", None)
+        if linear_bias is not None and torch.count_nonzero(linear_bias).item():
+            raise ValueError(f"shared W4 {prefix} has unsupported linear bias")
+        packed, scale, bias = _requantize_shared_w4(weight, proj.weight_scale)
+        device = weight.device
+        for suffix in ("weight", "weight_scale", "scale_bias"):
+            value = getattr(experts, f"{prefix}_{suffix}")
+            if not isinstance(value, list) or len(value) != local_experts:
+                raise ValueError(
+                    f"shared W4 requires one {prefix}_{suffix} per routed expert"
+                )
+        prepared[f"{prefix}_weight"] = npu_format_cast(packed.to(device)).view(torch.int32)
+        prepared[f"{prefix}_weight_scale"] = _encode_shared_scale(scale.to(device))
+        prepared[f"{prefix}_scale_bias"] = bias.to(device)
+    for name, value in prepared.items():
+        setattr(experts, name, [*getattr(experts, name), value])
+    experts._fuseep_shared_w4 = dict(local_experts=local_experts, scale=output_scale)
+
+
+def prepare_fuseep_shared_payload(moe_module) -> str:
+    """Build the native shared payload from a DeepseekV2MoE/GLM MoE module.
+
+    Stores the result on the experts layer as ``_fuseep_shared_payload`` and
+    returns "" on success or a human-readable incompatibility reason.
+    """
+    global _SHARED_PREPARED, _SHARED_PREP_REASON
+    if not _shared_fusion_enabled():
+        _SHARED_PREP_REASON = (
+            "native shared fusion is unverified: CANN 9.2.0-beta.2 A3 "
+            "MegaMoE does not pass shared inputs to its compute kernel"
+            if envs.SGLANG_NPU_EP_SHARED_FUSION.get()
+            else "SGLANG_NPU_EP_SHARED_FUSION disabled"
+        )
+        return _SHARED_PREP_REASON
+    if getattr(moe_module, "_fuseep_shared_attempted", False):
+        return _SHARED_PREP_REASON
+    moe_module._fuseep_shared_attempted = True
+    try:
+        shared = moe_module.shared_experts
+        experts = moe_module.experts
+        if shared is None or getattr(moe_module, "num_fused_shared_experts", 0):
+            raise ValueError("no separate shared experts on this module")
+        # The epilogue multiplies the merged routed rows by routed_scaling
+        # factor when the factor is not folded into topk (True on this NPU
+        # W4A8 stack). Pre-divide the shared scales so the epilogue brings
+        # the shared contribution back to its true magnitude.
+        if getattr(moe_module, "routed_scaling_factor_fused_in_topk", False):
+            output_scale = 1.0
+        else:
+            output_scale = 1.0 / float(moe_module.routed_scaling_factor)
+        intermediate = experts.intermediate_size_per_partition
+        hidden = experts.hidden_size
+        _check_shared_geometry(hidden, intermediate)
+        payload = {
+            "l1": _prepare_shared_projection(
+                shared.gate_up_proj, 2 * intermediate, hidden, "gate_up", output_scale
+            ),
+            "l2": _prepare_shared_projection(
+                shared.down_proj, hidden, intermediate, "down", output_scale
+            ),
+        }
+        experts._fuseep_shared_payload = payload
+        # NOTE (r8): no global binding here. forward_fuseep selects this
+        # module's payload on every call; a global "last prepared wins"
+        # binding is exactly the cross-layer weight-reuse bug r7 rejected.
+        _SHARED_PREPARED = True
+        _SHARED_PREP_REASON = ""
+        from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+        # r13: this is native mixed precision. Routed weights stay W4A8,
+        # shared weights stay W8A8; no shared re-quantization or W4→W8
+        # conversion is performed. CANN receives separate shared_weight1/2
+        # List[Tensor] payloads through the adapter.
+        evidence(
+            "ep-shared-fusion-payload",
+            hidden=int(hidden),
+            intermediate=int(intermediate),
+            output_scale=output_scale,
+            shared_quant="w8a8-native-mixed-w4a8-routed",
+            requantized=False,
+        )
+        logging.getLogger(__name__).warning(
+            "A3 MEGAMOE SHARED_FUSION payload prepared (fused shared execution)"
+        )
+    except (AttributeError, ValueError, RuntimeError) as exc:
+        _SHARED_PREP_REASON = f"{type(exc).__name__}: {exc}"
+        logging.getLogger(__name__).warning(
+            "A3 MEGAMOE SHARED_FUSION payload incompatible: %s", _SHARED_PREP_REASON
+        )
+    return _SHARED_PREP_REASON
+
+
+def shared_payload_reason() -> str:
+    return _SHARED_PREP_REASON
+
+
+SHARED_KWARGS = {
+    "shared_l1_weights", "shared_l1_weights_sf", "shared_l1_bias",
+    "shared_l2_weights", "shared_l2_weights_sf", "shared_l2_bias",
+    "shared_weight1", "shared_weight1_scale", "shared_weight1_sf", "shared_weight1_bias",
+    "shared_weight2", "shared_weight2_scale", "shared_weight2_sf", "shared_weight2_bias",
+}
+# ---------------------------------------------------------------------------
+# E102 (r8): per-layer payload binding. The adapter injects whatever payload
+# was last selected for the CURRENT forward; ``forward_fuseep`` selects its
+# own module's payload (or clears the slot) before every fused call, so no
+# layer can inherit another layer's shared weights. Serving forwards are
+# sequential on the scheduler thread; the slot is never read concurrently.
+# ---------------------------------------------------------------------------
+_ACTIVE_PAYLOAD = {"l1": {}, "l2": {}}
+
+
+def _set_active_payload(payload) -> None:
+    _ACTIVE_PAYLOAD["l1"] = payload["l1"]
+    _ACTIVE_PAYLOAD["l2"] = payload["l2"]
+
+
+def _clear_active_payload() -> None:
+    _ACTIVE_PAYLOAD["l1"] = {}
+    _ACTIVE_PAYLOAD["l2"] = {}
+
+
+def select_layer_payload(layer) -> bool:
+    """Bind ``layer``'s prepared shared payload for its next fused call.
+
+    Returns True when this layer's shared expert is fused; otherwise clears
+    the active slot so the adapter passes the native call through untouched
+    (and the layer's separate shared GEMMs must run).
+    """
+    if not _shared_fusion_enabled():
+        return False
+    payload = getattr(layer, "_fuseep_shared_payload", None)
+    if payload is None:
+        _clear_active_payload()
+        return False
+    _set_active_payload(payload)
+    return True
+
+
+def _adapt_shared_fusion_operator(operator):
+    """Wrap the native mega_moe so the registered shared payload is injected.
+
+    The DeepEP strategy calls mega_moe with its fixed keyword set; the shared
+    parameters are declared by the native operator but never passed by the
+    wrapper. This adapter adds them from the active payload at call time.
+    """
+    signature = inspect.signature(operator)
+    accepted = {
+        name
+        for name, p in signature.parameters.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    missing = SHARED_KWARGS - accepted
+    if missing == SHARED_KWARGS:
+        raise RuntimeError(
+            "native mega_moe accepts none of the shared payload parameters"
+        )
+
+    @wraps(operator)
+    def inject_shared(*args, **kwargs):
+        if _shared_fusion_enabled() and _ACTIVE_PAYLOAD["l1"]:
+            payload1 = _ACTIVE_PAYLOAD["l1"]
+            payload2 = _ACTIVE_PAYLOAD["l2"]
+
+            # CANN r12 smoke proves the native operator has two schemas:
+            # r12 Python signature names (shared_l1_*) and the runtime
+            # alias names (shared_weight1/2). For weight arguments, native
+            # schema requires Optional[List[Tensor]], not a bare Tensor.
+            for name in accepted:
+                if name in ("shared_l1_weights", "shared_l1_weight", "shared_weight1"):
+                    kwargs[name] = [payload1["weights"]]
+                elif name in ("shared_l1_weights_sf", "shared_l1_weight_sf", "shared_weight1_scale", "shared_weight1_sf"):
+                    kwargs[name] = [payload1["weights_sf"]]
+                elif name in ("shared_l1_bias", "shared_weight1_bias"):
+                    # W8A8 shared experts have no compensation bias. For
+                    # native CANN aliases, None is the correct Optional[List]
+                    # value; [None] would be a real list of a null tensor.
+                    kwargs[name] = None
+                elif name in ("shared_l2_weights", "shared_l2_weight", "shared_weight2"):
+                    kwargs[name] = [payload2["weights"]]
+                elif name in ("shared_l2_weights_sf", "shared_l2_weight_sf", "shared_weight2_scale", "shared_weight2_sf"):
+                    kwargs[name] = [payload2["weights_sf"]]
+                elif name in ("shared_l2_bias", "shared_weight2_bias"):
+                    kwargs[name] = None
+            from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+            evidence("ep-shared-fusion-injected")
+        return operator(*args, **kwargs)
+
+    inject_shared.__signature__ = signature
+    inject_shared._sglang_shared_fusion = True
+    return inject_shared
+
+
+def _meta_reuse_enabled() -> bool:
+    return envs.SGLANG_NPU_EP_META_REUSE.get()
+
+
+def _stage_routing_meta(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.dtype == dtype:
+        _META_COUNTS["noop"] += 1
+        return tensor
+    key = (str(tensor.device), dtype, tuple(tensor.shape))
+    buffer = _META_STAGING.get(key)
+    if buffer is None:
+        buffer = torch.empty(tuple(tensor.shape), dtype=dtype, device=tensor.device)
+        _META_STAGING[key] = buffer
+    else:
+        _META_COUNTS["allocations_avoided"] += 1
+    buffer.copy_(tensor)
+    _META_COUNTS["staged"] += 1
+    if _META_COUNTS["staged"] == 1 or _META_COUNTS["staged"] % 4096 == 0:
+        # Throttled server.log activation evidence for the runner's grep.
+        logging.getLogger(__name__).info(
+            "TP12 ACTIVE ep-meta-staging %s",
+            json.dumps(fuseep_meta_evidence(), sort_keys=True),
+        )
+    return buffer
+
+
+def fuseep_meta_evidence() -> dict:
+    """Aggregate staging counters for the runner's per-phase collection."""
+    return dict(_META_COUNTS, buffers=len(_META_STAGING), enabled=_meta_reuse_enabled())
+
+
+# ---------------------------------------------------------------------------
+# E93: cached DeepEP buffer geometry/lifecycle validation (correctness guard,
+# never a speed arm). A cached buffer returned for mismatched geometry is a
+# stale-communicator hazard; fail loudly instead of serving through it.
+# ---------------------------------------------------------------------------
+def _buffer_validate_enabled() -> bool:
+    return envs.SGLANG_NPU_EP_BUFFER_VALIDATE.get()
+
+
+def _validate_fuseep_buffer(state, group, hidden_size, num_experts, capacity):
+    if not _buffer_validate_enabled():
+        return
+    problems = []
+    if state.hidden_size != hidden_size:
+        problems.append(
+            f"hidden_size cached={state.hidden_size} requested={hidden_size}"
+        )
+    if state.num_experts != num_experts:
+        problems.append(
+            f"num_experts cached={state.num_experts} requested={num_experts}"
+        )
+    if (
+        state.num_max_dispatch_tokens_per_rank != capacity
+        and state.num_max_dispatch_tokens_per_rank is not None
+    ):
+        problems.append(
+            "num_max_dispatch_tokens_per_rank cached="
+            f"{state.num_max_dispatch_tokens_per_rank} requested={capacity}"
+        )
+    if problems:
+        raise RuntimeError(
+            "Cached DeepEP buffer geometry mismatch; coordinate a rebuild "
+            "outside live operations: " + "; ".join(problems)
+        )
+
+
+def probe_shared_fusion_abi() -> dict:
+    """E94: conservative shared-expert fusion ABI probe (host-only).
+
+    The fusion arm may only run when the INSTALLED operator stack exposes a
+    complete shared-expert payload contract (python wrapper AND native
+    operator, with quantization/scale support for the shared path). A missing
+    ABI is an explicit skip, never a silent fallback. Log-only probe; the
+    runner decides from the returned JSON.
+    """
+    result = {"eligible": False, "reasons": []}
+    try:
+        import deep_ep
+        from cann_ops_transformer.ops import mega_moe
+
+        wrapper_shared = sorted(
+            n
+            for n in inspect.signature(
+                deep_ep.Buffer.fused_deep_moe
+            ).parameters
+            if "shared" in n.lower()
+        )
+        operator_shared = sorted(
+            n
+            for n in inspect.signature(mega_moe).parameters
+            if "shared" in n.lower()
+        )
+        result["wrapper_shared_params"] = wrapper_shared
+        result["operator_shared_params"] = operator_shared
+        if not wrapper_shared:
+            result["reasons"].append(
+                "Buffer.fused_deep_moe exposes no shared-expert payload parameters"
+            )
+        if not operator_shared:
+            result["reasons"].append(
+                "native mega_moe exposes no shared-expert payload parameters"
+            )
+        quant_support = [
+            n
+            for n in operator_shared
+            if "scale" in n or "quant" in n or n.endswith("_sf")
+        ]
+        result["operator_shared_quant_params"] = quant_support
+        if operator_shared and not quant_support:
+            result["reasons"].append(
+                "shared payload lacks quantization/scale parameters; W4A8 routed "
+                "+ quantized shared cannot share one fused call"
+            )
+        # A BF16 input signature does not establish the on-wire dtype: MegaMoE
+        # may quantize internally before dispatch.
+        wrapper_params = list(
+            inspect.signature(deep_ep.Buffer.fused_deep_moe).parameters
+        )
+        input_quant = sorted(
+            n
+            for n in wrapper_params
+            if n.startswith("x_") or "input_scale" in n or "input_quant" in n
+        )
+        result["external_prequantized_input_params"] = input_quant
+        result["internal_dispatch_quantization"] = "not established by signature"
+        if not input_quant:
+            result["reasons"].append(
+                "fused_deep_moe exposes no explicit prequantized-input "
+                "parameters; internal dispatch precision is unverified"
+            )
+        if wrapper_shared and operator_shared and quant_support:
+            # Contract shape present; runtime adoption still requires the full
+            # G3 shared/merge parity gates before any speed claim.
+            result["eligible"] = True
+            result["reasons"].append(
+                "ABI present; G3 shared/merge parity gates remain mandatory"
+            )
+    except Exception as exc:  # noqa: BLE001 - probe reports, never crashes startup
+        result["reasons"].append(f"probe failed: {type(exc).__name__}: {exc}")
+    logging.getLogger(__name__).warning(
+        "A3 MEGAMOE SHARED_FUSION_ABI %s", json.dumps(result, sort_keys=True)
+    )
+    return result
+
 
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
-    return DeepEPBuffer.get_deepep_buffer(
+    state = DeepEPBuffer._state()
+    reused = state.buffer is not None
+    num_experts = layer.num_experts + (layer.moe_ep_size if getattr(layer, "_fuseep_shared_w4", None) else 0)
+    buffer = DeepEPBuffer.get_deepep_buffer(
         get_parallel().moe_ep_group.device_group,
         layer.hidden_size,
         _PARAMS_BYTES,
         DeepEPMode.LOW_LATENCY,
         envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
-        layer.num_experts,
+        num_experts,
     )
+    _validate_fuseep_buffer(
+        state,
+        get_parallel().moe_ep_group.device_group,
+        layer.hidden_size,
+        num_experts,
+        envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
+    )
+    logging.getLogger(__name__).debug(
+        "A3 FuseEP buffer %s hidden=%d experts=%d capacity=%d",
+        "reused" if reused else "created",
+        layer.hidden_size,
+        num_experts,
+        envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
+    )
+    return buffer
 
 
 def forward_fuseep(
@@ -49,11 +651,15 @@ def forward_fuseep(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
 ) -> torch.Tensor:
+    # E102 (r8): bind (or clear) this layer's shared payload before any
+    # fused call so the adapter injects exactly this layer's weights.
+    select_layer_payload(layer)
     mode = get_exec().moe.fuseep_mode
     if mode == 3:
         capacity = _mega_moe_capacity()
+        rows = hidden_states.shape[0]
         _log_mega_moe_geometry(
-            hidden_states.shape[0],
+            rows,
             hidden_states.shape[1],
             capacity,
             layer.moe_ep_size,
@@ -61,30 +667,85 @@ def forward_fuseep(
         )
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError("FuseEP mode 3 requires BF16 hidden states")
-        if hidden_states.shape[0] > capacity:
-            raise ValueError(
-                f"FuseEP mode 3 input has {hidden_states.shape[0]} tokens, exceeding "
-                f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity}"
-            )
         if not getattr(layer, "_mega_moe_weights_processed", False):
             raise RuntimeError("FuseEP mode 3 expert weights have not been prepared")
         buffer = _prepare_mega_moe_buffer(_get_fuseep_buffer(layer))
+        if _meta_reuse_enabled():
+            topk_idx = _stage_routing_meta(topk_output.topk_ids, torch.int32)
+            topk_weights = _stage_routing_meta(topk_output.topk_weights, torch.float32)
+        else:
+            topk_idx = topk_output.topk_ids.to(torch.int32)
+            topk_weights = topk_output.topk_weights.to(torch.float32)
+        shared_w4 = getattr(layer, "_fuseep_shared_w4", None)
+        num_experts = layer.num_experts
+        if shared_w4 is not None:
+            if not envs.SGLANG_NPU_EP_SHARED_W4_ROUTED.get():
+                raise RuntimeError("prepared shared W4 slot requires its runtime flag")
+            topk_idx, topk_weights = _route_shared_w4(
+                topk_idx, topk_weights, shared_w4["local_experts"],
+                layer.moe_ep_size, layer.moe_ep_rank, shared_w4["scale"]
+            )
+            num_experts += layer.moe_ep_size
+        # E101: wide-chunk sliced dispatch. Rows beyond the registered
+        # capacity run as consecutive capacity-sized fused calls (same RDMA
+        # buffer, no geometry rebuild); outputs concatenate in row order.
+        if rows > capacity:
+            if not envs.SGLANG_NPU_EP_SLICED_DISPATCH.get():
+                raise ValueError(
+                    f"FuseEP mode 3 input has {rows} tokens, exceeding "
+                    f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity}; "
+                    "enable SGLANG_NPU_EP_SLICED_DISPATCH for sliced dispatch"
+                )
+            from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+            evidence(
+                "ep-sliced-dispatch",
+                rows=int(rows),
+                slices=int((rows + capacity - 1) // capacity),
+            )
+            out_parts = []
+            for start in range(0, rows, capacity):
+                chunk_rows = min(capacity, rows - start)
+                part, _ = buffer.fused_deep_moe(
+                    x=hidden_states[start : start + chunk_rows],
+                    topk_idx=topk_idx[start : start + chunk_rows],
+                    topk_weights=topk_weights[start : start + chunk_rows],
+                    gmm1_permuted_weight=layer.w13_weight,
+                    gmm1_permuted_weight_scale=layer.w13_weight_scale,
+                    gmm2_weight=layer.w2_weight,
+                    gmm2_weight_scale=layer.w2_weight_scale,
+                    num_max_dispatch_tokens_per_rank=capacity,
+                    num_experts=num_experts,
+                    fuse_mode=3,
+                    quant_mode=1,
+                    activation="swiglu",
+                    l1_bias=getattr(layer, "w13_scale_bias", None),
+                    l2_bias=getattr(layer, "w2_scale_bias", None),
+                )
+                out_parts.append(part)
+            if shared_w4 is not None:
+                from sglang.srt.hardware_backend.npu.besttp12 import evidence
+                evidence("ep-shared-w4-routed")
+            return torch.cat(out_parts, dim=0)
         hidden_states, _ = buffer.fused_deep_moe(
             x=hidden_states,
-            topk_idx=topk_output.topk_ids.to(torch.int32),
-            topk_weights=topk_output.topk_weights.to(torch.float32),
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             gmm1_permuted_weight=layer.w13_weight,
             gmm1_permuted_weight_scale=layer.w13_weight_scale,
             gmm2_weight=layer.w2_weight,
             gmm2_weight_scale=layer.w2_weight_scale,
             num_max_dispatch_tokens_per_rank=capacity,
-            num_experts=layer.num_experts,
+            num_experts=num_experts,
             fuse_mode=3,
             quant_mode=1,
             activation="swiglu",
             l1_bias=getattr(layer, "w13_scale_bias", None),
             l2_bias=getattr(layer, "w2_scale_bias", None),
         )
+        if shared_w4 is not None:
+            from sglang.srt.hardware_backend.npu.besttp12 import evidence
+            evidence("ep-shared-w4-routed")
         return hidden_states
 
     buf = _get_fuseep_buffer(layer)
@@ -167,7 +828,13 @@ def _adapt_mega_moe_operator(operator):
 
 def _prepare_mega_moe_buffer(buffer):
     ops = _check_mega_moe_support()
-    if not getattr(ops[1], "_sglang_legacy_swiglu", False):
+    needs_strategy_patch = getattr(ops[1], "_sglang_legacy_swiglu", False)
+    if _shared_fusion_enabled():
+        # Install the shared-payload injection even when the operator natively
+        # accepts activation_params (no legacy adapter needed).
+        ops = (ops[0], _adapt_shared_fusion_operator(ops[1]))
+        needs_strategy_patch = True
+    if not needs_strategy_patch:
         return buffer
     from deep_ep.buffer import FuseMode
 
@@ -297,11 +964,15 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
     if getattr(layer, "_mega_moe_weights_processed", False):
         return
     kernels = (layer.w13_kernel, layer.w2_kernel)
+    # r14: routed routed projections are homogeneous with each other, while
+    # the shared projections can legitimately remain W8A8. Mixed routed/shared
+    # support is native-MegaMoE: no shared re-quantization; the shared payload
+    # contributes through the shared_weight1/2 List[Tensor] ABI.
     if type(kernels[0]) is not type(kernels[1]) or type(kernels[0]) not in (
         NPUW4A8Int8MoEMethod,
         NPUW8A8Int8MoEMethod,
     ):
-        raise ValueError("FuseEP mode 3 requires homogeneous ModelSlim W4A8/W8A8 INT")
+        raise ValueError("FuseEP mode 3 requires W4A8/W8A8 routed kernels")
     w4a8 = isinstance(kernels[0], NPUW4A8Int8MoEMethod)
     if w4a8 and any(
         not kernel.is_per_channel_weight or kernel.activation_use_clip
@@ -318,8 +989,8 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
         or config.gemm1_clamp_limit is not None
     ):
         raise ValueError("FuseEP mode 3 currently requires ordinary SwiGLU")
-    if layer.num_fused_shared_experts:
-        raise ValueError("FuseEP mode 3 requires separate shared experts")
+    # r14: separate shared experts are allowed. Their native W8A8 payload is
+    # carried through shared_weight1/2 and never re-quantized to W4A8.
     ep = layer.moe_ep_size
     if layer.moe_tp_size != 1 or ep not in (2, 4, 8, 16, 32, 64):
         raise ValueError("A3 FuseEP mode 3 requires MoE TP=1 and EP=2/4/8/16/32/64")

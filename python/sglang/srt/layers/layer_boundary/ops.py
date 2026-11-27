@@ -118,6 +118,49 @@ def attn_tp_gather_input(
     if isinstance(hidden_states, GatheredInput):
         return hidden_states.value
     parallel = get_parallel()
+    # E126 (r15, from E120's blocking traceback): under the DSA token-shard
+    # rebuild the FFN output is this rank's plan.rows slice -- plan.rows is
+    # uniform ceil(num_tokens/tp) on every rank, but the local DP buffer the
+    # plain gather allocates is sized by a wider rule, so all_gather_into_
+    # tensor rejects it ("output tensor size must be equal to world_size
+    # times input tensor size", ERR02001 -- the r12/r13/r14 nightly killer).
+    # Reconcile: pad this rank's rows to plan.rows, gather into a buffer of
+    # plan.rows * tp, then trim the padding back off. plan.num_tokens_pad is
+    # the width the next attention's own slice/restore expects.
+    if getattr(forward_batch, "npu_dsa_cp_token_sharded", False) and not isinstance(
+        hidden_states, tuple
+    ):
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            get_dsa_token_shard_plan,
+        )
+
+        plan = get_dsa_token_shard_plan(forward_batch)
+        if hidden_states.shape[0] > plan.rows:
+            raise RuntimeError(
+                "E126 token-shard gather received "
+                f"{hidden_states.shape[0]} rows, wider than this rank's "
+                f"plan.rows={plan.rows}; the rebuild's stage widths have "
+                "diverged"
+            )
+        missing = plan.rows - hidden_states.shape[0]
+        if missing > 0:
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros((missing, *hidden_states.shape[1:]))],
+                dim=0,
+            )
+        gathered = hidden_states.new_empty(
+            (plan.rows * parallel.attn_tp_size, *hidden_states.shape[1:])
+        )
+        attn_tp_all_gather_into_tensor(gathered, hidden_states)
+        from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+        evidence(
+            "ep-shard-gather-reconciled",
+            rows=int(plan.rows),
+            tokens=int(plan.num_tokens),
+            tp=int(parallel.attn_tp_size),
+        )
+        return gathered[: plan.num_tokens_pad]
     if isinstance(hidden_states, tuple):
         gathered_hidden_states = []
         for local_hidden_states in hidden_states:

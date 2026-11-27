@@ -182,6 +182,13 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    online_quantization: A[
+        Optional[str],
+        Arg(
+            help="Optional A2/A3 INT8 experiment: TARGET:w8a8_dynamic, with targets "
+            "gate, shared_expert, qkv or dense. Offline quantized weights are preserved.",
+        ),
+    ] = None
     quantization_param_path: A[
         Optional[str],
         Arg(

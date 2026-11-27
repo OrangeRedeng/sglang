@@ -447,6 +447,12 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.besttp12 import shared_activation
+            fused = shared_activation(self, gate_up)
+            if fused is not None:
+                return fused
+
         if self.use_fused_clamp_act_mul and not self._fused_clamp_fp8_checked:
             _hip_act.resolve_fused_clamp_route(self, gate_up.shape[-1] // 2)
 
@@ -576,6 +582,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if _is_npu and getattr(self, "_tp12_role", None) == "gate":
+            return self.quant_method.apply(self, hidden_states).float()
+
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 
@@ -1122,23 +1131,40 @@ class DeepseekV2MoE(nn.Module):
             dsa_cp_set_current_token_sharded,
         )
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.besttp12_graph import clear_input
+            clear_input()
         dsa_cp_set_current_token_sharded(token_sharded)
-        if token_sharded:
+        if token_sharded and not self._enable_a2a_moe:
+            # TP-MoE form (PR6/PR7): quantize the slice, all-gather INT8 +
+            # per-token scale, dequantize -- the TP-over-experts GEMM needs
+            # every token on every rank.
+            #
+            # E112 (EP): under an a2a MoE the dispatch itself redistributes
+            # rows (and MegaMoE quantizes internally), so the full-width
+            # rebuild must NOT run -- the rank's slice goes straight to the
+            # dispatch and the residual stays token-sharded. The rebuild's
+            # attention features (streamed weights) still engage; only the
+            # MoE-input gather is skipped.
             import torch_npu
 
-            group = get_parallel().attn_tp_group
             x_q, x_scale = torch_npu.npu_dynamic_quant(
                 hidden_states, dst_type=torch.int8
             )
-            x_q_full = x_q.new_empty(
-                (x_q.shape[0] * group.world_size,) + x_q.shape[1:]
-            )
-            group.all_gather_into_tensor(x_q_full, x_q)
-            x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
-            group.all_gather_into_tensor(x_scale_full, x_scale)
+            from sglang.srt.hardware_backend.npu.besttp12_graph import gather_input, publish_input
+            x_q_full, x_scale_full = gather_input(x_q, x_scale)
+            publish_input(x_q_full, x_scale_full, hidden_states.dtype)
             hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
                 -1
             ).to(hidden_states.dtype)
+        elif token_sharded and self._enable_a2a_moe:
+            # E112: EP-adapted path -- no full-width rebuild. The slice feeds
+            # the dispatch directly; the streamed attention weights above stay
+            # engaged. The marker proves the flag took this path (flag !=
+            # activation).
+            from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+            evidence("ep-token-shard-direct", rows=int(hidden_states.shape[0]))
 
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
@@ -1412,7 +1438,15 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
-    def forward_normal(
+    def forward_normal(self, hidden_states, *args, **kwargs):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.besttp12 import input_scope
+            from sglang.srt.hardware_backend.npu.besttp12_graph import take_input
+            with input_scope(take_input()):
+                return self._forward_normal_tp12(hidden_states, *args, **kwargs)
+        return self._forward_normal_tp12(hidden_states, *args, **kwargs)
+
+    def _forward_normal_tp12(
         self,
         hidden_states: torch.Tensor,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -1427,6 +1461,26 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.besttp12_graph import shared_overlap
+            with shared_overlap(self, hidden_states, skip_shared_experts, gemm_output_zero_allocator) as overlapped:
+                if overlapped is None:
+                    return self._forward_normal_tp12_body(hidden_states, gemm_output_zero_allocator,
+                        input_ids, input_ids_global, skip_shared_experts, use_vision_topk,
+                        return_moe_output, leave_output_sum)
+                output = self._forward_normal_tp12_body(hidden_states, gemm_output_zero_allocator,
+                    input_ids, input_ids_global, True, use_vision_topk, True, False)
+            output = output._replace(shared=overlapped)
+            if return_moe_output or leave_output_sum:
+                return output
+            return self._finalize_normal_output(output.get_merged(), overlapped)
+        return self._forward_normal_tp12_body(hidden_states, gemm_output_zero_allocator,
+            input_ids, input_ids_global, skip_shared_experts, use_vision_topk,
+            return_moe_output, leave_output_sum)
+
+    def _forward_normal_tp12_body(self, hidden_states, gemm_output_zero_allocator=None,
+        input_ids=None, input_ids_global=None, skip_shared_experts=False,
+        use_vision_topk=False, return_moe_output=False, leave_output_sum=False):
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1436,9 +1490,9 @@ class DeepseekV2MoE(nn.Module):
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
             pre_quant_input = (
-                None
-                if skip_shared_experts
-                else self._maybe_quant_moe_input_once(hidden_states)
+                self._maybe_quant_moe_input_once(hidden_states)
+                if _is_npu or not skip_shared_experts
+                else None
             )
             if (
                 not defer_shared
@@ -1650,6 +1704,14 @@ class DeepseekV2MoE(nn.Module):
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
+                    if _is_npu:
+                        from sglang.srt.hardware_backend.npu.besttp12 import (
+                            evidence,
+                        )
+
+                        evidence(
+                            "ep-shared-overlap", rows=int(hidden_states.shape[0])
+                        )
                     if is_in_breakable_cuda_graph():
                         # The MoE call below is an eager break, so record
                         # and wait must share one capture; joining here means
@@ -1846,10 +1908,24 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.fuseep import (
+                fuseep_shared_fusion_active_for,
+            )
+
+            if fuseep_shared_fusion_active_for(self.experts):
+                # E102: THIS layer's shared expert rides the native fused call;
+                # its output is merged by the operator. No separate GEMMs, no
+                # separate add (the routed rows already contain it). A layer
+                # whose payload failed to prepare keeps its separate GEMMs.
+                return None
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is None and _is_hip:
                 # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.besttp12 import input_for_shared
+                pre_quant_input = input_for_shared(self.shared_experts, hidden_states)
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops
@@ -1957,6 +2033,14 @@ class DeepseekV2MoE(nn.Module):
         and the routed dispatch, or return None when ineligible."""
         if hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16:
             return None
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.besttp12 import enabled
+            if enabled("INPUT_REUSE"):
+                from sglang.srt.hardware_backend.npu.besttp12_graph import current_input
+                operand = current_input()
+                if operand is not None:
+                    operand.validate(hidden_states.shape)
+                    return operand
         if not self._moe_quant_once_enabled():
             return None
         if is_in_tc_piecewise_cuda_graph():
@@ -2512,6 +2596,24 @@ class DeepseekV2AttentionMLA(
         return k_nope, k_pe
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        input_on_attn_tp_slices: bool = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ):
+        from sglang.srt.hardware_backend.npu.besttp12 import enabled
+        if _is_npu and enabled("BCG_ATTENTION_ISLAND"):
+            from sglang.srt.hardware_backend.npu.bcg_attention import attention
+            return attention(self, positions, hidden_states, forward_batch, zero_allocator,
+                input_on_attn_tp_slices, llama_4_scaling, prev_topk_indices)
+        return self._forward_npu_bcg_body(positions, hidden_states, forward_batch, zero_allocator,
+            input_on_attn_tp_slices, llama_4_scaling, prev_topk_indices)
+
+    def _forward_npu_bcg_body(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,

@@ -953,12 +953,16 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
         dsa_cp_reduce_scatter_tokens,
     )
 
-    if dsa_cp_is_current_token_sharded():
-        # D1v3: the residual is token-sharded, so each rank only needs its own
-        # rows of the summed MoE output. The reduce is the same sum the
-        # all-reduce computes; the scatter drops the other ranks' rows, which
-        # nobody consumes (the shared expert's partial was added before this
-        # point, so it is reduced in the same collective).
+    if dsa_cp_is_current_token_sharded() and get_moe_a2a_backend().is_none():
+        # D1v3 (TP-MoE only): the residual is token-sharded, so each rank only
+        # needs its own rows of the summed MoE output. The reduce is the same
+        # sum the all-reduce computes; the scatter drops the other ranks' rows,
+        # which nobody consumes (the shared expert's partial was added before
+        # this point, so it is reduced in the same collective).
+        #
+        # E112: under an a2a (EP) MoE the combine already returns complete
+        # local rows -- a reduce-scatter here would sum over the wrong group.
+        # Fall through to the normal EP/MoE-TP reduction instead.
         return dsa_cp_reduce_scatter_tokens(hidden_states)
     parallel = get_parallel()
     return _post_experts_sum(

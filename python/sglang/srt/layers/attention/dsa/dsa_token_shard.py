@@ -24,6 +24,9 @@ Composes with the indexer's query sharding
 which ``test_dsa_token_shard_indexer_row_agreement.py`` pins.
 """
 
+import json
+import logging
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
@@ -42,6 +45,52 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+# ---------------------------------------------------------------------------
+# E120 seam diagnostics (SGLANG_NPU_TOKEN_SHARD_DEBUG): the r8-r10 shard-arm
+# crashes are ASYNC vector-core faults (507035) that surface at a later sync
+# point, so the traceback names a victim H2D copy, never the faulting kernel.
+# These one-per-seam logs record shape/dtype/finiteness at every rebuild seam
+# so the first crashing layer's last healthy tensor is identifiable in
+# server.log without a debugger. Off by default; first 3 hits per seam.
+# ---------------------------------------------------------------------------
+_TS_LOGGER = logging.getLogger(__name__)
+_TS_DEBUG_CACHE: Dict[str, bool] = {}
+_TS_SEEN: Dict[str, int] = {}
+_TS_DEBUG_HITS = 3
+
+
+def _ts_debug_enabled() -> bool:
+    if "on" not in _TS_DEBUG_CACHE:
+        _TS_DEBUG_CACHE["on"] = (
+            os.environ.get("SGLANG_NPU_TOKEN_SHARD_DEBUG", "False").lower()
+            in ("1", "true")
+        )
+    return _TS_DEBUG_CACHE["on"]
+
+
+def _ts_desc(value) -> str:
+    if not isinstance(value, torch.Tensor):
+        return repr(value)[:80]
+    finite = ""
+    if value.numel() and value.is_floating_point():
+        finite = f',finite={bool(torch.isfinite(value).all())}'
+    return f"{tuple(value.shape)} {value.dtype}{finite}"
+
+
+def ts_debug(seam: str, **tensors) -> None:
+    """Log one seam's tensor facts; a no-op unless the env is set."""
+    if not _ts_debug_enabled():
+        return
+    seen = _TS_SEEN.get(seam, 0)
+    if seen >= _TS_DEBUG_HITS:
+        return
+    _TS_SEEN[seam] = seen + 1
+    _TS_LOGGER.info(
+        "TSDBG %s %s",
+        seam,
+        json.dumps({k: _ts_desc(v) for k, v in tensors.items()}, sort_keys=True),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -270,6 +319,16 @@ def dsa_token_shard_cumulative_lens(
             torch.tensor(cumulative(plan.key_lens), dtype=torch.int32, device=device),
         )
         forward_batch.npu_dsa_token_shard_cu_lens = cached
+        # r10 crash site (async 507035 surfaced at this H2D sync): log the plan
+        # so the victim sync and the plan that produced it are tied together.
+        ts_debug(
+            "cu_lens",
+            tokens=plan.num_tokens,
+            pad=plan.num_tokens_pad,
+            rows=plan.rows,
+            query_lens=plan.query_lens[:4],
+            key_lens=plan.key_lens[:4],
+        )
     return cached
 
 
@@ -279,8 +338,11 @@ def dsa_token_shard_slice(x: torch.Tensor, plan: DsaTokenShardPlan) -> torch.Ten
     sliced = x[plan.local_start : plan.local_end]
     missing = plan.rows - sliced.shape[0]
     if missing <= 0:
-        return sliced
-    return torch.cat([sliced, sliced.new_zeros((missing, *x.shape[1:]))], dim=0)
+        out = sliced
+    else:
+        out = torch.cat([sliced, sliced.new_zeros((missing, *x.shape[1:]))], dim=0)
+    ts_debug("slice", inp=x, out=out, rows=plan.rows, start=plan.local_start)
+    return out
 
 
 def dsa_token_shard_redistribute_heads(
@@ -306,8 +368,12 @@ def dsa_token_shard_redistribute_heads(
     # npu_transpose_batchmatmul.
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
-    parallel.attn_tp_group.all_to_all_single(recv, send)
-    return recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
+    ts_debug("redist.send", send=send)
+    from sglang.srt.hardware_backend.npu.besttp12_graph import collective_into
+    collective_into("all_to_all_single", recv, send)
+    out = recv.permute(1, 0, 2, 3).reshape(plan.rows, tp * h, d)
+    ts_debug("redist.recv", out=out)
+    return out
 
 
 def dsa_token_shard_restore_tokens(
@@ -334,10 +400,12 @@ def dsa_token_shard_restore_tokens(
     )
     send = x.reshape(plan.rows, tp, h, d).permute(1, 0, 2, 3).contiguous()
     recv = torch.empty_like(send)
-    parallel.attn_tp_group.all_to_all_single(recv, send)
+    from sglang.srt.hardware_backend.npu.besttp12_graph import collective_into
+    collective_into("all_to_all_single", recv, send)
     out = recv.reshape(plan.num_tokens_pad, h, d)[:num_rows]
     if num_rows > plan.num_tokens:
         out[plan.num_tokens :].zero_()
+    ts_debug("restore", out=out, num_rows=num_rows)
     return out
 
 
@@ -425,7 +493,8 @@ def dsa_cp_reduce_scatter_tokens(x: torch.Tensor) -> torch.Tensor:
         )
     rows = x.shape[0] // tp
     out = x.new_empty((rows,) + x.shape[1:])
-    parallel.attn_tp_group.reduce_scatter_tensor(out, x)
+    from sglang.srt.hardware_backend.npu.besttp12_graph import collective_into
+    collective_into("reduce_scatter_tensor", out, x)
     return out
 
 
@@ -443,7 +512,6 @@ def dsa_cp_gather_last_token_rows(x: torch.Tensor, forward_batch) -> torch.Tenso
     slices are contiguous blocks: local_start = rank*rows). Trim the
     trailing pad to [num_tokens, hidden].
     """
-    parallel = get_parallel()
     plan = get_dsa_token_shard_plan(forward_batch)
     if plan is None:
         raise RuntimeError(
@@ -451,7 +519,8 @@ def dsa_cp_gather_last_token_rows(x: torch.Tensor, forward_batch) -> torch.Tenso
             "plan but it is gone"
         )
     full = x.new_empty((plan.num_tokens_pad,) + x.shape[1:])
-    parallel.attn_tp_group.all_gather_into_tensor(full, x)
+    from sglang.srt.hardware_backend.npu.besttp12_graph import collective_into
+    collective_into("all_gather_into_tensor", full, x)
     return full[: plan.num_tokens]
 
 
@@ -481,7 +550,12 @@ def dsa_cp_redistribute_heads_async(
         x = torch.cat([x, x.new_zeros((missing, h, d))], dim=0)
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
-    work = parallel.attn_tp_group.all_to_all_single_async(recv, send)
+    from sglang.srt.hardware_backend.npu.besttp12_graph import collective_into, is_in_breakable_cuda_graph
+    if is_in_breakable_cuda_graph():
+        collective_into("all_to_all_single", recv, send)
+        work = None
+    else:
+        work = parallel.attn_tp_group.all_to_all_single_async(recv, send)
     return recv, work, send
 
 

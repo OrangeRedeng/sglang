@@ -399,6 +399,9 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     return q_pe, k_pe
 
 
+_NARROW_A2A_REPORTED = False
+
+
 def _dsa_token_shard_narrow_plan(m: "DeepseekV2AttentionMLA", forward_batch):
     """The token-shard plan when the narrow exchange applies, else None. Absent
     full weights (the loader declined) put the layer back on the wide path."""
@@ -794,6 +797,12 @@ def forward_dsa_prepare_npu(
             q_swapped = dsa_token_shard_redistribute_heads(
                 torch.cat([q_nope, q_pe], dim=-1), narrow_plan
             )
+            global _NARROW_A2A_REPORTED
+            if not _NARROW_A2A_REPORTED:
+                from sglang.srt.hardware_backend.npu.besttp12 import evidence
+
+                evidence("ep-attention-narrow-a2a")
+                _NARROW_A2A_REPORTED = True
             q_nope, q_pe = q_swapped.split(
                 [m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1
             )

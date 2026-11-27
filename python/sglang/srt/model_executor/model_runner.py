@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -1378,13 +1379,15 @@ class ModelRunner:
                 "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but the attention-TP "
                 "size is 1; there is no token grid to shard"
             )
-        if not get_moe_a2a_backend().is_none():
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.is_none() and not envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED_EP.get():
             raise ValueError(
-                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED requires the MoE to run "
-                "tensor-parallel (a2a backend none/ascend_tp): the rebuild "
-                "gathers the quantized MoE input back to full width before "
-                "the dispatch, which expert parallelism replaces with a token "
-                "dispatch -- a different design"
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but the MoE runs an "
+                "a2a backend (EP); the TP rebuild gathers the MoE input back "
+                "to full width before dispatch. Set "
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED_EP=1 for the E112 "
+                "EP-adapted path (slice feeds dispatch directly; streamed "
+                "attention weights stay engaged)"
             )
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             raise ValueError(
@@ -1733,6 +1736,68 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
+        online_quantization = get_model().online_quantization
+        if online_quantization:
+            if self.device != "npu":
+                raise ValueError("This online INT8 experiment requires NPU")
+            from sglang.srt.hardware_backend.npu.besttp12 import convert_online
+            convert_online(self.model, online_quantization)
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.besttp12 import (
+                _ensure_dump_registered,
+                shared_eligibility_inventory,
+            )
+
+            _ensure_dump_registered()
+            shared_eligibility_inventory(self.model)
+            if os.environ.get("SGLANG_NPU_EP_SHARED_W4_ROUTED", "").lower() in ("1", "true"):
+                if os.environ.get("SGLANG_NPU_EP_SHARED_FUSION", "").lower() in ("1", "true"):
+                    raise ValueError("native and routed shared fusion cannot be enabled together")
+                from sglang.srt.hardware_backend.npu.moe.fuseep import prepare_fuseep_shared_w4
+                from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+                prepared = 0
+                for module in self.model.modules():
+                    if isinstance(module, DeepseekV2MoE):
+                        prepare_fuseep_shared_w4(module)
+                        prepared += 1
+                if not prepared:
+                    raise ValueError("shared W4 experiment found no DeepseekV2MoE layers")
+                logger.warning("A3 MEGAMOE SHARED_W4_ROUTED prepared %d layers", prepared)
+            if os.environ.get("SGLANG_NPU_EP_SHARED_FUSION", "").lower() in (
+                "1",
+                "true",
+            ):
+                # E102 (r8): build each MoE layer's native shared payload after
+                # weight processing. Per-module attempted flags keep a failed
+                # layer on its separate shared GEMMs (see select_layer_payload).
+                from sglang.srt.hardware_backend.npu.moe.fuseep import (
+                    prepare_fuseep_shared_payload,
+                )
+                from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+                prepared = failed = 0
+                for module in self.model.modules():
+                    if isinstance(module, DeepseekV2MoE):
+                        if prepare_fuseep_shared_payload(module) == "":
+                            prepared += 1
+                        else:
+                            failed += 1
+                logger.warning(
+                    "A3 MEGAMOE SHARED_FUSION prep: %d layers prepared, "
+                    "%d kept separate shared experts",
+                    prepared,
+                    failed,
+                )
+            if os.environ.get("SGLANG_NPU_EP_SHARED_FUSION_PROBE", "").lower() in (
+                "1",
+                "true",
+            ):
+                from sglang.srt.hardware_backend.npu.moe.fuseep import (
+                    probe_shared_fusion_abi,
+                )
+
+                probe_shared_fusion_abi()
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
@@ -2127,6 +2192,14 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        # Graph dummy batches bypass the normal global-slot translator.
+        if (
+            _is_npu
+            and get_parallel().dcp_enabled
+            and not self.is_draft_worker
+            and getattr(forward_batch, "origin_out_cache_loc", None) is None
+        ):
+            forward_batch.origin_out_cache_loc = forward_batch.out_cache_loc
         # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
         forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
             forward_batch._forward_num_tokens()

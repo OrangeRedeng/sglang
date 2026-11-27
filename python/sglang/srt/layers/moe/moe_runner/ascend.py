@@ -363,26 +363,36 @@ def pre_permute_standard_to_ascend(
             "Ascend MoE routing requires a standard top-k output, got "
             f"{type(topk_output).__name__}."
         )
-    if dispatch_output.hidden_states_pre_quant is not None:
-        raise NotImplementedError(
-            "Ascend MoE routing quantizes inside npu_moe_init_routing_v2 and "
-            "cannot consume a pre-quantized routed input."
-        )
+    operand = dispatch_output.hidden_states_pre_quant
+    if operand is not None:
+        from sglang.srt.hardware_backend.npu.besttp12 import Int8Operand
+        if not isinstance(operand, Int8Operand):
+            raise NotImplementedError("Ascend requires a validated INT8 operand")
+        operand.validate(dispatch_output.hidden_states.shape)
 
     layer = _routing_layer(runner_config)
     hidden_states = dispatch_output.hidden_states
+    # Routing-weight precision is deliberately IDENTICAL in the reuse and
+    # control arms: INPUT_REUSE must isolate operand staging only. Any
+    # routing-precision experiment is a separate, explicitly labeled arm.
     topk_weights = topk_output.topk_weights.to(hidden_states.dtype)
     topk_ids = topk_output.topk_ids.to(torch.int32)
 
     quant_mode, tp_all_gather, group_list_type = ascend_dispatch.get_routing(layer)
 
+    if operand is not None and quant_mode != INT8_QUANT_MODE:
+        raise ValueError("INT8 operand requires INT8 routing")
     routed = npu_moe_init_routing(
-        hidden_states,
+        operand.data if operand is not None else hidden_states,
         topk_ids,
         runner_config.num_experts,
         quant_mode=quant_mode,
+        scale=operand.scale if operand is not None else None,
         active_num=topk_ids.numel(),
     )
+    if operand is not None:
+        from sglang.srt.hardware_backend.npu.besttp12 import evidence
+        evidence("routing-input-reuse")
 
     running_state["ascend_routing"] = {
         "expanded_row_idx": routed.expanded_row_idx,

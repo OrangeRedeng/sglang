@@ -538,14 +538,22 @@ class DSANPUIndexerMixin:
             )
             # BUG 14: under D1v3 positions is row-sliced [rows] but
             # dcp_origin_out_cache_loc is full batch width [num_tokens];
-            # compare against the plan's full token count instead.
+            # compare against the plan's widths instead.
+            # r10 fix (evidence 20261121-204344-3c063b, E112/E113 crashes):
+            # the allocator-global loc carries the PADDED batch width
+            # (plan.num_tokens_pad -- e.g. 26 real tokens -> 32 at
+            # attn_tp 16), not the real-token count BUG 14 demanded; the
+            # exact-equality assert killed every healthy shard arm at its
+            # first real prefill. Accept either width; the BUG-10 trim
+            # below already reconciles k to the loc's actual width.
             if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
-                _expected = get_dsa_token_shard_plan(forward_batch).num_tokens
+                _plan = get_dsa_token_shard_plan(forward_batch)
+                _expected = (_plan.num_tokens, _plan.num_tokens_pad)
             else:
-                _expected = positions.shape[0]
-            assert indexer_cache_loc.shape[0] == _expected, (
+                _expected = (positions.shape[0],)
+            assert indexer_cache_loc.shape[0] in _expected, (
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
-                f"length: {indexer_cache_loc.shape[0]} != {_expected}"
+                f"length: {indexer_cache_loc.shape[0]} not in {_expected}"
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None

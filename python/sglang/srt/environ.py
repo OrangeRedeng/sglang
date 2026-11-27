@@ -1297,6 +1297,18 @@ class Envs:
     # untouched (it already consumes this rank's queries + the rank-local top-k).
     # OFF; requires NPU, a DSA model, attn TP size > 1, and MoE running TP.
     SGLANG_NPU_DSA_CP_TOKEN_SHARDED = EnvBool(False)
+    # E112: allow the D1v3 token-sharded rebuild to compose with an a2a (EP)
+    # MoE. Under EP the MoE-input all-gather is skipped (the rank's token
+    # slice feeds the dispatch directly) and the post-experts reduce-scatter
+    # falls back to the EP reduction; the rebuild's attention features
+    # (streamed weight gathers) stay engaged. Requires
+    # SGLANG_NPU_DSA_CP_TOKEN_SHARDED=1.
+    SGLANG_NPU_DSA_CP_TOKEN_SHARDED_EP = EnvBool(False)
+    # E120: per-seam shape/dtype/finiteness logs through the token-shard
+    # rebuild (slice / redistribute / restore / cu_lens). The r8-r10 crashes
+    # are async 507035 vector-core faults whose tracebacks name a victim sync,
+    # not the faulting kernel; these logs bracket the culprit.
+    SGLANG_NPU_TOKEN_SHARD_DEBUG = EnvBool(False)
     # DSA-CP token sharding (D1v3): run q_b_proj at full width (every rank
     # computes every query head) instead of the head-sharded projection.
     # Version B of the DSA-CP Q all-to-all removal. Mutually exclusive with
@@ -1697,6 +1709,22 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # A3 FuseEP experiment: persistent routing-metadata staging reuse (E92).
+    # Numerics-identical; counts staging hits for activation evidence.
+    SGLANG_NPU_EP_META_REUSE = EnvBool(False)
+    # A3 FuseEP correctness guard (E93): validate the cached DeepEP buffer's
+    # geometry against every request; mismatch fails loudly instead of
+    # serving through a stale communicator. Default on.
+    SGLANG_NPU_EP_BUFFER_VALIDATE = EnvBool(True)
+    # A3 FuseEP E102: native shared-expert fusion via wrapper bypass. Payload
+    # scales pre-divided by routed_scaling_factor (epilogue applies it);
+    # requires G3 saved-prompt parity before any speed claim.
+    SGLANG_NPU_EP_SHARED_FUSION = EnvBool(False)
+    SGLANG_NPU_EP_SHARED_W4_ROUTED = EnvBool(False)
+    # A3 FuseEP E101: sliced wide-chunk dispatch. Rows beyond the registered
+    # capacity run as consecutive capacity-sized fused calls; enables chunk
+    # 65536 without doubling the DeepEP RDMA buffer.
+    SGLANG_NPU_EP_SLICED_DISPATCH = EnvBool(False)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
