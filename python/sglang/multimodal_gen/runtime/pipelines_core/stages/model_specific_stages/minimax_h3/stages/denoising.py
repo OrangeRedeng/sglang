@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFAMetadata,
     AscendFAMetadataBuilder,
@@ -59,7 +60,11 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    StageProfiler,
+    capture_memory_snapshot,
+)
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 logger = init_logger(__name__)
 
@@ -1255,20 +1260,34 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     @contextmanager
     def _profile_denoising_step(self, step_index: int, *, batch: Req):
+        step_name = f"denoising_step_{step_index}"
+        trace_npu = current_platform.is_npu() and batch.profile and not batch.is_warmup
         with (
-            maybe_nvtx_range(
-                f"denoising_step_{step_index}",
-                self.current_use_nvtx,
-            ),
+            maybe_nvtx_range(step_name, self.current_use_nvtx),
+            maybe_record_function(step_name, enabled=trace_npu),
             StageProfiler(
-                f"denoising_step_{step_index}",
+                step_name,
                 logger=logger,
                 metrics=batch.metrics,
                 perf_dump_path_provided=batch.perf_dump_path is not None,
                 record_as_step=True,
             ),
         ):
+            if trace_npu:
+                rank = get_world_rank()
+                before = capture_memory_snapshot().to_dict()
             yield
+            if trace_npu:
+                logger.info(
+                    "H3 NPU step memory request=%s rank=%d step=%d before=%s after=%s",
+                    batch.request_id,
+                    rank,
+                    step_index + 1,
+                    before,
+                    capture_memory_snapshot().to_dict(),
+                    main_process_only=False,
+                    local_main_process_only=False,
+                )
 
     def _forward_dit(
         self,
