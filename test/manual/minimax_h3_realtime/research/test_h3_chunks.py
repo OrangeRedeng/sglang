@@ -40,6 +40,7 @@ def config(tmp_path, mode="continuation"):
 
 def test_real_request_plan_and_native_minimum(tmp_path):
     cfg = config(tmp_path)
+    cfg["request"].update(seconds=5, fps=24, num_frames=124)
     tasks = chunks.plan(cfg)
     assert len(tasks) == 3
     assert tasks[-1].stop == 362
@@ -49,10 +50,9 @@ def test_real_request_plan_and_native_minimum(tmp_path):
         request = chunks.payload(
             cfg, task, [chunks.keyframe(tmp_path / "input.png", 0)]
         )
-        assert type(request["seconds"]) is int
+        assert {"seconds", "fps", "num_frames"}.isdisjoint(request)
         assert request["task"] == "fl2va"
         assert request["seed"] == 1101 + task.index
-        assert request["num_frames"] == task.sampled_frames
         assert 4 <= request["target"]["duration_seconds"] <= 15
 
 

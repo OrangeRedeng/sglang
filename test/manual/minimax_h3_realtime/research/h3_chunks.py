@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -133,15 +134,14 @@ def extract_frame(video, index, image, timeout):
 
 def payload(config, task, conditions):
     result = dict(config["request"])
+    for field in ("seconds", "fps", "num_frames"):
+        result.pop(field, None)
     target = dict(result["target"])
     # Ask for the native frame bin without exceeding the public 15-second cap.
     duration = min(15, max(4, (task.sampled_frames - 1) / 24))
     target.update(duration_seconds=duration)
     result.update(
         target=target,
-        seconds=int(round(duration)),
-        fps=24,
-        num_frames=task.sampled_frames,
         task="fl2va" if conditions else "t2va",
         conditions=conditions,
         num_outputs_per_prompt=1,
@@ -172,8 +172,17 @@ class Client:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=min(30, self.timeout)) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(
+                request, timeout=min(30, self.timeout)
+            ) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read(4096).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"{method} {path} returned HTTP {error.code}: {detail or error.reason}"
+            ) from error
 
     def generate(self, request, destination, cancelled):
         job = self.json("POST", "/v1/videos", request)
