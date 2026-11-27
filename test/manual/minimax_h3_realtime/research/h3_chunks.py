@@ -9,11 +9,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 from prototypes import execute_chunks, windows
 from runner import probe_media, save
+
+
+DEVICE_BUDGET_BY_MODE = {"continuation": 16, "anchor_parallel": 8}
 
 
 def plan(config):
@@ -25,8 +29,9 @@ def plan(config):
             "expected_canvas must contain two positive 32-aligned dimensions"
         )
     mode = config["mode"]
-    if mode not in ("continuation", "anchor_parallel"):
+    if mode not in DEVICE_BUDGET_BY_MODE:
         raise ValueError("mode must be continuation or anchor_parallel")
+    budget = DEVICE_BUDGET_BY_MODE[mode]
     if not math.isfinite(config["duration_s"]) or config["duration_s"] <= 0:
         raise ValueError("duration_s must be positive and finite")
     total = math.ceil(config["duration_s"] * 24)
@@ -60,12 +65,12 @@ def plan(config):
     if (
         not groups
         or any(not group for group in groups)
-        or len(devices) > 8
+        or len(devices) > budget
         or len(set(devices)) != len(devices)
         or len(set(urls)) != len(urls)
     ):
         raise ValueError(
-            "Endpoints need unique URLs and disjoint nonempty groups within eight NPUs"
+            f"Endpoints need unique URLs and disjoint nonempty groups within {budget} NPUs"
         )
     if any(type(device) is not int or device < 0 for device in devices):
         raise ValueError("Device IDs must be nonnegative integers")
@@ -133,15 +138,14 @@ def extract_frame(video, index, image, timeout):
 
 def payload(config, task, conditions):
     result = dict(config["request"])
+    for field in ("seconds", "fps", "num_frames"):
+        result.pop(field, None)
     target = dict(result["target"])
     # Ask for the native frame bin without exceeding the public 15-second cap.
     duration = min(15, max(4, (task.sampled_frames - 1) / 24))
     target.update(duration_seconds=duration)
     result.update(
         target=target,
-        seconds=int(round(duration)),
-        fps=24,
-        num_frames=task.sampled_frames,
         task="fl2va" if conditions else "t2va",
         conditions=conditions,
         num_outputs_per_prompt=1,
@@ -172,8 +176,17 @@ class Client:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=min(30, self.timeout)) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(
+                request, timeout=min(30, self.timeout)
+            ) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read(4096).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"{method} {path} returned HTTP {error.code}: {detail or error.reason}"
+            ) from error
 
     def generate(self, request, destination, cancelled):
         job = self.json("POST", "/v1/videos", request)
@@ -333,7 +346,10 @@ def generate(config, directory):
         return record
 
     records = execute_chunks(
-        tasks, [endpoint["devices"] for endpoint in config["endpoints"]], adapter
+        tasks,
+        [endpoint["devices"] for endpoint in config["endpoints"]],
+        adapter,
+        budget=DEVICE_BUDGET_BY_MODE[config["mode"]],
     )
     output = concatenate(
         [Path(record["committed"]) for record in records], directory, timeout

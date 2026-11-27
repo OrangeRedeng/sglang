@@ -34,6 +34,9 @@ This executes native H3 HTTP jobs and muxes one AV output; latent-tail reuse and
 global RoPE continuation remain unimplemented. Executed NFE is not exposed by the
 HTTP API and remains unverified.
 
+See the [H01 night agent handoff](H01_NIGHTLY.md) to recover saved A3 timings
+and run one missing sample against the pinned deployment.
+
 ## Start a campaign
 
 Run from the repository root, using the intended deployment Python environment:
