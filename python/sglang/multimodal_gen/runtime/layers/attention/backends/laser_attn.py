@@ -149,10 +149,10 @@ class LaserAttentionImpl(AttentionImpl):
         qseqlen: int,
         head_dim: int,
     ) -> torch.Tensor:
+        attention_out = attention_out[:, :, :qseqlen, :head_dim]
         if dtype != attention_out.dtype:
             attention_out = attention_out.to(dtype)
 
-        attention_out = attention_out[:, :, :qseqlen, :head_dim]
         attention_out = attention_out.transpose(1, 2).contiguous()
         return attention_out
 

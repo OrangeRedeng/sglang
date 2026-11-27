@@ -289,13 +289,19 @@ class AscendSparseAttentionImpl(AttentionImpl):
         self._dense_backend = AscendFABackend
         self._dense_uses_laser = False
         if not self._is_a5 and not causal and num_kv_heads in (None, num_heads):
-            from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
-                LaserAttentionBackend,
-            )
-
-            if head_size in LaserAttentionBackend.get_supported_head_sizes():
-                self._dense_backend = LaserAttentionBackend
-                self._dense_uses_laser = True
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                    LaserAttentionBackend,
+                )
+            except ImportError:
+                logger.warning_once(
+                    "Laser Attention is unavailable; using Ascend FA for dense "
+                    "steps in MindIE-SD sparse attention."
+                )
+            else:
+                if head_size in LaserAttentionBackend.get_supported_head_sizes():
+                    self._dense_backend = LaserAttentionBackend
+                    self._dense_uses_laser = True
         self._dense_config_key = None
         self._dense_impl = None
         self._dense_metadata = None
