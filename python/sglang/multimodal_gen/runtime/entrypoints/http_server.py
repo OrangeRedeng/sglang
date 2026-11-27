@@ -136,7 +136,6 @@ async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
         await run_async_client_warmup(
             server_args,
             async_scheduler_client.forward,
-            fail_open=server_args.warmup_resolutions is None,
             check_backend=check_backend,
         )
         # A worker can exit after replying, before the periodic monitor runs.
@@ -148,7 +147,7 @@ async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
         if not async_scheduler_client.failure_reason:
-            async_scheduler_client.mark_failed(str(e))
+            async_scheduler_client.mark_failed(f"Server warmup failed: {e}")
         warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
@@ -729,6 +728,7 @@ def create_app(
             warmup_done is not None
             and not warmup_done.is_set()
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
+            and not async_scheduler_client.failure_reason
         ):
             await warmup_done.wait()
             if async_scheduler_client.failure_reason:

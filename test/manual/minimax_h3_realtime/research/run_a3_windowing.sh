@@ -8,8 +8,8 @@ if [[ ${1:-} != --inside ]]; then
     script=test/manual/minimax_h3_realtime/research/run_a3_windowing.sh
     command -v docker >/dev/null || { echo "Run this on the A3 Docker host." >&2; exit 1; }
     env_args=()
-    for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_PORT H3_B3_DEVICES \
-        H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
+    for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
+        H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
     done
@@ -71,6 +71,21 @@ command -v ffprobe >/dev/null
 if curl -sS --max-time 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
     echo "Port $port is occupied." >&2; exit 1
 fi
+master_port=$(python3 - "${H3_MASTER_PORT:-0}" "$port" <<'PY'
+import socket
+import sys
+
+requested, http_port = map(int, sys.argv[1:])
+if requested == http_port:
+    sys.exit("The rendezvous and HTTP ports must differ.")
+with socket.socket() as listener:
+    try:
+        listener.bind(("127.0.0.1", requested))
+    except OSError as error:
+        sys.exit(f"Cannot use H3_MASTER_PORT={requested}: {error}")
+    print(listener.getsockname()[1])
+PY
+)
 mkdir -p "$(dirname "$output")"
 mkdir "$output"
 output=$(realpath "$output")
@@ -78,7 +93,9 @@ if command -v npu-smi >/dev/null; then npu-smi info > "$output/npu-smi.txt"; fi
 args=(sglang serve --model-path "$model" --model-type diffusion --model-variant fl2va
     --lora-path "$lora" --lora-scale 1.0 --lora-alpha "${H3_LORA_ALPHA:-64}"
     --dit-cpu-offload false --num-gpus "$devices" --tp-size 2 --sp-degree "$sp"
-    --ulysses-degree "$sp" --port "$port" --component-residency text_encoder=layerwise-offload
+    --ulysses-degree "$sp" --port "$port" --master-port "$master_port"
+    --component-residency text_encoder=layerwise-offload
+    --pin-cpu-memory "${H3_PIN_CPU_MEMORY:-true}"
     --attention-backend laser_attn --warmup-steps "$steps" --warmup-mode server
     --enable-breakable-cuda-graph false --component-attention-backends video-vae=fa
     --vae-config.decoder-tile-batch 2 --minimax-h3-lightvae-decoder-path "$decoder"
