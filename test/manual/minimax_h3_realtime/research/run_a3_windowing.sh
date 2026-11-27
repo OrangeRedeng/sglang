@@ -9,7 +9,7 @@ if [[ ${1:-} != --inside ]]; then
     command -v docker >/dev/null || { echo "Run this on the A3 Docker host." >&2; exit 1; }
     env_args=()
     for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_FLOW_SHIFT H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
-        H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY \
+        H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
         H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
@@ -132,6 +132,9 @@ PY
 mkdir -p "$(dirname "$output")"
 mkdir "$output"
 output=$(realpath "$output")
+if [[ ${H3_PROFILE:-0} == 1 ]]; then
+    export SGLANG_DIFFUSION_TORCH_PROFILER_DIR="$output/profiles"
+fi
 if command -v npu-smi >/dev/null; then npu-smi info > "$output/npu-smi.txt"; fi
 args=(sglang serve --model-path "$model" --model-type diffusion --model-variant fl2va
     --dit-cpu-offload false --num-gpus "$devices" --tp-size 2 --sp-degree "$sp"

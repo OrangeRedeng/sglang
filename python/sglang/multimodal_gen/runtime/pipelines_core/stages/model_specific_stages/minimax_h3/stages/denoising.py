@@ -1014,7 +1014,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             shared_conditioning=emb,
                         )
                         _precompute_rope_cache(model, window.branch, device=device)
-                    window_forward = partial(windows.predict, forward_dit)
+                    window_forward = partial(
+                        windows.predict,
+                        forward_dit,
+                        profile=current_platform.is_npu() and batch.profile,
+                    )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             if model.final_layer._pdd_heads is not None:
                 initial_video, initial_audio = _scale_pdd_initial_noise(

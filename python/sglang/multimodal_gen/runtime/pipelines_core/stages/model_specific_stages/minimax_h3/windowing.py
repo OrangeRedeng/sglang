@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+
 from .denoise_loop import MiniMaxH3DenoiseBranch
 from .packed_sequence import minimax_h3_packed_sequence
 
@@ -108,27 +110,31 @@ class WindowPredictions:
         self.video_ramp = video_ramp
         self.audio_ramp = audio_ramp
 
-    def predict(self, forward, model, video, audio, step, slot):
+    def predict(self, forward, model, video, audio, step, slot, *, profile=False):
         outputs = []
-        for window in self.windows:
-            kwargs = window.branch.forward_kwargs(
-                video_rows=video[window.video],
-                audio_rows=audio.index_select(0, window.audio.flatten()),
-                step_timesteps=window.timesteps[step],
-                adaln_slot=slot,
-            )
-            outputs.append(forward(model, kwargs, step))
+        for index, window in enumerate(self.windows):
+            tag = f"h3_window_s{step}_w{index}"
+            with maybe_record_function(f"{tag}_prepare", enabled=profile):
+                kwargs = window.branch.forward_kwargs(
+                    video_rows=video[window.video],
+                    audio_rows=audio.index_select(0, window.audio.flatten()),
+                    step_timesteps=window.timesteps[step],
+                    adaln_slot=slot,
+                )
+            with maybe_record_function(f"{tag}_dit", enabled=profile):
+                outputs.append(forward(model, kwargs, step))
         if len(outputs) == 1:
             return outputs[0]
-        (left_video, left_audio), (right_video, right_audio) = outputs
-        video_prediction = _blend(left_video, right_video, self.video_ramp)
-        channels = self.windows[0].audio.shape[0]
-        audio_prediction = _blend(
-            left_audio.reshape(channels, -1, left_audio.shape[-1]).transpose(0, 1),
-            right_audio.reshape(channels, -1, right_audio.shape[-1]).transpose(0, 1),
-            self.audio_ramp,
-        )
-        return video_prediction, audio_prediction.transpose(0, 1).flatten(0, 1)
+        with maybe_record_function(f"h3_window_s{step}_fusion", enabled=profile):
+            (left_video, left_audio), (right_video, right_audio) = outputs
+            video_prediction = _blend(left_video, right_video, self.video_ramp)
+            channels = self.windows[0].audio.shape[0]
+            audio_prediction = _blend(
+                left_audio.reshape(channels, -1, left_audio.shape[-1]).transpose(0, 1),
+                right_audio.reshape(channels, -1, right_audio.shape[-1]).transpose(0, 1),
+                self.audio_ramp,
+            )
+            return video_prediction, audio_prediction.transpose(0, 1).flatten(0, 1)
 
 
 def _blend(left, right, ramp):
