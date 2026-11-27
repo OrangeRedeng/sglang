@@ -8,8 +8,8 @@ if [[ ${1:-} != --inside ]]; then
     script=test/manual/minimax_h3_realtime/research/run_a3_windowing.sh
     command -v docker >/dev/null || { echo "Run this on the A3 Docker host." >&2; exit 1; }
     env_args=()
-    for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
-        H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
+    for key in H3_MODEL H3_LORA H3_LIGHTVAE H3_STEPS H3_LORA_ALPHA H3_FLOW_SHIFT H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
+        H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
     done
@@ -20,17 +20,28 @@ cd "$1"
 shift
 
 case_id=${1:-B0}
-output=${2:-/tmp/h3-a3-$case_id-$(date +%s)}
-devices=8
+devices=${H3_NUM_GPUS:-8}
 sp=4
-visible=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+ring=1
+attention=laser_attn
+case "$devices" in
+    8) ;;
+    16) sp=8; ring=2; attention=fa ;;
+    *) echo "H3_NUM_GPUS must be 8 or 16." >&2; exit 2 ;;
+esac
 duration=15
-unset SGLANG_H3_WINDOW_MODE SGLANG_H3_WINDOW_GLOBAL_STEPS
+unset SGLANG_H3_WINDOW_MODE SGLANG_H3_WINDOW_GLOBAL_STEPS SGLANG_H3_LASER_SP8_PAD_HEADS
 case "$case_id" in
     B0) ;;
     B1) duration=7.5 ;;
     B2) duration=5 ;;
-    B3) duration=7.5; devices=4; sp=2; visible=${H3_B3_DEVICES:-0,1,2,3} ;;
+    B3)
+        duration=7.5; devices=4; sp=2; ring=1; attention=laser_attn
+        ;;
+    L16)
+        devices=16; sp=8; ring=1; attention=laser_attn
+        export SGLANG_H3_LASER_SP8_PAD_HEADS=1
+        ;;
     W0) export SGLANG_H3_WINDOW_MODE=single ;;
     W1) export SGLANG_H3_WINDOW_MODE=local ;;
     W2) export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_GLOBAL_STEPS=1 ;;
@@ -39,8 +50,18 @@ case "$case_id" in
         export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_OVERLAP=0.15
         export SGLANG_H3_WINDOW_GLOBAL_STEPS=${H3_GLOBAL_STEPS:-1}
         ;;
-    *) echo "Expected B0–B3 or W0–W4" >&2; exit 2 ;;
+    *) echo "Expected B0–B3, L16 or W0–W4" >&2; exit 2 ;;
 esac
+visible=${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 "$((devices - 1))")}
+if [[ "$case_id" == B3 ]]; then visible=${H3_B3_DEVICES:-0,1,2,3}; fi
+if [[ "$case_id" == L16 ]]; then
+    IFS=, read -r -a laser_devices <<< "$visible"
+    if [[ ${#laser_devices[@]} != 16 ]]; then
+        echo "L16 requires 16 visible Ascend devices. Check ASCEND_RT_VISIBLE_DEVICES." >&2
+        exit 2
+    fi
+fi
+output="${2:-/home/swx1199799/h3-a3}-$case_id-$(TZ=Europe/Moscow date +%H%M%S-%Y%m%d)"
 
 model=${H3_MODEL:-/home/weights/MiniMax-H3/}
 flashgen=/home/weights/Beidouqixing/minimax-h3-4step-lora-flashgen/minimax_h3_4step_lora_flashgen_v1.0_768p_bf16.safetensors
@@ -93,19 +114,25 @@ if command -v npu-smi >/dev/null; then npu-smi info > "$output/npu-smi.txt"; fi
 args=(sglang serve --model-path "$model" --model-type diffusion --model-variant fl2va
     --lora-path "$lora" --lora-scale 1.0 --lora-alpha "${H3_LORA_ALPHA:-64}"
     --dit-cpu-offload false --num-gpus "$devices" --tp-size 2 --sp-degree "$sp"
-    --ulysses-degree "$sp" --port "$port" --master-port "$master_port"
+    --ulysses-degree "$((sp / ring))" --ring-degree "$ring" --port "$port" --master-port "$master_port"
     --component-residency text_encoder=layerwise-offload
     --pin-cpu-memory "${H3_PIN_CPU_MEMORY:-true}"
-    --attention-backend laser_attn --warmup-steps "$steps" --warmup-mode server
+    --attention-backend "$attention" --warmup-steps "$steps" --warmup-mode server
     --enable-breakable-cuda-graph false --component-attention-backends video-vae=fa
     --vae-config.decoder-tile-batch 2 --minimax-h3-lightvae-decoder-path "$decoder"
     --output-path "$output/server-media")
 printf '%q ' "${args[@]}" > "$output/launch.txt"
 printf '\nvisible_devices=%s\nrungs=%s\n' "$visible" "$SGLANG_H3_DENOISE_RUNGS" >> "$output/launch.txt"
+printf 'laser_sp8_pad_heads=%s\n' "${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}" >> "$output/launch.txt"
 git rev-parse HEAD > "$output/source.txt" 2>/dev/null || true
 git diff --binary HEAD > "$output/source.diff" 2>/dev/null || true
-setsid "${args[@]}" > "$output/server.log" 2>&1 &
+echo "Artifacts: $output"
+echo "Starting $case_id with $attention, TP2, SP$sp (Ulysses $((sp / ring)), Ring $ring)"
+echo "Devices $visible (HTTP $port, rendezvous $master_port)"
+setsid env PYTHONUNBUFFERED=1 "${args[@]}" > "$output/server.log" 2>&1 &
 server=$!
+tail --pid="$server" -s 0.2 -n +1 -f "$output/server.log" &
+log_follower=$!
 cleanup() {
     kill -TERM -- "-$server" 2>/dev/null || true
     for _ in {1..20}; do
@@ -114,17 +141,22 @@ cleanup() {
     done
     kill -KILL -- "-$server" 2>/dev/null || true
     wait "$server" 2>/dev/null || true
+    wait "$log_follower" 2>/dev/null || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 deadline=$((SECONDS + ${H3_STARTUP_TIMEOUT:-1800}))
 until curl -fsS --max-time 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
     kill -0 "$server" 2>/dev/null && (( SECONDS < deadline )) || {
-        tail -60 "$output/server.log" >&2; exit 1;
+        echo "Server exited or startup timed out. See $output/server.log" >&2
+        exit 1
     }
     sleep 2
 done
 
-python3 - "$output" "$port" "$duration" "$steps" "$case_id" <<'PY'
+echo "Server ready. Running $case_id requests."
+python3 -u - "$output" "$port" "$duration" "$steps" "$case_id" <<'PY'
 import json
 import math
 import os
@@ -146,7 +178,8 @@ frames += (5 - frames) % 17
 payload = dict(model="MiniMaxAI/MiniMax-H3", prompt=os.getenv("H3_PROMPT", "Currious raccoon"),
                task="t2va", conditions=[], target=dict(short_edge=768, aspect_ratio="16:9",
                duration_seconds=duration), num_outputs_per_prompt=1, num_inference_steps=int(steps),
-               flow_shift=12.0, audio_flow_shift=3.0, seed=int(os.getenv("H3_SEED", "1101")),
+               flow_shift=float(os.getenv("H3_FLOW_SHIFT", "12")), audio_flow_shift=3.0,
+               seed=int(os.getenv("H3_SEED", "1101")),
                quality="lossless")
 client = Client(f"http://127.0.0.1:{port}", int(os.getenv("H3_REQUEST_TIMEOUT", "1800")))
 (out / "request.json").write_text(json.dumps(payload, indent=2))
@@ -156,6 +189,8 @@ repeats = 1 if profiling else int(os.getenv("H3_REPEATS", "3"))
 if repeats < 1:
     raise ValueError("H3_REPEATS must be positive")
 for index in range(repeats + 1):
+    label = "warmup" if index == 0 else f"sample {index}/{repeats}"
+    print(f"{case} {label}: submitting request", flush=True)
     media_file = out / f"sample-{index}.mp4"
     start = time.perf_counter()
     request = dict(payload)
@@ -171,6 +206,7 @@ for index in range(repeats + 1):
     record = dict(case=case, warmup=index == 0, profiled=profiling and index > 0, e2e_s=elapsed, media=media, response=response)
     with (out / "samples.jsonl").open("a") as stream:
         print(json.dumps(record), file=stream)
+    print(f"{case} {label}: {elapsed:.2f}s, {frames} frames", flush=True)
     if index:
         times.append(elapsed)
 if not profiling:
@@ -198,7 +234,7 @@ for line in Path(path).read_text().splitlines():
     match = pattern.search(line)
     if not match or match.group(1, 2, 3) != (mode, str(steps), str(steps + local_steps)):
         raise RuntimeError(f"Unexpected denoising execution: {line}")
-    for field, shift in ((4, 12), (5, 3)):
+    for field, shift in ((4, float(os.getenv("H3_FLOW_SHIFT", "12"))), (5, 3)):
         actual = ast.literal_eval(match.group(field))
         expected = [shift * sigma / (1 + (shift - 1) * sigma) for sigma in grid]
         if len(actual) != len(expected) or not all(

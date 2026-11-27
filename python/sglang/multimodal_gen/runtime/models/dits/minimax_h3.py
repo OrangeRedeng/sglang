@@ -1081,6 +1081,16 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     )
 
 
+def _minimax_h3_laser_sp8_padding(
+    local_heads: int, tp_size: int, ulysses_size: int, ring_size: int
+) -> bool:
+    return (
+        (local_heads, tp_size, ulysses_size, ring_size) == (28, 2, 8, 1)
+        and os.getenv("SGLANG_H3_LASER_SP8_PAD_HEADS") == "1"
+        and current_platform.is_npu()
+    )
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1104,7 +1114,20 @@ def _minimax_h3_attention_core_impl(
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
-    if ulysses_active and not ring_active and gate_compress is None:
+    local_heads = q.shape[1]
+    pad_heads = (
+        ulysses_active
+        and not ring_active
+        and attention._attention_backend_enum is AttentionBackendEnum.LASER_ATTN
+        and _minimax_h3_laser_sp8_padding(
+            local_heads, attention.tp_size, get_ulysses_ctx()[0], 1
+        )
+    )
+    if pad_heads:
+        # Equal head shards keep the existing Ulysses collectives usable.
+        q, k, v = (nn.functional.pad(tensor, (0, 0, 0, 4)) for tensor in (q, k, v))
+
+    if ulysses_active and not ring_active and gate_compress is None and not pad_heads:
         pipeline_kwargs = dict(
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1251,6 +1274,8 @@ def _minimax_h3_attention_core_impl(
             )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+    if pad_heads:
+        out = out[:, :local_heads].contiguous()
     return out
 
 
@@ -2746,7 +2771,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if ring_size <= 0:
             raise ValueError("MiniMax H3 ring size must be positive.")
         local_heads = arch.num_attention_heads // tp_size
-        if local_heads % ulysses_size:
+        if local_heads % ulysses_size and not _minimax_h3_laser_sp8_padding(
+            local_heads, tp_size, ulysses_size, ring_size
+        ):
             raise ValueError(
                 f"MiniMax H3 TP-local heads {local_heads} must be divisible by "
                 f"Ulysses size {ulysses_size} (total heads="
@@ -3541,13 +3568,24 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     f"sequence-parallel world size {sp_ws} "
                     f"(ulysses={ulysses_ws} x ring={ring_ws})"
                 )
-            local_heads = self.num_attention_heads // get_tp_world_size()
+            tp_size = get_tp_world_size()
+            local_heads = self.num_attention_heads // tp_size
             if local_heads % ulysses_ws:
-                raise ValueError(
-                    f"TP-local heads {local_heads} not divisible by Ulysses "
-                    f"world size {ulysses_ws} (total heads="
-                    f"{self.num_attention_heads}, TP={get_tp_world_size()})"
-                )
+                if not _minimax_h3_laser_sp8_padding(
+                    local_heads, tp_size, ulysses_ws, ring_ws
+                ):
+                    raise ValueError(
+                        f"TP-local heads {local_heads} not divisible by Ulysses "
+                        f"world size {ulysses_ws} (total heads="
+                        f"{self.num_attention_heads}, TP={tp_size})"
+                    )
+                if (
+                    self._resolved_attention_backend
+                    is not AttentionBackendEnum.LASER_ATTN
+                ):
+                    raise ValueError(
+                        "MiniMax H3 SP8 head padding requires Laser Attention."
+                    )
             local_seq_len = seq_len // sp_ws
         ring_chunk_len = local_seq_len * ulysses_ws
         row_start = ring_rank * ring_chunk_len + ulysses_rank * local_seq_len

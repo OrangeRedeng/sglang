@@ -11,16 +11,19 @@ and [Diff-VF](https://arxiv.org/abs/2608.05976).
 
 Run from the checkout on the A3 Docker host. The existing `sglang-a3-diffusion`
 container needs the checkout mounted. Set `H3_CONTAINER_REPO` if its path inside
-Docker differs. Paths passed as the second argument are inside the container.
-The script starts and stops its own server and expects the port to be free.
+Docker differs. The optional second argument is an output prefix inside the
+container and defaults to `/home/swx1199799/h3-a3`. The launcher appends
+`-EXPERIMENT-HHMMSS-YYYYMMDD` using Moscow time and prints the full path.
+Server logs stream to the console and are saved to `server.log`.
 
 ```bash
 runner=test/manual/minimax_h3_realtime/research/run_a3_windowing.sh
-bash "$runner" B0 /tmp/h3-B0
-bash "$runner" B1 /tmp/h3-B1
-bash "$runner" B2 /tmp/h3-B2
-bash "$runner" B3 /tmp/h3-B3
-bash "$runner" W0 /tmp/h3-W0
+bash "$runner" B0
+bash "$runner" B1
+bash "$runner" B2
+bash "$runner" B3
+bash "$runner" L16
+bash "$runner" W0
 ```
 
 | Case | Target seconds | NPUs | Mode | Forwards with FlashGen |
@@ -29,11 +32,18 @@ bash "$runner" W0 /tmp/h3-W0
 | B1 | 7.5 | 8 | Monolithic | 4 |
 | B2 | 5 | 8 | Monolithic | 4 |
 | B3 | 7.5 | 4 | Monolithic | 4 |
+| L16 | 15 | 16 | Monolithic, Laser Attention, TP2 × Ulysses8 | 4 |
 | W0 | 15 | 8 | One full window, native execution | 4 |
 | W1 | 15 | 8 | Two sequential windows at each step | 8 |
 | W2 | 15 | 8 | One global step, then local | 7 |
 | W3 | 15 | 8 | Two global steps, then local | 6 |
 | W4 | 15 | 8 | Best global prefix with 15% overlap | Depends on prefix |
+
+`L16` defaults to devices 0–15 and uses port 30088 by default. The Laser
+experiment pads each TP rank's 28 QKV heads to 32 for Ulysses8 and removes
+the extra heads before output projection. Compare against `H3_NUM_GPUS=16`
+`B0` (TP2 × Ulysses4 × Ring2, FA) with the same adapter, schedule, prompt,
+seed, and decoder.
 
 W0 uses the original full-sequence packing and scheduler path. The host tests
 exercise the two-window path with a position-dependent predictor and check
@@ -42,17 +52,16 @@ Before W1–W4, compare the matched B0 and W0 AV outputs on A3. For deterministi
 media streams, compare decoded signatures from inside the container.
 
 ```bash
-docker exec sglang-a3-diffusion bash -c '
-  set -e
-  for mode in B0 W0; do
-    ffmpeg -v error -i "/tmp/h3-${mode}/sample-1.mp4" -map 0:v -map 0:a       -f framemd5 "/tmp/h3-${mode}/decoded.md5"
+docker exec sglang-a3-diffusion bash -ec '
+  for out in "$@"; do
+    ffmpeg -v error -i "$out/sample-1.mp4" -map 0:v -map 0:a -f framemd5 "$out/decoded.md5"
   done
-  diff -u /tmp/h3-B0/decoded.md5 /tmp/h3-W0/decoded.md5
-'
-bash "$runner" W1 /tmp/h3-W1
-bash "$runner" W2 /tmp/h3-W2
-bash "$runner" W3 /tmp/h3-W3
-H3_GLOBAL_STEPS=1 bash "$runner" W4 /tmp/h3-W4
+  diff -u "$1/decoded.md5" "$2/decoded.md5"
+' bash "<printed B0 directory>" "<printed W0 directory>"
+bash "$runner" W1
+bash "$runner" W2
+bash "$runner" W3
+H3_GLOBAL_STEPS=1 bash "$runner" W4
 ```
 
 Defaults are `/home/weights/MiniMax-H3/`,
