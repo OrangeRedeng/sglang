@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_decode_precision,
     resolve_precision,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
@@ -658,6 +660,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
         if self.video_vae is None:
             raise RuntimeError("MiniMax H3 tasks require the video_vae output decoder")
         batch_size = int(visual_latent.shape[0])
+        trace_npu = current_platform.is_npu() and batch.profile and not batch.is_warmup
 
         def finish_audio(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
             waveform = _canonical_output_audio_waveform(waveform, batch_size=batch_size)
@@ -677,9 +680,10 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 finish_audio,
             )
         else:
-            owner_audio, owner_exception = self._decode_owner_audio(
-                audio_latent, server_args
-            )
+            with maybe_record_function("h3_vae_audio_owner", enabled=trace_npu):
+                owner_audio, owner_exception = self._decode_owner_audio(
+                    audio_latent, server_args
+                )
         output_audio_waveform = None
         streamed_output_path = None
         encoder_audio = None
@@ -693,7 +697,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
         elif audio_job is not None:
             audio_sample_rate = int(self.audio_vae.sample_rate)
             encoder_audio = lambda: audio_job.result()[2]  # noqa: E731
-        if encoder_audio is not None:
+        # Skip frame callbacks when CudaVideoEncoder cannot open the device.
+        if (
+            encoder_audio is not None
+            and current_platform.device_type == "cuda"
+            and hasattr(os, "memfd_create")
+        ):
             streamed_output_path = streamed_video_output_path(
                 batch, server_args, batch_size
             )
@@ -751,6 +760,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     decode_kwargs["on_frames"] = stream
                 try:
                     with (
+                        maybe_record_function("h3_vae_video_decode", enabled=trace_npu),
                         use_vae_fast_path(
                             selected_video_vae,
                             quality_allows(batch.sampling_params.quality, "lossless"),
@@ -766,9 +776,10 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         owner_audio, output_audio_waveform, owner_exception = (
                             self._join_owner_audio(audio_job)
                         )
-                    audio_waveform, audio_sample_rate = self._share_audio(
-                        owner_audio, owner_exception
-                    )
+                    with maybe_record_function("h3_vae_audio_share", enabled=trace_npu):
+                        audio_waveform, audio_sample_rate = self._share_audio(
+                            owner_audio, owner_exception
+                        )
                     if output_audio_waveform is None:
                         output_audio_waveform = finish_audio(
                             audio_waveform, audio_sample_rate
@@ -781,7 +792,10 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     raise
                 if output_file_paths is None:
                     # callbacks borrow slices of decoded; only the final output owns it
-                    visual_frames = finish_frames(decoded, runtime_owned=True)
+                    with maybe_record_function(
+                        "h3_vae_video_finish", enabled=trace_npu
+                    ):
+                        visual_frames = finish_frames(decoded, runtime_owned=True)
                 del decoded
 
         if visual_frames is not None:
