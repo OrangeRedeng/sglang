@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 import functools
 import os
 from collections.abc import Mapping
@@ -477,8 +478,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
             raise ValueError("SGLANG_H3_VAE_AV_OVERLAP must be 0 or 1")
         return (
             override != "0"
-            and
-            (current_platform.is_cuda() or current_platform.is_npu())
+            and (current_platform.is_cuda() or current_platform.is_npu())
             and model_parallel_is_initialized()
             and get_decode_parallel_world_size() > 1
             and server_args.residency_mode("audio_vae") == RESIDENT
@@ -511,9 +511,13 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
             # TorchNPU mirrors the CUDA stream API; the device module resolves
             # from the latent's device type, so one code path serves both.
-            self._audio_stream = torch.get_device_module(
-                audio_latent.device.type
-            ).Stream(priority=-1)
+            device_module = torch.get_device_module(audio_latent.device.type)
+            with device_module.device(audio_latent.device):
+                self._audio_stream = (
+                    device_module.Stream()
+                    if audio_latent.device.type == "npu"
+                    else device_module.Stream(priority=-1)
+                )
         device_module = torch.get_device_module(audio_latent.device.type)
         stream = self._audio_stream
         stream.wait_stream(device_module.current_stream())
@@ -781,7 +785,44 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         ),
                         set_forward_context(current_timestep=0, attn_metadata=None),
                     ):
+                        audit = (
+                            os.getenv("SGLANG_H3_VAE_AV_OVERLAP") is not None
+                            or os.getenv("SGLANG_H3_VAE_NPU_GRAPH") == "1"
+                        )
+                        cache = getattr(selected_video_vae, "_tile_graph_cache", None)
+                        before = (
+                            cache.stats.as_dict() if audit and cache is not None else {}
+                        )
                         decoded = video_decode(visual_decode_latent, **decode_kwargs)
+                        if audit:
+                            after = cache.stats.as_dict() if cache is not None else {}
+                            counters = {
+                                name: after[name] - value
+                                for name, value in before.items()
+                                if name != "entries"
+                            }
+                            logger.info(
+                                "H3 VAE execution %s",
+                                json.dumps(
+                                    dict(
+                                        request=batch.request_id,
+                                        rank=get_replica_group().rank_in_group
+                                        if model_parallel_is_initialized()
+                                        else 0,
+                                        audio_side_stream=audio_job is not None,
+                                        overlap_enabled=overlap_audio,
+                                        tile_batch=getattr(
+                                            selected_video_vae,
+                                            "decoder_tile_batch",
+                                            None,
+                                        ),
+                                        allocator_bytes=torch.npu.memory_allocated()
+                                        if current_platform.is_npu()
+                                        else None,
+                                        **counters,
+                                    )
+                                ),
+                            )
                     # before closing the encoder, whose x264 and mux tail it overlaps
                     if overlap_audio:
                         owner_audio, output_audio_waveform, owner_exception = (

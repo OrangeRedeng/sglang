@@ -50,7 +50,7 @@ class _FakeGraph:
 def _fake_capture(fn, x):
     static_input = x.clone()
     graph = _FakeGraph(fn, static_input)
-    graph.static_output = fn(static_input)
+    graph.static_output = torch.empty_like(fn(static_input))
     return npu_graph_module._GraphEntry(graph, static_input, graph.static_output)
 
 
@@ -111,7 +111,7 @@ def test_capture_once_replay_per_bucket(monkeypatch):
         second = wrapped(torch.full((4, 8), 5.0))
         third = wrapped(torch.full((4, 8), 7.0))
     # one capture, two replays, and outputs reflect each replay's input bytes
-    assert cache.stats.captures == 1 and cache.stats.replays == 2
+    assert cache.stats.captures == 1 and cache.stats.replays == 3
     assert torch.equal(first, torch.full((4, 8), 6.0))
     assert torch.equal(second, torch.full((4, 8), 15.0))
     assert torch.equal(third, torch.full((4, 8), 21.0))
@@ -138,8 +138,8 @@ def test_bucket_key_tracks_shape_and_revision(monkeypatch):
         wrapped(torch.zeros(2, 8))  # distinct shape -> distinct bucket
         assert len(cache._entries) == 2
         revision["epoch"] = 1
-        wrapped(torch.zeros(4, 8))  # new revision -> new bucket, old stays
-    assert len(cache._entries) == 3
+        wrapped(torch.zeros(4, 8))  # Revision changes retire all old buffers.
+    assert len(cache._entries) == 1
 
 
 def test_max_entries_bound_and_overflow_eager(monkeypatch):
@@ -274,8 +274,13 @@ def test_r06_probe_reports_without_device():
     import json
     import subprocess
 
-    probe = _REPO_ROOT / "test" / "manual" / "minimax_h3_realtime" / "research" / (
-        "r06_vae_graph_probe.py"
+    probe = (
+        _REPO_ROOT
+        / "test"
+        / "manual"
+        / "minimax_h3_realtime"
+        / "research"
+        / ("r06_vae_graph_probe.py")
     )
     result = subprocess.run(
         [sys.executable, str(probe), "--json"],

@@ -52,6 +52,21 @@ def _is_fatal_device_error(error: BaseException) -> bool:
     )
 
 
+def _recoverable_graph_error(error: RuntimeError) -> bool:
+    if isinstance(error, torch.OutOfMemoryError) or _is_fatal_device_error(error):
+        return False
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "not supported",
+            "unsupported",
+            "not implemented",
+            "no capture on this host",
+        )
+    )
+
+
 @dataclass
 class _GraphEntry:
     graph: Any
@@ -66,6 +81,7 @@ class TileGraphStats:
     captures: int = 0
     replays: int = 0
     eager_calls: int = 0
+    replay_failures: int = 0
     capture_failures: int = 0
     invalidations: int = 0
     entries: dict[tuple, int] = field(default_factory=dict)
@@ -76,6 +92,7 @@ class TileGraphStats:
             "replays": self.replays,
             "eager_calls": self.eager_calls,
             "capture_failures": self.capture_failures,
+            "replay_failures": self.replay_failures,
             "invalidations": self.invalidations,
             "entries": len(self.entries),
         }
@@ -100,17 +117,14 @@ def npu_graph_api_available() -> bool:
     if not hasattr(torch, "npu"):
         return False
     return all(
-        hasattr(torch.npu, name)
-        for name in ("graph", "NPUGraph", "graph_pool_handle", "current_stream")
+        hasattr(torch.npu, name) for name in ("graph", "NPUGraph", "current_stream")
     )
 
 
 class TileDecodeGraphCache:
     """Capture/replay cache for one decoder's per-group forward.
 
-    One shared graph memory pool backs every entry of one cache so the pool
-    stays bounded by the largest captured bucket instead of accumulating one
-    private pool per capture.
+    Each entry owns a private graph pool because bucket replay order varies.
     """
 
     def __init__(
@@ -127,8 +141,8 @@ class TileDecodeGraphCache:
         self._enabled = enabled
         self._entries: dict[tuple, _GraphEntry] = {}
         self._unsupported: set[tuple] = set()
-        self._pool = None
         self.stats = TileGraphStats()
+        self._epoch = None
 
     @property
     def enabled(self) -> bool:
@@ -145,7 +159,7 @@ class TileDecodeGraphCache:
             )
         self._entries.clear()
         self._unsupported.clear()
-        self._pool = None
+        self.stats.entries.clear()
 
     def wrap(self, forward_fn: Callable[[torch.Tensor], torch.Tensor]):
         """Return ``forward_fn`` with graph replay for repeated buckets."""
@@ -184,62 +198,53 @@ class TileDecodeGraphCache:
             return forward_fn(x)
 
         key = self._bucket_key(x)
+        if self._epoch != key[-1]:
+            self.clear(reason="decoder revision changed")
+            self._epoch = key[-1]
+        if x.device.type == "npu":
+            key += (torch.npu.current_stream(x.device).npu_stream,)
         if key in self._unsupported:
             self.stats.eager_calls += 1
             return forward_fn(x)
         entry = self._entries.get(key)
-        if entry is not None:
-            try:
-                entry.static_input.copy_(x)
-                entry.graph.replay()
-                self.stats.replays += 1
-                # The static output is overwritten by the next replay, so every
-                # caller owns a private copy; the copy is cheaper than the decode.
-                return entry.static_output.clone()
-            except Exception as exc:  # noqa: BLE001 - invalidate recoverable replay failures
-                if _is_fatal_device_error(exc):
-                    raise
-                self.stats.invalidations += 1
-                self._entries.pop(key, None)
-                self.stats.entries.pop(key, None)
-                self._unsupported.add(key)
-                logger.warning_once(
-                    "MiniMax H3 VAE graph replay failed; invalidating bucket (%s: %s)",
-                    type(exc).__name__,
-                    exc,
-                )
+        if entry is None:
+            if len(self._entries) >= self._max_entries:
                 self.stats.eager_calls += 1
                 return forward_fn(x)
-
-        if len(self._entries) >= self._max_entries:
-            self.stats.eager_calls += 1
-            return forward_fn(x)
-
+            try:
+                entry = self._capture(forward_fn, x)
+            except RuntimeError as exc:
+                self.stats.capture_failures += 1
+                if not _recoverable_graph_error(exc):
+                    raise
+                self._unsupported.add(key)
+                self.stats.eager_calls += 1
+                logger.warning("H3 tile graph capture disabled for %s: %s", key, exc)
+                return forward_fn(x)
+            self._entries[key] = entry
+            self.stats.entries[key] = 1
+            self.stats.captures += 1
+        else:
+            entry.static_input.copy_(x)
         try:
-            entry = self._capture(forward_fn, x)
-        except Exception as exc:  # noqa: BLE001 - capture must fail closed
-            if _is_fatal_device_error(exc):
+            # Capture records work. Explicit replay also initializes output on the first call.
+            entry.graph.replay()
+        except RuntimeError as exc:
+            self.stats.replay_failures += 1
+            self.stats.invalidations += 1
+            del self._entries[key], self.stats.entries[key]
+            if not _recoverable_graph_error(exc):
                 raise
-            self.stats.capture_failures += 1
             self._unsupported.add(key)
-            # The caller's decode ran the unwrapped forward; count it.
             self.stats.eager_calls += 1
-            logger.warning_once(
-                "MiniMax H3 VAE graph capture failed; staying eager (%s: %s)",
-                type(exc).__name__,
-                exc,
-            )
+            logger.warning("H3 tile graph replay disabled for %s: %s", key, exc)
             return forward_fn(x)
-        self._entries[key] = entry
-        self.stats.entries[key] = self.stats.entries.get(key, 0) + 1
-        self.stats.captures += 1
+        self.stats.replays += 1
         return entry.static_output.clone()
 
     def _capture(
         self, forward_fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor
     ) -> _GraphEntry:
-        if self._pool is None:
-            self._pool = torch.npu.graph_pool_handle()
         static_input = x.clone()
         # Warmup on the side of the capture pool: primed caches, workspace and
         # allocator state must exist before capture, and warmup work must not
@@ -247,7 +252,7 @@ class TileDecodeGraphCache:
         warm = forward_fn(static_input)
         torch.npu.current_stream().synchronize()
         graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, pool=self._pool):
+        with torch.npu.graph(graph):
             static_output = forward_fn(static_input)
         if static_output.shape != warm.shape or static_output.dtype != warm.dtype:
             raise RuntimeError(
