@@ -299,7 +299,7 @@ def aggregate_samples(samples):
 def validate_denoise_match(match, adapter):
     """Require measured scheduler and logical-forward counters from the launcher."""
     require(isinstance(match, str), "Denoise evidence must be a server log line")
-    expected_updates = 50 if adapter == "H08.NATIVE50" else 4
+    expected_updates = 50 if adapter in ("H08.NATIVE50", "R01.HIST.OFF", "R01.HIST.ON") else 8 if adapter == "R01.QUALITY.TURBO" else 4
     pattern = re.search(
         r"scheduler_updates=(\d+) dit_evaluations=(\d+)", match
     )
@@ -917,7 +917,7 @@ def results(directory, adapter, deadline, samples=1, source_sha=None):
     comparison = json.loads(comparison_path.read_text())
     if source_sha is not None:
         require(
-            comparison.get("source_sha") == source_sha,
+            comparison.get("source_sha", "").strip() == source_sha,
             "Execution source SHA differs from the approved branch",
         )
     records = [
@@ -933,7 +933,7 @@ def results(directory, adapter, deadline, samples=1, source_sha=None):
     )
     request_ids = {row["response"]["id"] for row in records[1:]}
     require(
-        request_ids == matches.keys(),
+        len(request_ids) == samples and request_ids == matches.keys(),
         "Missing or duplicate denoise evidence",
     )
     for match in matches.values():
@@ -958,7 +958,7 @@ def results(directory, adapter, deadline, samples=1, source_sha=None):
         hashes.append(sha256_file(run / f"sample-{index}.mp4", deadline))
     client_samples = [row["e2e_s"] for row in records[1:]]
     require(
-        records[1]["profiled"] == profile
+        all(row["profiled"] == profile for row in records[1:])
         and all(math.isfinite(value) and value > 0 for value in client_samples),
         "Invalid measured clock",
     )
