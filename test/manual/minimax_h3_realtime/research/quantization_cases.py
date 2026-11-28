@@ -16,6 +16,8 @@ METHODS = {
     "Q3": "w8a8_int",
     "Q4": "w8a8_int",
     "Q5": "mxfp8",
+    "Q5_FFN": "mxfp8",
+    "Q5_ALLOWLIST": "mxfp8",
 }
 
 
@@ -58,13 +60,20 @@ def selection(case, checkpoint, placement, source, reference=None, allowlist=Non
     blocks = sorted({block for block, _ in block_linears.values()})
     if blocks != list(range(len(blocks))) or len(blocks) < 3:
         raise ValueError("Q0 map must enumerate the complete numbered DiT block stack")
+    projections = {"mlp.fc1", "mlp.fc2", "attn.qkv_proj", "attn.out_proj"}
+    if any(
+        {projection for block, projection in block_linears.values() if block == i}
+        != projections
+        for i in blocks
+    ):
+        raise ValueError("Incomplete Q0 block projection inventory")
     edge = math.ceil(len(blocks) / 10)
     middle = {
         prefix: projection
         for prefix, (block, projection) in block_linears.items()
         if edge <= block < len(blocks) - edge
     }
-    if case == "Q3":
+    if case in ("Q3", "Q5_ALLOWLIST"):
         if (
             not isinstance(allowlist, list)
             or not allowlist
@@ -76,7 +85,7 @@ def selection(case, checkpoint, placement, source, reference=None, allowlist=Non
             )
         included = set(allowlist)
     else:
-        group = "mlp." if case == "Q2" else "attn."
+        group = "mlp." if case in ("Q2", "Q5_FFN") else "attn."
         included = {
             name for name, projection in middle.items() if projection.startswith(group)
         }

@@ -1456,7 +1456,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         ):
             runner = self._maybe_get_bcg_runner(model)
             capture = os.getenv("SGLANG_H3_QUANT_CAPTURE")
-            if capture and not batch.is_warmup and batch.profile and step_index == 0:
+            if (
+                capture
+                and not batch.is_warmup
+                and batch.profile
+                and step_index
+                in {0, batch.num_inference_steps // 2, batch.num_inference_steps - 1}
+            ):
                 if runner is not None or self._cache_dit_enabled:
                     raise ValueError(
                         "BF16 layer capture requires eager execution and cache off"

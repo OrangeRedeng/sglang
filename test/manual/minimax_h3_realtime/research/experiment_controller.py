@@ -47,7 +47,11 @@ REGISTRY = {
     "R01.HIST.OFF": ("HIST-OFF", False, None),
     "R01.HIST.ON": ("HIST-ON", False, None),
     **{
-        f"R02.{case}": ("B0", False, "r02_sensitivity" if case == "Q3" else None)
+        f"R02.{case}": (
+            "B0",
+            False,
+            "r02_sensitivity" if case in ("Q3", "Q5_ALLOWLIST") else None,
+        )
         for case in QUANTIZATION_METHODS
     },
 }
@@ -227,12 +231,14 @@ def validate(manifest):
             require(len(devices) == 8, "Historical controls require eight devices")
         if family == "A5-R02":
             require(
-                adapter in {"R02.Q0", "R02.Q5"} and contract["soc_version"] >= 260,
+                adapter in {"R02.Q0", "R02.Q5", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"}
+                and contract["soc_version"] >= 260,
                 "A5-R02 requires Ascend 950 and Q0/Q5",
             )
-        elif adapter in {"R02.Q1", "R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5"}:
+        elif adapter.startswith("R02.") and adapter != "R02.Q0":
             require(
-                family in {"A3-C4", "A3-T8"} and adapter != "R02.Q5",
+                family in {"A3-C4", "A3-T8"}
+                and adapter in {"R02.Q1", "R02.Q2", "R02.Q3", "R02.Q4"},
                 "Q1–Q4 require A3; Q5 requires A5-R02",
             )
         after, repeat = case["after"], case["repeat_of"]
@@ -240,7 +246,7 @@ def validate(manifest):
             isinstance(after, list) and all(item in seen for item in after),
             "Dependencies must precede the case",
         )
-        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4"}:
+        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"}:
             require(
                 sum(seen[dependency] == "R02.Q0" for dependency in after) == 1,
                 "Selective quantization requires one Q0 dependency",
@@ -541,7 +547,7 @@ def launch_environment(manifest, case, latest=None, output=None):
         env["H3_QUANT_CASE"] = adapter.split(".")[1]
         if contract["family"] == "A5-R02":
             env["H3_ATTENTION_BACKEND"] = "fa"
-        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4"}:
+        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"}:
             baseline = next(
                 item["id"]
                 for item in manifest["cases"]
@@ -550,7 +556,7 @@ def launch_environment(manifest, case, latest=None, output=None):
             env["H3_QUANT_REFERENCE"] = str(
                 Path(latest[baseline]["artifacts"]) / "precision-rank-0.json"
             )
-        if adapter == "R02.Q3":
+        if adapter in {"R02.Q3", "R02.Q5_ALLOWLIST"}:
             proof = manifest["capabilities"]["r02_sensitivity"]
             proof_content = Path(proof["path"]).read_bytes()
             require(
@@ -695,6 +701,7 @@ def results(directory, adapter, deadline, contract=None):
         )
     if adapter.startswith("R02."):
         method = QUANTIZATION_METHODS[adapter.split(".")[1]]
+        inventory = None
         for rank in range(len(contract["devices"])):
             evidence = json.loads((run / f"precision-rank-{rank}.json").read_text())
             require(
@@ -706,6 +713,21 @@ def results(directory, adapter, deadline, contract=None):
                 and (method == "bf16" or evidence["probed_layers"]),
                 f"Missing or mismatched precision evidence for rank {rank}",
             )
+            current = {
+                name: (
+                    row["precision"],
+                    row["weight_shape"],
+                    row["scale_shape"],
+                    row["operators"],
+                )
+                for name, row in evidence["layers"].items()
+            }
+            identity = evidence["source_sha"], evidence["placement"], current
+            require(
+                inventory is None or inventory == identity,
+                f"Precision inventory differs on rank {rank}",
+            )
+            inventory = identity
     return dict(
         artifacts=str(run),
         output_sha256=hashes,

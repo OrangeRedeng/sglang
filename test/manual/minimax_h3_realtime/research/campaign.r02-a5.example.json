@@ -33,9 +33,9 @@
     "checkpoint_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "limits": {
-    "max_runs": 2,
+    "max_runs": 3,
     "max_wall_s": 7500,
-    "max_device_s": 28800,
+    "max_device_s": 43200,
     "run_timeout_s": 1800,
     "min_free_mib": 52000,
     "min_disk_mib": 10000
@@ -46,6 +46,14 @@
       "id": "q0",
       "adapter": "R02.Q0",
       "after": [],
+      "repeat_of": null
+    },
+    {
+      "id": "q5_ffn",
+      "adapter": "R02.Q5_FFN",
+      "after": [
+        "q0"
+      ],
       "repeat_of": null
     },
     {

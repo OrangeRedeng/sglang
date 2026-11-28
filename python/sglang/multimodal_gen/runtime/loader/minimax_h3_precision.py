@@ -58,7 +58,13 @@ def record_precision_map(model, directory, load_started, before):
                     raise ValueError(
                         f"BF16 replay {key} differs from the active R02 contract"
                     )
+            if (
+                metadata.get("rank") != str(rank)
+                or not metadata.get("step", "").isdigit()
+            ):
+                raise ValueError("BF16 replay is missing rank or step identity")
             replay = {key: handle.get_tensor(key) for key in handle.keys()}
+    protected = set()
     for path, layer in model.named_modules():
         if not isinstance(layer, LinearBase):
             continue
@@ -88,12 +94,25 @@ def record_precision_map(model, directory, load_started, before):
             )
         if scale is not None and precision != requested:
             raise RuntimeError(f"Unexpected precision {precision} at {path}")
-        if (
-            set(prefix.split("."))
-            & {"token_refiner", "final_layer", "condition_proj", "adaln_proj"}
-            and scale is not None
+        protected_parts = set(prefix.split(".")) & {
+            "token_refiner",
+            "final_layer",
+            "condition_proj",
+            "adaln_proj",
+        }
+        if protected_parts:
+            protected.update(protected_parts)
+            # Some output projections are explicitly FP32 in the native H3 architecture.
+            if (
+                scale is not None
+                or weight.dtype != layer.params_dtype
+                or weight.dtype not in (torch.bfloat16, torch.float32)
+            ):
+                raise RuntimeError(f"Protected projection precision changed at {path}")
+        if precision == "w8a8_int" and (
+            weight.dtype != torch.int8 or tuple(scale.shape) != (weight.shape[1],)
         ):
-            raise RuntimeError(f"Protected linear was quantized: {path}")
+            raise RuntimeError(f"Invalid TP-local W8A8 scale layout at {path}")
 
         layout = None
         statistics = {}
@@ -164,6 +183,9 @@ def record_precision_map(model, directory, load_started, before):
                 if not torch.isfinite(pred).all() or not torch.isfinite(ref).all():
                     raise ValueError(f"Nonfinite replay tensors at {prefix}.{group}")
                 statistics[group] = {
+                    "step": int(metadata["step"]),
+                    "rank": rank,
+                    "modality": group,
                     "rows": x.shape[0],
                     "normalized_l2": (
                         (pred - ref).norm() / ref.norm().clamp_min(1e-12)
@@ -203,6 +225,19 @@ def record_precision_map(model, directory, load_started, before):
         raise RuntimeError(
             f"Resolved precision differs from the requested layer selection: {sorted(actual ^ (selected or actual))}"
         )
+    required = {"condition_proj", "token_refiner", "final_layer"}
+    if any("adaln_proj" in name.split(".") for name, _ in model.named_modules()):
+        required.add("adaln_proj")
+    missing = required - protected
+    for index in range(len(model.blocks)):
+        for projection in ("mlp.fc1", "mlp.fc2", "attn.qkv_proj", "attn.out_proj"):
+            prefix = f"blocks.{index}.{projection}"
+            if prefix not in layers:
+                missing.add(prefix)
+    if missing or not len(model.blocks):
+        raise RuntimeError(
+            f"Incomplete protected or block precision inventory: {sorted(missing)}"
+        )
     if replay:
         raise ValueError(
             f"Replay tensors reference unselected or unknown linears: {sorted(replay)}"
@@ -234,7 +269,7 @@ def capture_precision_replay(model, call_kwargs, destination, *, request_id, ste
     from safetensors.torch import save_file
 
     root = Path(os.environ["SGLANG_H3_QUANT_AUDIT"])
-    target = root / "replay" / f"rank-{get_world_rank()}.safetensors"
+    target = root / "replay" / f"step-{step}" / f"rank-{get_world_rank()}.safetensors"
     if target.exists():
         yield
         return
@@ -320,7 +355,7 @@ def capture_precision_replay(model, call_kwargs, destination, *, request_id, ste
         raise RuntimeError(
             f"BF16 capture missed projections: {sorted(wanted - called)}"
         )
-    target.parent.mkdir(exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         key: os.environ[f"SGLANG_H3_QUANT_{key}"]
         for key in ("CHECKPOINT", "PLACEMENT", "SOURCE")
@@ -329,6 +364,12 @@ def capture_precision_replay(model, call_kwargs, destination, *, request_id, ste
     save_file(
         tensors,
         str(temporary),
-        metadata={**metadata, "request_id": request_id, "step": str(step)},
+        metadata={
+            **metadata,
+            "request_id": request_id,
+            "step": str(step),
+            "rank": str(get_world_rank()),
+            "modalities": ",".join(indices),
+        },
     )
     temporary.replace(target)

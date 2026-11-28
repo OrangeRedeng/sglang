@@ -66,7 +66,24 @@ def test_registered_reference_and_a5_gate(tmp_path):
     manifest = json.loads((root / "campaign.r02-a5.example.json").read_text())
     validate(manifest)
     for case in manifest["cases"]:
-        assert launch_environment(manifest, case)["H3_ATTENTION_BACKEND"] == "fa"
+        assert (
+            launch_environment(manifest, case, {"q0": {"artifacts": str(tmp_path)}})[
+                "H3_ATTENTION_BACKEND"
+            ]
+            == "fa"
+        )
     manifest["contract"]["soc_version"] = 250
     with pytest.raises(ValueError, match="Ascend 950"):
         validate(manifest)
+
+
+def test_conservative_mxfp8_requires_complete_bf16_reference(baseline):
+    args = ("checkpoint", "placement", "source", baseline)
+    assert selection("Q5_FFN", *args)["selected"] == selection("Q2", *args)["selected"]
+    assert (
+        selection("Q5_ALLOWLIST", *args, ["blocks.2.attn.qkv_proj"])["method"]
+        == "mxfp8"
+    )
+    del baseline["layers"]["blocks.2.attn.qkv_proj"]
+    with pytest.raises(ValueError, match="Incomplete"):
+        selection("Q5_FFN", *args)

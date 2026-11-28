@@ -25,6 +25,7 @@ Each rank writes a precision JSON file with module paths, method, operators, wei
 | Q2 | W8A8 FC1 and FC2 in the middle 80% of the actual numbered block stack |
 | Q3 | W8A8 explicit whole projections from the same middle blocks, selected from sensitivity evidence |
 | Q4 | W8A8 whole QKV and output projections in the middle blocks |
+| Q5_FFN / Q5_ALLOWLIST | Ascend 950 MXFP8 on middle-block FFN or approved whole projections, using the matching Q0 inventory |
 | Q5 | Ascend 950 MXFP8 with the same protected floor as Q1 and dense FA |
 
 Q2–Q4 use a Q0 rank-0 map from the same commit, checkpoint, topology and attention backend. The launcher passes the complement through the existing transformer ignored-layer option. Each rank checks its resolved map. BF16 and FP32 islands retain their original precision. Joint AV projections share weights across video and audio. Q6 depends on accepted R03 seam results.
@@ -52,8 +53,8 @@ For an A5 pair, use H3_ATTENTION_BACKEND=fa for both Q0 and Q5.
 ### Sensitivity and quality
 
 1. Write a JSON array containing actual whole projection names from Q0, such as ["blocks.10.mlp.fc1","blocks.10.mlp.fc2"].
-2. Run Q0 with H3_PROFILE=1 and H3_QUANT_CAPTURE pointing to the JSON array. The first measured denoise step saves up to eight rank-local rows per present AV modality, using packed latent row IDs and the BF16 projection output before TP reduction.
-3. Run the candidate with H3_PROFILE=1 and H3_QUANT_REPLAY pointing to the Q0 replay directory. The candidate replays the same inputs through its loaded local weight and reports normalized L2, cosine and maximum absolute error for those slices. Run the pair for each calibration prompt and keep the captured tensors.
+2. Run Q0 with H3_PROFILE=1 and H3_QUANT_CAPTURE pointing to the JSON array. The early, middle and final measured denoise steps each save up to eight rank-local rows per present AV modality, using packed latent row IDs and the BF16 projection output before TP reduction.
+3. Run the candidate with H3_PROFILE=1 and H3_QUANT_REPLAY pointing to one of the Q0 replay/step-N directories. The candidate replays the same inputs through its loaded local weight and reports normalized L2, cosine and maximum absolute error for those slices. Run the pair for each calibration prompt and keep the captured tensors.
 4. Combine paired layer errors with weight and scale bytes. Review whole AV trajectories for speech, lip sync, seam, identity and prompt adherence. Choose the smallest accepted map that meets the measured residency target, then qualify it with paired warmed timing and held-out prompts.
 
 ### Historical context
@@ -72,3 +73,7 @@ An isolated loader smoke executed the loader function with mocked conversion
 and verified one-time conversion, early source release and BF16 retention.
 Both campaign plans, Python compilation, repo-selected Ruff rules and Bash
 syntax checks passed.
+
+### Phase 2.1
+
+Screen Q2 on A3 or Q5_FFN on A5 immediately after Q0. The broad Q1/Q5 screens are independent. On every rank the audit resolves protected projection families, checks the declared native parameter precision (including intentionally FP32 output heads), and requires all four supported block projections. The controller compares projection paths, precision, rank-local weight/scale shapes, operator lists, placement and source across the allocation. Replay files bind source, checkpoint, rank, modality and step. Capture is limited to three steps, 32 selected layers and eight rows per modality. Existing TP-local once-only conversion guards and the diffusion format policy remain in force. Actual device matmul, scale layouts, memory and quality require operator execution.

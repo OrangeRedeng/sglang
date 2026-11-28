@@ -233,8 +233,8 @@ if [[ -v H3_QUANT_CASE ]]; then
         echo "R02 cases require merged, monolithic B0 and the unmodified dense attention/FFN path." >&2
         exit 2
     fi
-    if [[ "$H3_QUANT_CASE" == Q5 && ( "$devices" != 8 || "$attention" != fa ) ]]; then
-        echo "Q5 requires eight Ascend 950 devices with dense FA." >&2
+    if [[ "$H3_QUANT_CASE" =~ ^Q5(_FFN|_ALLOWLIST)?$ && ( "$devices" != 8 || "$attention" != fa ) ]]; then
+        echo "MXFP8 requires eight Ascend 950 devices with dense FA." >&2
         exit 2
     fi
     git diff --quiet HEAD || { echo "R02 cases require a clean tracked source checkout." >&2; exit 2; }
