@@ -398,3 +398,101 @@ def test_supervisor_configures_loopback_and_rejects_otherwise():
             {"endpoint": "http://example.com/v1/chat/completions", "model": "m"},
             {},
         )
+
+
+# --- phase 2.2: launcher-integration fixes ----------------------------------
+
+
+def test_r02_quant_backend_never_empty_and_matched(manifest):
+    from experiment_controller import launch_environment
+
+    manifest = deepcopy(manifest)
+    manifest["cases"] = [
+        {"id": "q0", "adapter": "R02.Q0", "after": [], "repeat_of": None, "samples": 1},
+        {"id": "q2", "adapter": "R02.Q2", "after": ["q0"], "repeat_of": None, "samples": 1},
+    ]
+    for case in manifest["cases"]:
+        env = launch_environment(manifest, case)
+        # Every quant case pins the same dense backend: matched Q0/candidate
+        # comparison, and never a set-but-empty override.
+        assert env["H3_ATTENTION_BACKEND"] == "fa"
+        assert env["H3_ATTENTION_BACKEND"] != ""
+
+
+def test_r02_candidates_reference_q0_precision_map(manifest, tmp_path):
+    from experiment_controller import launch_environment
+
+    manifest = deepcopy(manifest)
+    manifest["cases"] = [
+        {"id": "q0", "adapter": "R02.Q0", "after": [], "repeat_of": None, "samples": 1},
+        {"id": "q2", "adapter": "R02.Q2", "after": ["q0"], "repeat_of": None, "samples": 1},
+        {
+            "id": "q3",
+            "adapter": "R02.Q3",
+            "after": ["q0"],
+            "repeat_of": None,
+            "samples": 1,
+        },
+    ]
+    manifest["capabilities"]["r02_q3"] = {"path": "/tmp/allowlist.json", "sha256": "0" * 64}
+    (tmp_path / "q0").mkdir()
+    q0_map = tmp_path / "q0" / "precision-rank-0.json"
+    q0_map.write_text("{}")
+
+    env = launch_environment(manifest, manifest["cases"][1], tmp_path)
+    assert env["H3_QUANT_REFERENCE"] == str(tmp_path / "q0" / "precision-rank-0.json")
+    # The allowlist comes from the verified capability receipt (Q3 only).
+    assert "H3_QUANT_ALLOWLIST" not in env
+    env = launch_environment(manifest, manifest["cases"][2], tmp_path)
+    assert env["H3_QUANT_ALLOWLIST"] == "/tmp/allowlist.json"
+    assert env["H3_QUANT_REFERENCE"] == str(tmp_path / "q0" / "precision-rank-0.json")
+
+    # A missing reference fails the launch instead of silently quantizing
+    # against an unmatched baseline.
+    with pytest.raises(ValueError, match="R02.Q0 first"):
+        launch_environment(manifest, manifest["cases"][1], tmp_path / "empty")
+
+
+def test_r03_seam_and_window_policies_are_distinct(manifest):
+    from experiment_controller import launch_environment, validate
+
+    seam_case = dict(id="adaptive", adapter="R03.ADAPTIVE", after=[], repeat_of=None, samples=1)
+    env = launch_environment(manifest, seam_case)
+    # Seam-policy names go to H3_SEAM_POLICY, never to the G/L schedule.
+    assert env["H3_SEAM_POLICY"] == "adaptive"
+    assert "H3_WINDOW_POLICY" not in env
+    assert "SGLANG_H3_WINDOW_POLICY" not in env
+
+    window_case = dict(id="glll", adapter="R03.WINDOW.GLLL", after=[], repeat_of=None, samples=1)
+    env = launch_environment(manifest, window_case)
+    assert env["H3_WINDOW_POLICY"] == "GLLL"
+    assert env["H3_GLOBAL_STEPS"] == "4"
+    assert "H3_SEAM_POLICY" not in env
+
+    # Unregistered schedules are rejected before any launch (the registry is
+    # the source of truth for runnable cases).
+    invalid = deepcopy(manifest)
+    invalid["cases"].append(
+        dict(id="gggg", adapter="R03.WINDOW.GGGG", after=[], repeat_of=None, samples=1)
+    )
+    with pytest.raises(ValueError, match="Invalid case identity or adapter"):
+        validate(invalid)
+
+
+def test_r04_workspace_flag_and_sync_requires_profile(manifest):
+    from experiment_controller import launch_environment
+
+    d2 = dict(id="d2", adapter="R04.D2", after=[], repeat_of=None, samples=1)
+    env = launch_environment(manifest, d2)
+    # The launcher consumes H3_WINDOW_WORKSPACE; the old
+    # H3_REQUEST_LOCAL_WORKSPACE name is gone.
+    assert env["H3_WINDOW_WORKSPACE"] == "1"
+    assert "H3_REQUEST_LOCAL_WORKSPACE" not in env
+
+    sync = dict(id="sync", adapter="R04.D1.SYNC", after=[], repeat_of=None, samples=1)
+    env = launch_environment(manifest, sync)
+    assert env["H3_DISPATCH_SYNC"] == "1"
+    # Diagnostic synchronization requires profiling; the registry marks the
+    # adapter profiled, so H3_PROFILE=1 must accompany the sync flag.
+    assert env["H3_PROFILE"] == "1"
+    assert "H3_DISPATCH_TRACE" not in env

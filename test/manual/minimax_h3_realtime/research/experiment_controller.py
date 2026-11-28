@@ -21,7 +21,7 @@ from contextlib import ExitStack, closing, contextmanager
 from importlib import metadata
 from pathlib import Path
 
-from checkpoint_contract import SCHEDULES
+
 from checkpoint_contract import digest as checkpoint_digest
 from checkpoint_contract import is_sha, load_verified, reject_runtime_lora
 from runner import digest, save
@@ -62,6 +62,10 @@ REGISTRY = {
     "R02.Q5_ALLOWLIST": ("B0", False, "r02_q5_allowlist"),
     **{f"R02.{case}": ("B0", False, f"r02_{case.lower()}") for case in ("Q0", "Q1", "Q2", "Q3", "Q4", "Q5")},
     **{f"R03.{name.upper()}": ("W2", False, "r03_policy") for name in ("fixed", "shifted", "adaptive", "context", "cosine")},
+    **{
+        f"R03.WINDOW.{name}": ("W2", False, "r03_policy")
+        for name in ("GLLL", "LLGL", "GLLG", "GLGL")
+    },
     "R04.D0.B0": ("B0", False, "r04_trace"),
     "R04.D0.W1": ("W1", False, "r04_trace"),
     "R04.D1.TRACE": ("B0", True, "r04_trace"),
@@ -311,10 +315,23 @@ def validate(manifest):
             require(
                 repeat is None, "Repeat must name an earlier case of the same adapter"
             )
-        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"}:
+        if adapter in {
+            "R02.Q1",
+            "R02.Q2",
+            "R02.Q3",
+            "R02.Q4",
+            "R02.Q5_FFN",
+            "R02.Q5_ALLOWLIST",
+        }:
             require(
                 sum(seen[dependency] == "R02.Q0" for dependency in after) == 1,
                 "Selective quantization requires exactly one R02.Q0 predecessor",
+            )
+        if adapter.startswith("R03.WINDOW."):
+            schedule = adapter.split(".", 2)[2]
+            require(
+                re.fullmatch(r"[GL]{2,}", schedule) is not None and "L" in schedule,
+                "R03 window policy must be a G/L schedule with at least one L",
             )
         seen[case_id] = adapter
 
@@ -353,11 +370,18 @@ def validate_denoise_match(match, adapter):
         updates == expected_updates and evaluations > 0,
         "Invalid scheduler or logical DiT counters",
     )
-    if adapter.startswith("R03."):
+    if adapter.startswith("R03.WINDOW."):
+        schedule = adapter.split(".", 2)[2]
+        require(
+            re.search(rf"policy={re.escape(schedule)}(?:\s|$)", match),
+            "Missing measured R03 window policy",
+        )
+    elif adapter.startswith("R03."):
         policy = adapter.split(".", 1)[1].lower()
         require(
-            re.search(rf"(?:policy|seam_policy)={re.escape(policy)}(?:\s|$)", match),
-            "Missing measured R03 window policy",
+            policy in ("fixed", "shifted", "adaptive", "context", "cosine")
+            and re.search(rf"seam_policy={re.escape(policy)}(?:\s|$)", match),
+            "Missing measured R03 seam policy",
         )
     return updates, evaluations
 
@@ -824,7 +848,7 @@ def preflight(manifest, directory, deadline, case=None):
     )
 
 
-def launch_environment(manifest, case):
+def launch_environment(manifest, case, cases_dir=None):
     contract = manifest["contract"]
     reject_runtime_lora()
     env = {
@@ -879,22 +903,58 @@ def launch_environment(manifest, case):
         # The pinned capability file doubles as the sparse policy config the
         # launcher requires; validation has already hash-pinned it.
         env["H3_ATTENTION_CONFIG"] = manifest["capabilities"]["r08_sparse"]["path"]
-    if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
-        env["H3_QUANT_CASE"] = adapter.split(".", 1)[1]
+    if adapter.startswith("R02.Q"):
+        case_name = adapter.split(".", 1)[1]
+        env["H3_QUANT_CASE"] = case_name
+        # Matched backend and topology: every quant case pins the same dense
+        # backend so Q0 and the candidate differ only in precision. Never
+        # emit an empty override: the launcher treats a set-but-empty backend
+        # as an explicit invalid selection.
         env["H3_ATTENTION_BACKEND"] = "fa"
-    if adapter.startswith("R02.Q") and adapter not in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
-        env["H3_QUANT_CASE"] = adapter.split(".")[1]
-        env["H3_ATTENTION_BACKEND"] = "fa" if adapter == "R02.Q5" else env.get("H3_ATTENTION_BACKEND", "")
-    if adapter.startswith("R03."):
+        if adapter != "R02.Q0":
+            q0_ids = [
+                dep
+                for dep in case["after"]
+                if next(
+                    item["adapter"] for item in manifest["cases"] if item["id"] == dep
+                )
+                == "R02.Q0"
+            ]
+            require(
+                len(q0_ids) == 1,
+                f"{adapter} requires exactly one R02.Q0 predecessor",
+            )
+            q0_id = q0_ids[0]
+            reference = f"cases/{q0_id}/precision-rank-0.json"
+            if cases_dir is not None:
+                reference = str(Path(cases_dir) / q0_id / "precision-rank-0.json")
+                require(
+                    Path(reference).is_file(),
+                    "Missing verified Q0 precision reference; run R02.Q0 first",
+                )
+            env["H3_QUANT_REFERENCE"] = reference
+        capability = {
+            "R02.Q3": "r02_q3",
+            "R02.Q5_ALLOWLIST": "r02_q5_allowlist",
+        }.get(adapter)
+        if capability is not None:
+            # The allowlist is an operator-approved capability receipt: the
+            # controller already verified its path and content hash.
+            env["H3_QUANT_ALLOWLIST"] = manifest["capabilities"][capability]["path"]
+    if adapter.startswith("R03.WINDOW."):
+        schedule = adapter.split(".", 2)[2]
         env["SGLANG_H3_WINDOW_MODE"] = "global-local"
-        env["SGLANG_H3_WINDOW_POLICY"] = adapter.split(".", 1)[1].lower()
-    if adapter == "R04.D1.TRACE":
-        env["H3_DISPATCH_TRACE"] = "1"
+        # The launcher validates the schedule length against the global-step
+        # count and requires at least one L.
+        env["H3_GLOBAL_STEPS"] = str(len(schedule))
+        env["H3_WINDOW_POLICY"] = schedule
+    elif adapter.startswith("R03."):
+        env["SGLANG_H3_WINDOW_MODE"] = "global-local"
+        env["H3_SEAM_POLICY"] = adapter.split(".", 1)[1].lower()
     if adapter == "R04.D1.SYNC":
-        env["H3_DISPATCH_TRACE"] = "1"
         env["H3_DISPATCH_SYNC"] = "1"
     if adapter == "R04.D2":
-        env["H3_REQUEST_LOCAL_WORKSPACE"] = "1"
+        env["H3_WINDOW_WORKSPACE"] = "1"
     return env
 
 
@@ -1021,7 +1081,6 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
                 == checkpoint_sha,
                 f"Mismatched rank precision evidence: {rank}",
             )
-||||||| parent of 1982bffa19 (Require verified H3 merge lineage and measured execution for timing)
     profile = REGISTRY[adapter][1]
     diagnostic = records[1]["diagnostic"]
     require(type(diagnostic) is bool, "Missing diagnostic classification")
@@ -1055,10 +1114,15 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
             any(path.is_file() for path in (run / "profiles").rglob("*")),
             "Missing device profiler artifacts",
         )
-    if adapter.startswith("R04.D1."):
+    if adapter == "R04.D1.SYNC":
         require(
-            any(path.name in ("dispatch_trace.json", "trace.json") for path in run.rglob("*.json")),
-            "Blocked: R04 diagnostic artifact is missing",
+            comparison.get("dispatch_sync") == "1",
+            "R04 diagnostic synchronization was not active for this run",
+        )
+    if adapter == "R04.D2":
+        require(
+            comparison.get("window_workspace") == "1",
+            "R04 request-local workspace was not active for this run",
         )
     if adapter == "R06.GRAPH.W0R":
         require(
@@ -1246,7 +1310,7 @@ def campaign(manifest, directory, config=None):
             case = next(item for item in manifest["cases"] if item["id"] == case_id)
             output = directory / "cases" / case_id
             output.mkdir(parents=True)
-            env = launch_environment(manifest, case)
+            env = launch_environment(manifest, case, directory / "cases")
             argv = [
                 "bash",
                 manifest["launcher"],
