@@ -71,6 +71,7 @@ def test_no_unapproved_repeat_or_cross_family_adapter(manifest):
             adapter=manifest["cases"][0]["adapter"],
             after=["b0"],
             repeat_of=None,
+            samples=1,
         )
     )
     with pytest.raises(ValueError, match="explicit repeat"):
