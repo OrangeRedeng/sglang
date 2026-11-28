@@ -307,6 +307,8 @@ def test_r_series_adapters_registered_with_gates():
         assert REGISTRY[adapter][2] == capability
     for diagnostic in ("R08.DISPATCHLOG", "R08.MEMOSTATS", "R08.FFNLOG"):
         assert REGISTRY[diagnostic][1] is True  # profiled diagnostics
+    assert REGISTRY["R02.Q5_FFN"][2] == "r02_q5_ffn"
+    assert REGISTRY["R02.Q5_ALLOWLIST"][2] == "r02_q5_allowlist"
     # L16 requires sixteen devices
     assert REGISTRY["R05.SP8PAD.L16"][0] == "L16"
 
@@ -324,6 +326,18 @@ def test_l16_requires_sixteen_devices(manifest):
     )
     with pytest.raises(ValueError, match="sixteen"):
         validate(invalid)
+
+
+def test_a5_q6_q7_require_a5_family(manifest):
+    invalid = deepcopy(manifest)
+    invalid["cases"].append(
+        dict(id="q5ffn", adapter="R02.Q5_FFN", after=["b0"], repeat_of=None, samples=1)
+    )
+    with pytest.raises(ValueError, match="A5 target"):
+        validate(invalid)
+    invalid["contract"]["family"] = "A5-TARGET"
+    invalid["contract"]["devices"] = list(range(8))
+    validate(invalid)
 
 
 def test_launch_environment_sets_real_flags(manifest):

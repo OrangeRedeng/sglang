@@ -3,6 +3,8 @@
   "id": "h09-a3-screen",
   "approved": false,
   "source_sha": "0000000000000000000000000000000000000000",
+  "source_root": "/absolute/path/to/branch-worktree",
+  "launcher": "/absolute/path/to/branch-worktree/test/manual/minimax_h3_realtime/research/run_a3_windowing.sh",
   "contract": {
     "family": "A3-C4",
     "host": "approved-a3-host",

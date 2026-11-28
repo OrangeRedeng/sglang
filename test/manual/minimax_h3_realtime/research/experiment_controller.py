@@ -57,6 +57,8 @@ REGISTRY = {
     "R08.DISPATCHLOG": ("B0", True, None),
     "R08.MEMOSTATS": ("B0", True, None),
     "R08.FFNLOG": ("B0", True, None),
+    "R02.Q5_FFN": ("B0", False, "r02_q5_ffn"),
+    "R02.Q5_ALLOWLIST": ("B0", False, "r02_q5_allowlist"),
 }
 # Evidence identifiers that must never unlock a gate (invalid historical
 # comparisons; see R08/H02 audit in RESEARCH_STATE).
@@ -79,6 +81,8 @@ CASE_FAMILIES = {
     "R01.HIST.OFF": "native50",
     "R01.HIST.ON": "native50",
 }
+for _adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+    CASE_FAMILIES[_adapter] = "flashgen4"
 ACTIONS = {
     "run_case",
     "repeat_case",
@@ -131,7 +135,8 @@ def absolute_path(value):
 
 def validate(manifest):
     fields(
-        manifest, "version id approved source_sha contract limits capabilities cases"
+        manifest,
+        "version id approved source_sha source_root launcher contract limits capabilities cases",
     )
     require(
         type(manifest["version"]) is int and manifest["version"] == 2,
@@ -144,6 +149,12 @@ def validate(manifest):
     require(
         re.fullmatch(r"[0-9a-f]{40}", manifest["source_sha"] or "") is not None,
         "Pin a full Git SHA",
+    )
+    require(
+        absolute_path(manifest["source_root"])
+        and absolute_path(manifest["launcher"])
+        ,
+        "Pin the source worktree and its branch-specific launcher",
     )
 
     contract = manifest["contract"]
@@ -239,6 +250,8 @@ def validate(manifest):
             require(len(devices) == 8, "Historical controls require eight devices")
         if adapter == "R05.SP8PAD.L16":
             require(len(devices) == 16, "L16 head padding requires sixteen devices")
+        if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+            require(family == "A5-TARGET", "Conservative A5 R02 cases require the A5 target family")
         samples = case["samples"]
         require(
             type(samples) is int and 1 <= samples <= 12,
@@ -715,10 +728,15 @@ def preflight(manifest, directory, deadline):
     require(
         socket.gethostname() == contract["host"], "Host does not match the allocation"
     )
+    source_root = Path(manifest["source_root"])
+    require(source_root.is_dir() and Path(manifest["launcher"]).is_file(),
+            "Pinned source worktree or launcher is missing")
     source = subprocess.check_output(
-        ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True
     ).strip()
-    dirty = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"])
+    dirty = subprocess.check_output(
+        ["git", "-C", str(source_root), "status", "--porcelain"]
+    )
     require(
         source == manifest["source_sha"] and not dirty,
         "Use the approved clean checkout",
@@ -769,6 +787,9 @@ def launch_environment(manifest, case):
         H3_CHECKPOINT_MANIFEST=contract["checkpoint_manifest"],
         H3_CHECKPOINT_RECEIPT=contract["checkpoint_receipt"],
         H3_EXPECTED_CHECKPOINT_SHA=contract["checkpoint_manifest_sha256"],
+        H3_SOURCE_SHA=manifest["source_sha"],
+        H3_SOURCE_ROOT=manifest["source_root"],
+        H3_LAUNCHER=manifest["launcher"],
         H3_PROMPT=contract["prompt"],
         H3_NUM_GPUS=str(len(contract["devices"])),
         H3_LASER16="1",
@@ -803,6 +824,9 @@ def launch_environment(manifest, case):
         # The pinned capability file doubles as the sparse policy config the
         # launcher requires; validation has already hash-pinned it.
         env["H3_ATTENTION_CONFIG"] = manifest["capabilities"]["r08_sparse"]["path"]
+    if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+        env["H3_QUANT_CASE"] = "Q6" if adapter.endswith("FFN") else "Q7"
+        env["H3_ATTENTION_BACKEND"] = "fa"
     return env
 
 
@@ -882,12 +906,20 @@ def run_launcher(argv, env, log, timeout, stop, lock_fds):
     return status or ("completed" if process.returncode == 0 else "failed")
 
 
-def results(directory, adapter, deadline, samples=1):
+def results(directory, adapter, deadline, samples=1, source_sha=None):
     runs = list(directory.glob("run-*"))
     require(
         len(runs) == 1 and runs[0].is_dir(), "Expected one launcher artifact directory"
     )
     run = runs[0]
+    comparison_path = run / "comparison.json"
+    require(comparison_path.is_file(), "Missing execution identity receipt")
+    comparison = json.loads(comparison_path.read_text())
+    if source_sha is not None:
+        require(
+            comparison.get("source_sha") == source_sha,
+            "Execution source SHA differs from the approved branch",
+        )
     records = [
         json.loads(line) for line in (run / "samples.jsonl").read_text().splitlines()
     ]
@@ -1093,9 +1125,9 @@ def campaign(manifest, directory, config=None):
             env = launch_environment(manifest, case)
             argv = [
                 "bash",
-                str(LAUNCHER),
+                manifest["launcher"],
                 "--inside",
-                str(ROOT),
+                manifest["source_root"],
                 REGISTRY[case["adapter"]][0],
                 str(output / "run"),
             ]
@@ -1132,6 +1164,7 @@ def campaign(manifest, directory, config=None):
                             case["adapter"],
                             run_started + limits["run_timeout_s"],
                             case["samples"],
+                            manifest["source_sha"],
                         )
                         status = (
                             "diagnostic" if REGISTRY[case["adapter"]][1] else "measured"
