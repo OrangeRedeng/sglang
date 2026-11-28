@@ -22,6 +22,7 @@ from pathlib import Path
 
 from checkpoint_contract import digest as checkpoint_digest
 from checkpoint_contract import is_sha, load_verified, reject_runtime_lora
+from quantization_cases import METHODS as QUANTIZATION_METHODS
 from runner import digest, save
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -45,12 +46,17 @@ REGISTRY = {
     "R01.QUALITY.TURBO": ("B0", False, None),
     "R01.HIST.OFF": ("HIST-OFF", False, None),
     "R01.HIST.ON": ("HIST-ON", False, None),
+    **{
+        f"R02.{case}": ("B0", False, "r02_sensitivity" if case == "Q3" else None)
+        for case in QUANTIZATION_METHODS
+    },
 }
 CHECKPOINT_FAMILIES = {
     "A3-C4": "flashgen4",
     "A3-T8": "turbo8",
     "A3-NATIVE50": "native50",
     "A5-TARGET": "flashgen4",
+    "A5-R02": "flashgen4",
 }
 CASE_FAMILIES = {
     "H08.NATIVE50": "native50",
@@ -137,6 +143,7 @@ def validate(manifest):
         "A3-T8": (8, 16),
         "A3-NATIVE50": (8, 16),
         "A5-TARGET": (8,),
+        "A5-R02": (8,),
     }
     family = contract["family"]
     require(family in sizes, "Unknown deployment family")
@@ -212,16 +219,32 @@ def validate(manifest):
             "Invalid case identity or adapter",
         )
         require(
-            CHECKPOINT_FAMILIES[family] == CASE_FAMILIES.get(adapter, "flashgen4"),
+            CHECKPOINT_FAMILIES[family] == CASE_FAMILIES.get(adapter, "flashgen4")
+            or (family == "A3-T8" and adapter.startswith("R02.")),
             "Adapter and schedule must use the same deployment family",
         )
         if adapter.startswith("R01.HIST."):
             require(len(devices) == 8, "Historical controls require eight devices")
+        if family == "A5-R02":
+            require(
+                adapter in {"R02.Q0", "R02.Q5"} and contract["soc_version"] >= 260,
+                "A5-R02 requires Ascend 950 and Q0/Q5",
+            )
+        elif adapter in {"R02.Q1", "R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5"}:
+            require(
+                family in {"A3-C4", "A3-T8"} and adapter != "R02.Q5",
+                "Q1–Q4 require A3; Q5 requires A5-R02",
+            )
         after, repeat = case["after"], case["repeat_of"]
         require(
             isinstance(after, list) and all(item in seen for item in after),
             "Dependencies must precede the case",
         )
+        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4"}:
+            require(
+                sum(seen[dependency] == "R02.Q0" for dependency in after) == 1,
+                "Selective quantization requires one Q0 dependency",
+            )
         similar = [key for key, value in seen.items() if value == adapter]
         if similar:
             require(
@@ -487,7 +510,7 @@ def preflight(manifest, directory, deadline):
     )
 
 
-def launch_environment(manifest, case):
+def launch_environment(manifest, case, latest=None, output=None):
     contract = manifest["contract"]
     reject_runtime_lora()
     env = {
@@ -514,6 +537,29 @@ def launch_environment(manifest, case):
         SGLANG_H3_NPU_ADALN_MEMO="0",
     )
     adapter = case["adapter"]
+    if adapter.startswith("R02."):
+        env["H3_QUANT_CASE"] = adapter.split(".")[1]
+        if contract["family"] == "A5-R02":
+            env["H3_ATTENTION_BACKEND"] = "fa"
+        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4"}:
+            baseline = next(
+                item["id"]
+                for item in manifest["cases"]
+                if item["id"] in case["after"] and item["adapter"] == "R02.Q0"
+            )
+            env["H3_QUANT_REFERENCE"] = str(
+                Path(latest[baseline]["artifacts"]) / "precision-rank-0.json"
+            )
+        if adapter == "R02.Q3":
+            proof = manifest["capabilities"]["r02_sensitivity"]
+            proof_content = Path(proof["path"]).read_bytes()
+            require(
+                hashlib.sha256(proof_content).hexdigest() == proof["sha256"],
+                "Sensitivity receipt changed since approval",
+            )
+            allowlist = output / "quantization-allowlist.json"
+            save(allowlist, json.loads(proof_content)["allowlist"])
+            env["H3_QUANT_ALLOWLIST"] = str(allowlist)
     if adapter in ("R01.PARITY.B0", "R01.PARITY.W0R"):
         env["H3_WINDOW_PARITY"] = "1"
     if adapter.startswith("R01.CROP."):
@@ -597,7 +643,7 @@ def run_launcher(argv, env, log, timeout, stop, lock_fds):
     return status or ("completed" if process.returncode == 0 else "failed")
 
 
-def results(directory, adapter, deadline):
+def results(directory, adapter, deadline, contract=None):
     runs = list(directory.glob("run-*"))
     require(
         len(runs) == 1 and runs[0].is_dir(), "Expected one launcher artifact directory"
@@ -647,6 +693,19 @@ def results(directory, adapter, deadline):
             any(path.is_file() for path in (run / "profiles").rglob("*")),
             "Missing device profiler artifacts",
         )
+    if adapter.startswith("R02."):
+        method = QUANTIZATION_METHODS[adapter.split(".")[1]]
+        for rank in range(len(contract["devices"])):
+            evidence = json.loads((run / f"precision-rank-{rank}.json").read_text())
+            require(
+                evidence["rank"] == rank
+                and evidence["method"] == method
+                and evidence["checkpoint_manifest_sha256"]
+                == contract["checkpoint_manifest_sha256"]
+                and bool(evidence["layers"])
+                and (method == "bf16" or evidence["probed_layers"]),
+                f"Missing or mismatched precision evidence for rank {rank}",
+            )
     return dict(
         artifacts=str(run),
         output_sha256=hashes,
@@ -784,7 +843,6 @@ def campaign(manifest, directory, config=None):
             case = next(item for item in manifest["cases"] if item["id"] == case_id)
             output = directory / "cases" / case_id
             output.mkdir(parents=True)
-            env = launch_environment(manifest, case)
             argv = [
                 "bash",
                 str(LAUNCHER),
@@ -807,6 +865,7 @@ def campaign(manifest, directory, config=None):
             status = "blocked"
             evidence = dict(artifacts=str(output))
             try:
+                env = launch_environment(manifest, case, latest, output)
                 visible = check_devices(env, manifest)
                 save(output / "device_preflight.json", visible)
                 timeout = limits["run_timeout_s"] - (time.monotonic() - run_started)
@@ -815,7 +874,10 @@ def campaign(manifest, directory, config=None):
                 )
                 if status == "completed":
                     evidence = results(
-                        output, case["adapter"], run_started + limits["run_timeout_s"]
+                        output,
+                        case["adapter"],
+                        run_started + limits["run_timeout_s"],
+                        contract,
                     )
                     status = (
                         "diagnostic" if REGISTRY[case["adapter"]][1] else "measured"

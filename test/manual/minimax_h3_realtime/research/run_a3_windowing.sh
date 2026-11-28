@@ -17,7 +17,7 @@ if [[ ${1:-} != --inside ]]; then
         H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
         H3_NATIVE_REFERENCE H3_NATIVE_VAE H3_QUALITY H3_ATTENTION_BACKEND H3_ATTENTION_CONFIG \
         H3_FFN_ACTIVE_FRACTION SGLANG_H3_NPU_ADALN_MEMO \
-        H3_SERVE_ONLY H3_BIND_HOST H3_LASER_CROP_BEFORE_CAST H3_WINDOW_PARITY H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
+        H3_QUANT_CASE H3_QUANT_REFERENCE H3_QUANT_ALLOWLIST H3_QUANT_CAPTURE H3_QUANT_REPLAY H3_SERVE_ONLY H3_BIND_HOST H3_LASER_CROP_BEFORE_CAST H3_WINDOW_PARITY H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
     done
@@ -224,6 +224,46 @@ fi
 if [[ -v H3_FFN_ACTIVE_FRACTION ]]; then
     args+=(--minimax-h3-ffn-active-fraction "$H3_FFN_ACTIVE_FRACTION")
 fi
+export H3_LAUNCH_PLACEMENT="$visible:TP2:SP$sp:Ulysses$((sp / ring)):Ring$ring:$attention:pin=${H3_PIN_CPU_MEMORY:-true}:pad=${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}"
+unset SGLANG_H3_QUANT_AUDIT SGLANG_H3_QUANT_CAPTURE SGLANG_H3_QUANT_REPLAY
+if [[ -v H3_QUANT_CASE ]]; then
+    if [[ "$case_id" != B0 || "$family" == native50 || "$attention" == ascend_sparse_attn ||
+        -v H3_ATTENTION_CONFIG || -v H3_FFN_ACTIVE_FRACTION || -v H3_LASER_CROP_BEFORE_CAST ||
+        ${H3_WINDOW_PARITY:-0} == 1 ]]; then
+        echo "R02 cases require merged, monolithic B0 and the unmodified dense attention/FFN path." >&2
+        exit 2
+    fi
+    if [[ "$H3_QUANT_CASE" == Q5 && ( "$devices" != 8 || "$attention" != fa ) ]]; then
+        echo "Q5 requires eight Ascend 950 devices with dense FA." >&2
+        exit 2
+    fi
+    git diff --quiet HEAD || { echo "R02 cases require a clean tracked source checkout." >&2; exit 2; }
+    source_sha=$(git rev-parse HEAD)
+    resolved=$(python3 "$research/quantization_cases.py" "$H3_QUANT_CASE" "$identity" \
+        "$H3_LAUNCH_PLACEMENT" "$source_sha" "$output/quantization-selection.json")
+    mapfile -t quantization <<< "$resolved"
+    export SGLANG_H3_QUANT_AUDIT="$output" SGLANG_H3_QUANT_CHECKPOINT="$identity"
+    export SGLANG_H3_QUANT_METHOD="${quantization[0]}" SGLANG_H3_QUANT_PLACEMENT="$H3_LAUNCH_PLACEMENT"
+    export SGLANG_H3_QUANT_SOURCE="$source_sha"
+    if [[ -v H3_QUANT_CAPTURE ]]; then
+        if [[ "$H3_QUANT_CASE" != Q0 || ${H3_PROFILE:-0} != 1 || -v H3_QUANT_REPLAY ]]; then
+            echo "Layer inputs can be captured only during a profiled BF16 Q0." >&2
+            exit 2
+        fi
+        export SGLANG_H3_QUANT_CAPTURE="$H3_QUANT_CAPTURE"
+    fi
+    if [[ -v H3_QUANT_REPLAY ]]; then
+        if [[ "$H3_QUANT_CASE" == Q0 || ${H3_PROFILE:-0} != 1 ]]; then
+            echo "Layer replay requires a separate profiled quantized trial." >&2
+            exit 2
+        fi
+        export SGLANG_H3_QUANT_REPLAY="$H3_QUANT_REPLAY"
+    fi
+    if [[ "${quantization[0]}" != bf16 ]]; then
+        args+=(--component-quantizations.transformer "${quantization[0]}"
+            --component-quantization-ignored-layers.transformer "${quantization[@]:1}")
+    fi
+fi
 printf '%q ' "${args[@]}" > "$output/launch.txt"
 printf '\nvisible_devices=%s\nrungs=%s\nquality=%s\n' \
     "$visible" "${SGLANG_H3_DENOISE_RUNGS:-native}" "${H3_QUALITY:-lossless}" >> "$output/launch.txt"
@@ -271,7 +311,6 @@ until curl -fsS --max-time 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
 done
 
 export H3_PROMPT="${H3_PROMPT:-$default_prompt}"
-export H3_LAUNCH_PLACEMENT="$visible:TP2:SP$sp:Ulysses$((sp / ring)):Ring$ring:$attention:pin=${H3_PIN_CPU_MEMORY:-true}:pad=${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}"
 echo "Server ready. Running $case_id requests."
 python3 -u - "$output" "$port" "$duration" "$steps" "$case_id" "$served_model" "$video_shift" "$audio_shift" <<'PY'
 import json
@@ -316,6 +355,11 @@ comparison = dict(
     crop_before_cast=os.environ["SGLANG_H3_LASER_CROP_BEFORE_CAST"],
     cache_dit=os.environ["SGLANG_CACHE_DIT_ENABLED"],
     profile=os.getenv("H3_PROFILE", "0"),
+    quantization=(
+        json.loads((out / "quantization-selection.json").read_text())
+        if (out / "quantization-selection.json").exists()
+        else None
+    ),
     ffn_active_fraction=os.getenv("H3_FFN_ACTIVE_FRACTION", "1"),
 )
 (out / "comparison.json").write_text(json.dumps(comparison, indent=2))

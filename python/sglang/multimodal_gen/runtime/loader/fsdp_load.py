@@ -335,6 +335,18 @@ def maybe_load_fsdp_model(
         use_fsdp = False
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
+    if use_fsdp and any(
+        getattr(
+            getattr(module, "quant_method", None),
+            "requires_local_weight_conversion",
+            False,
+        )
+        for module in model.modules()
+    ):
+        raise ValueError(
+            "Online Ascend quantization of diffusion linears requires TP/local weights; FSDP DTensors are unsupported"
+        )
+
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
     keep_checkpoint_mapping = bool(
         current_platform.is_mps()
@@ -666,6 +678,20 @@ def load_model_from_full_model_state_dict(
         tuple[torch.dtype, torch.dtype], list[str]
     ] = defaultdict(list)
 
+    weight_converters = {}
+    if not is_fsdp_model:
+        for name, module in model.named_modules():
+            convert = getattr(
+                getattr(module, "quant_method", None), "_process_weight_on_load", None
+            )
+            if convert is not None:
+                prefix = f"{name}." if name else ""
+                weight_converters[f"{prefix}weight"] = (
+                    module,
+                    convert,
+                    f"{prefix}weight_scale",
+                )
+
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
         loaded_tensor = custom_param_sd[target_param_name]
@@ -690,6 +716,15 @@ def load_model_from_full_model_state_dict(
         )
         is_rank_local_shard = is_rank_local_fsdp_shard or is_rank_local_tp_shard
         full_tensor = loaded_tensor.tensor if is_rank_local_shard else loaded_tensor
+
+        conversion = weight_converters.get(target_param_name)
+        if conversion is not None and full_tensor.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError(
+                f"{target_param_name} requires BF16/FP16 source weights for online W8A8"
+            )
 
         if not is_rank_local_shard:
             full_tensor = _maybe_dequantize_fp8(
@@ -820,6 +855,7 @@ def load_model_from_full_model_state_dict(
                             f"param_cls={type(actual_param).__name__}"
                         ) from exc
                     sharded_tensor = temp_param.data
+                    del temp_param
                     if host_spill is not None and spilled is not None:
                         host_spill.seal(
                             target_param_name, meta_sharded_param.shape, target_dtype
@@ -892,6 +928,23 @@ def load_model_from_full_model_state_dict(
             sharded_sd[target_param_name] = nn.Parameter(
                 sharded_tensor, requires_grad=False
             )
+
+        if conversion is not None:
+            module, convert, scale_name = conversion
+            module.weight = sharded_sd[target_param_name]
+            # Keep only the completed TP-local floating-point weight during conversion.
+            del (
+                custom_param_sd[target_param_name],
+                loaded_tensor,
+                full_tensor,
+                sharded_tensor,
+            )
+            convert(module)
+            if cpu_offload:
+                module.weight.data = module.weight.data.cpu()
+                module.weight_scale.data = module.weight_scale.data.cpu()
+            sharded_sd[target_param_name] = module.weight
+            sharded_sd[scale_name] = module.weight_scale
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 

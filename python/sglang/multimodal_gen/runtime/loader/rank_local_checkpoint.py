@@ -74,7 +74,7 @@ def get_param_for_weight_loading(
     param_name: str,
 ) -> torch.nn.Parameter | None:
     actual_param = param_dict.get(param_name)
-    if actual_param is not None and actual_param.__dict__.get("weight_loader"):
+    if actual_param is not None and getattr(actual_param, "weight_loader", None):
         return actual_param
 
     pre_fsdp_weight_loader_params = model.__dict__.get(
@@ -250,7 +250,7 @@ def read_rank_local_tensor(
 def _resolve_tp_shard_dim(
     actual_param: torch.nn.Parameter,
 ) -> tuple[bool, int | None]:
-    weight_loader = actual_param.__dict__.get("weight_loader")
+    weight_loader = getattr(actual_param, "weight_loader", None)
     if weight_loader is None:
         return True, None
     if not isinstance(weight_loader, MethodType):
@@ -260,10 +260,10 @@ def _resolve_tp_shard_dim(
     if isinstance(owner, ReplicatedLinear):
         return True, None
     if isinstance(owner, ColumnParallelLinear):
-        output_dim = actual_param.__dict__.get("output_dim")
+        output_dim = getattr(actual_param, "output_dim", None)
         return output_dim is not None, output_dim
     if isinstance(owner, RowParallelLinear):
-        input_dim = actual_param.__dict__.get("input_dim")
+        input_dim = getattr(actual_param, "input_dim", None)
         return True, input_dim
     return False, None
 
@@ -361,11 +361,13 @@ def _tp_read_plan(
     supported, dim = _resolve_tp_shard_dim(param)
     if not supported:
         return None
-    loader = param.__dict__.get("weight_loader")
+    loader = getattr(param, "weight_loader", None)
     if loader is None:
         return _TPReadPlan(dim)
     owner = loader.__self__
-    if not isinstance(owner.quant_method, UnquantizedLinearMethod):
+    if not isinstance(owner.quant_method, UnquantizedLinearMethod) and not getattr(
+        owner.quant_method, "supports_rank_local_tp_source", False
+    ):
         return None
     # Subclasses with different loaders (e.g. GQA QKV replication) need their
     # own explicit layout contract; inheriting ColumnParallelLinear is not one.

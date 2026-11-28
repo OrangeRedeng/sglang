@@ -1,5 +1,7 @@
 import copy
 import logging
+import os
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
@@ -577,6 +579,34 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             else nullcontext()
         )
 
+        quant_audit = (
+            os.getenv("SGLANG_H3_QUANT_AUDIT")
+            if is_minimax_h3 and component_name == "transformer"
+            else None
+        )
+        if quant_audit:
+            from sglang.multimodal_gen.runtime.loader.minimax_h3_precision import (
+                record_precision_map,
+            )
+            from sglang.multimodal_gen.runtime.utils.perf_logger import (
+                capture_memory_snapshot,
+            )
+
+            if not current_platform.is_npu():
+                raise ValueError("R02 precision trials require an Ascend device")
+            expected = os.environ["SGLANG_H3_QUANT_METHOD"]
+            actual = (
+                runtime_quant_config.get_name()
+                if runtime_quant_config is not None
+                else "bf16"
+            )
+            if actual != expected or checkpoint_quant_config is not None:
+                raise ValueError(
+                    f"Expected R02 precision {expected}, resolved {actual}"
+                )
+            allocator_before = capture_memory_snapshot().to_dict()
+            load_started = time.perf_counter()
+
         # Model construction resolves attention implementations, so apply the
         # quantization-specific default around FSDP initialization and loading.
         with attn_backend_context:
@@ -606,5 +636,9 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             post_load_hook(model)
 
         _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
+
+        if quant_audit:
+            torch.npu.synchronize()
+            record_precision_map(model, quant_audit, load_started, allocator_before)
 
         return model

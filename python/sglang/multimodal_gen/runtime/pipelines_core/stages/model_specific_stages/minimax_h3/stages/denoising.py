@@ -1455,6 +1455,24 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
+            capture = os.getenv("SGLANG_H3_QUANT_CAPTURE")
+            if capture and not batch.is_warmup and batch.profile and step_index == 0:
+                if runner is not None or self._cache_dit_enabled:
+                    raise ValueError(
+                        "BF16 layer capture requires eager execution and cache off"
+                    )
+                from sglang.multimodal_gen.runtime.loader.minimax_h3_precision import (
+                    capture_precision_replay,
+                )
+
+                with capture_precision_replay(
+                    model,
+                    call_kwargs,
+                    capture,
+                    request_id=batch.request_id,
+                    step=step_index,
+                ):
+                    return model(**call_kwargs)
             if runner is None:
                 return model(**call_kwargs)
             # timestep bits are eager memo keys, not graph specialization inputs

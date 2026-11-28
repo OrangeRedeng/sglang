@@ -1,0 +1,76 @@
+{
+  "version": 2,
+  "id": "r02-a3-selective",
+  "approved": false,
+  "source_sha": "0000000000000000000000000000000000000000",
+  "contract": {
+    "family": "A3-C4",
+    "host": "approved-a3-host",
+    "devices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "soc_version": 250,
+    "port": 30088,
+    "software": {
+      "torch": "fill",
+      "torch_npu": "fill",
+      "mindiesd": "absent",
+      "cann_version_file": "/absolute/path/to/cann-version",
+      "cann_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "prompt": "An uninterrupted tracking shot follows a cyclist through a quiet park with matching ambient sound.",
+    "seed": 1101,
+    "quality": "lossless",
+    "checkpoint_manifest": "/absolute/path/to/flashgen4.json",
+    "checkpoint_receipt": "/absolute/path/to/flashgen4.receipt.json",
+    "checkpoint_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "limits": {
+    "max_runs": 4,
+    "max_wall_s": 7500,
+    "max_device_s": 57600,
+    "run_timeout_s": 1800,
+    "min_free_mib": 52000,
+    "min_disk_mib": 10000
+  },
+  "capabilities": {},
+  "cases": [
+    {
+      "id": "q0",
+      "adapter": "R02.Q0",
+      "after": [],
+      "repeat_of": null
+    },
+    {
+      "id": "q1",
+      "adapter": "R02.Q1",
+      "after": [
+        "q0"
+      ],
+      "repeat_of": null
+    },
+    {
+      "id": "q2",
+      "adapter": "R02.Q2",
+      "after": [
+        "q0"
+      ],
+      "repeat_of": null
+    },
+    {
+      "id": "q4",
+      "adapter": "R02.Q4",
+      "after": [
+        "q0"
+      ],
+      "repeat_of": null
+    }
+  ]
+}

@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUMXFP8LinearMethod,
 )
+from sglang.srt.hardware_backend.npu.utils import is_ascend_950
+from sglang.srt.layers.quantization.utils import _module_path_match, is_layer_skipped
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -76,7 +78,18 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
         if self.layer_markers is not None and prefix not in self.layer_markers:
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
-            return NPUMXFP8LinearMethod(self)
+            if self.is_checkpoint_fp8_serialized or self.layer_markers is not None:
+                return NPUMXFP8LinearMethod(self)
+            if any(
+                _module_path_match(pattern, prefix)
+                for pattern in self.ignored_layers or ()
+            ) or is_layer_skipped(
+                prefix,
+                self.ignored_layers or [],
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedLinearMethod()
+            return NPUOnlineMXFP8DiffusionLinearMethod(self)
         if not self.is_checkpoint_fp8_serialized:
             from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_online import (
                 MXFP8OnlineLinearMethod,
@@ -84,6 +97,42 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
 
             return MXFP8OnlineLinearMethod(self)
         return ComfyMXFP8LinearMethod(self)
+
+
+class NPUOnlineMXFP8DiffusionLinearMethod(NPUMXFP8LinearMethod):
+    uses_explicit_npu_formats = True
+    requires_local_weight_conversion = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_diffusion_mxfp8_processed", False):
+            return
+        if not is_ascend_950() or not all(
+            callable(getattr(torch.ops.npu, name, None))
+            for name in ("npu_dynamic_mx_quant", "npu_quant_matmul")
+        ):
+            raise RuntimeError(
+                "Online MXFP8 requires Ascend 950-class MX quantization and matmul"
+            )
+        n, k = layer.weight.shape
+        if k % 64 or layer.weight.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Online Ascend MXFP8 requires BF16/FP16 weights and a TP-local K divisible by 64"
+            )
+        super().process_weights_after_loading(layer)
+        scale = layer.weight_scale_inv
+        if (
+            layer.weight.shape != (k, n)
+            or layer.weight.dtype != torch.float8_e4m3fn
+            or scale.shape != (k // 64, n, 2)
+            or scale.dtype not in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
+        ):
+            raise RuntimeError("Unexpected Ascend MXFP8 paired scale layout")
+        layer._diffusion_mxfp8_processed = True
+
+    def apply(self, layer, x, bias=None):
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Online Ascend MXFP8 requires BF16/FP16 activations")
+        return super().apply(layer, x, bias)
 
 
 class ComfyMXFP8LinearMethod(SRTFp8LinearMethod):
