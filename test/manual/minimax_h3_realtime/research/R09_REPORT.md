@@ -30,6 +30,14 @@ The existing `experiment_controller.py` already provided: typed manifest validat
 
 ## 2. What changed, per handoff requirement
 
+The campaign manifest now pins both an absolute source worktree and the
+branch-specific launcher. Preflight verifies the worktree SHA and cleanliness,
+and launch uses that exact launcher and source root. Every completed run must
+also contain a `comparison.json` receipt whose execution SHA matches the
+approved source. Conservative A5 R02 cases are registered as `R02.Q5_FFN` and
+`R02.Q5_ALLOWLIST`, mapping to the R02 launcher's Q6/Q7 implementation behind
+separate capability gates.
+
 ### Durable ledger, unique run IDs, case fingerprints (resume only identical evidence)
 - `journal()` now sets `PRAGMA journal_mode=WAL` + `synchronous=FULL`: a killed controller cannot lose a reservation or terminal record (which would otherwise double-spend the budget).
 - Every launch records a fresh UUID `run_id`; the terminal record carries the same id, so paired reservation/reconciliation is unambiguous even across retries.
