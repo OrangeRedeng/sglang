@@ -1054,7 +1054,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         "H3 windowing requires a verified 4- or 8-step schedule"
                     )
                 if mode != "single":
-                    from ..windowing import prepare_windows
+                    from ..windowing import (
+                        boundary_offsets,
+                        choose_boundary,
+                        prepare_windows,
+                    )
 
                     window_policy = "L" * num_steps
                     if mode == "global-local":
@@ -1076,30 +1080,144 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             raise ValueError(
                                 "H3 window policy needs one G/L per step and at least one L"
                             )
-                    windows = prepare_windows(
-                        packed,
-                        tags,
-                        emb["hidden_states"],
-                        latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
-                        audio_t=ctx.audio_t,
-                        sigmas=ctx.sigmas,
-                        overlap=float(os.getenv("SGLANG_H3_WINDOW_OVERLAP", "0.08")),
-                        device=device,
-                        full_window=mode == "repack",
-                    )
-                    for window in windows.windows:
-                        _precompute_refined_prompt_embeds(
-                            model,
-                            window.branch,
-                            device=device,
-                            shared_conditioning=emb,
+                    seam_policy = os.getenv("SGLANG_H3_SEAM_POLICY", "fixed")
+                    if seam_policy not in (
+                        "fixed",
+                        "shifted",
+                        "adaptive",
+                        "context",
+                        "cosine",
+                    ):
+                        raise ValueError("Invalid H3 seam policy")
+                    if seam_policy != "fixed" and mode != "global-local":
+                        raise ValueError(
+                            "H3 seam policies require global-local windowing"
                         )
-                        _precompute_rope_cache(model, window.branch, device=device)
-                    window_forward = partial(
-                        windows.predict,
-                        forward_dit,
-                        profile=current_platform.is_npu() and batch.profile,
+                    overlap = float(os.getenv("SGLANG_H3_WINDOW_OVERLAP", "0.08"))
+                    offsets = (
+                        boundary_offsets(ctx.latent_t, overlap)
+                        if seam_policy in ("shifted", "adaptive")
+                        else (0,)
                     )
+                    plans = {}
+                    for offset in offsets:
+                        plan = prepare_windows(
+                            packed,
+                            tags,
+                            emb["hidden_states"],
+                            latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                            audio_t=ctx.audio_t,
+                            sigmas=ctx.sigmas,
+                            overlap=overlap,
+                            device=device,
+                            full_window=mode == "repack",
+                            offset=offset,
+                            cosine=seam_policy == "cosine",
+                            anchors=seam_policy == "context",
+                        )
+                        for window in plan.windows:
+                            _precompute_refined_prompt_embeds(
+                                model,
+                                window.branch,
+                                device=device,
+                                shared_conditioning=emb,
+                            )
+                            _precompute_rope_cache(model, window.branch, device=device)
+                        plans[offset] = plan
+                    windows = plans[0]
+
+                    def window_forward(model, video, audio, step, slot):
+                        offset = 0
+                        scores = None
+                        reason = "fixed"
+                        if seam_policy == "shifted" and len(offsets) == 3:
+                            offset = (0, offsets[1], offsets[2], 0)[step % 4]
+                            reason = "step_schedule"
+                        elif seam_policy == "adaptive" and step and len(offsets) > 1:
+                            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                                get_replica_group,
+                            )
+
+                            group = get_replica_group()
+                            decision = (
+                                choose_boundary(plans, video, audio)
+                                if group.rank_in_group == 0
+                                else None
+                            )
+                            offset, scores = group.broadcast_object(decision)
+                            reason = (
+                                "previous_state"
+                                if all(math.isfinite(score) for score in scores)
+                                else "nonfinite_center_fallback"
+                            )
+                        elif seam_policy == "adaptive":
+                            reason = "initial_center" if not step else "single_bucket"
+                        plan = plans[offset]
+                        report = (
+                            {}
+                            if batch.profile
+                            and get_world_rank() == 0
+                            and mode != "repack"
+                            else None
+                        )
+                        output = plan.predict(
+                            forward_dit,
+                            model,
+                            video,
+                            audio,
+                            step,
+                            slot,
+                            profile=current_platform.is_npu() and batch.profile,
+                            diagnostics=report,
+                        )
+                        if report is not None:
+                            (_, stop, _, audio_stop), (start, _, audio_start, _) = (
+                                plan.ranges
+                            )
+                            report.update(
+                                ranges=plan.ranges,
+                                offset=offset,
+                                scores=scores,
+                                reason=reason,
+                                video_rope_bounds=plan.video_times[
+                                    [start, stop]
+                                ].tolist(),
+                                audio_rope_bounds=plan.audio_times[
+                                    [audio_start, audio_stop]
+                                ].tolist(),
+                                video_overlap_seconds=(
+                                    (
+                                        plan.video_times[[start, stop]]
+                                        - plan.video_times[0]
+                                    )
+                                    / 40
+                                ).tolist(),
+                                audio_overlap_seconds=(
+                                    (
+                                        plan.audio_times[[audio_start, audio_stop]]
+                                        - plan.audio_times[0]
+                                    )
+                                    / 40
+                                ).tolist(),
+                                video_ramp_endpoints=plan.video_ramp[[0, -1]].tolist(),
+                                audio_ramp_endpoints=plan.audio_ramp[[0, -1]].tolist(),
+                                context_rows=[
+                                    w.context.numel() if w.context is not None else 0
+                                    for w in plan.windows
+                                ],
+                                packed_rows=[
+                                    w.branch.static_kwargs["img_position_ids"].shape[1]
+                                    for w in plan.windows
+                                ],
+                            )
+                            logger.info(
+                                "H3 seam request=%s step=%d %s",
+                                batch.request_id,
+                                step,
+                                report,
+                            )
+                        return output
+
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             if parity:
                 _log_window_parity(

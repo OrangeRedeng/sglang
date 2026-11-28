@@ -14,7 +14,7 @@ if [[ ${1:-} != --inside ]]; then
     command -v docker >/dev/null || { echo "Run this on the A3 Docker host." >&2; exit 1; }
     env_args=()
     for key in H3_CHECKPOINT_MANIFEST H3_CHECKPOINT_RECEIPT H3_EXPECTED_CHECKPOINT_SHA H3_MODEL H3_LIGHTVAE H3_STEPS H3_FLOW_SHIFT H3_PORT H3_MASTER_PORT H3_B3_DEVICES \
-        H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
+        H3_MERGED_FLASHGEN H3_LASER16 H3_SEAM_POLICY H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
         H3_NATIVE_REFERENCE H3_NATIVE_VAE H3_QUALITY H3_ATTENTION_BACKEND H3_ATTENTION_CONFIG \
         H3_FFN_ACTIVE_FRACTION SGLANG_H3_NPU_ADALN_MEMO \
         H3_SERVE_ONLY H3_BIND_HOST H3_LASER_CROP_BEFORE_CAST H3_WINDOW_PARITY H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
@@ -147,6 +147,14 @@ case ${H3_QUALITY:-lossless} in
     exact|lossless) ;;
     *) echo "H3_QUALITY must be exact or lossless." >&2; exit 2 ;;
 esac
+unset SGLANG_H3_SEAM_POLICY
+if [[ -v H3_SEAM_POLICY ]]; then
+    if [[ ${SGLANG_H3_WINDOW_MODE:-} != global-local || ! "$H3_SEAM_POLICY" =~ ^(fixed|shifted|adaptive|context|cosine)$ ]]; then
+        echo "H3_SEAM_POLICY requires W2–W4 and fixed, shifted, adaptive, context or cosine." >&2
+        exit 2
+    fi
+    export SGLANG_H3_SEAM_POLICY="$H3_SEAM_POLICY"
+fi
 if [[ -v H3_WINDOW_POLICY ]]; then
     if [[ ${SGLANG_H3_WINDOW_MODE:-} != global-local || ! "$H3_WINDOW_POLICY" =~ ^[GL]+$ ||
         ${#H3_WINDOW_POLICY} != "$steps" || "$H3_WINDOW_POLICY" != *L* ]]; then
@@ -316,6 +324,7 @@ comparison = dict(
     crop_before_cast=os.environ["SGLANG_H3_LASER_CROP_BEFORE_CAST"],
     cache_dit=os.environ["SGLANG_CACHE_DIT_ENABLED"],
     profile=os.getenv("H3_PROFILE", "0"),
+    seam_policy=os.getenv("SGLANG_H3_SEAM_POLICY", "fixed"),
     ffn_active_fraction=os.getenv("H3_FFN_ACTIVE_FRACTION", "1"),
 )
 (out / "comparison.json").write_text(json.dumps(comparison, indent=2))
