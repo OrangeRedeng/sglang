@@ -66,6 +66,10 @@ REGISTRY = {
     "R04.D1.TRACE": ("B0", True, "r04_trace"),
     "R04.D1.SYNC": ("B0", True, "r04_trace"),
     "R04.D2": ("W1", False, "r04_trace"),
+    "R06.V0": ("W0R", False, "r06_vae_graph"),
+    "R06.V1": ("W0R", False, "r06_vae_graph"),
+    "R06.V2": ("W0R", False, "r06_vae_graph"),
+    "R06.V3": ("W0R", False, "r06_vae_graph"),
 }
 # Evidence identifiers that must never unlock a gate (invalid historical
 # comparisons; see R08/H02 audit in RESEARCH_STATE).
@@ -857,6 +861,10 @@ def launch_environment(manifest, case):
         env["SGLANG_H3_NPU_ADALN_MEMO"] = "1"
     if adapter == "R06.GRAPH.W0R":
         env["SGLANG_H3_VAE_NPU_GRAPH"] = "1"
+        env["SGLANG_H3_VAE_AV_OVERLAP"] = "0"
+    if adapter.startswith("R06.V"):
+        env["SGLANG_H3_VAE_NPU_GRAPH"] = "1" if adapter in ("R06.V1", "R06.V3") else "0"
+        env["SGLANG_H3_VAE_AV_OVERLAP"] = "1" if adapter in ("R06.V2", "R06.V3") else "0"
     if adapter == "R08.DISPATCHLOG":
         env["SGLANG_H3_ATTN_DISPATCH_LOG"] = "1"
     if adapter == "R08.MEMOSTATS":
@@ -1051,6 +1059,31 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
             any("graph" in path.name.lower() for path in run.rglob("*.json")),
             "Blocked: R06 graph capture/replay counters are missing",
         )
+    if adapter.startswith("R06.V"):
+        execution = []
+        for log in run.rglob("server.log"):
+            for line in log.read_text().splitlines():
+                marker = "H3 VAE execution "
+                if marker in line:
+                    try:
+                        execution.append(json.loads(line.split(marker, 1)[1]))
+                    except json.JSONDecodeError as error:
+                        raise ValueError("Invalid R06 VAE execution receipt") from error
+        ranks = {int(item.get("rank", -1)) for item in execution}
+        expected_ranks = set(range(len(devices or ())))
+        require(execution and ranks == expected_ranks, "Missing R06 per-rank VAE receipts")
+        graph = adapter in ("R06.V1", "R06.V3")
+        overlap = adapter in ("R06.V2", "R06.V3")
+        for item in execution:
+            require(
+                item.get("overlap_enabled") is overlap
+                and item.get("audio_side_stream") is overlap
+                and (item.get("captures", 0) == 0 if not graph else item.get("captures", 0) >= 1)
+                and (item.get("replays", 0) == 0 if not graph else item.get("replays", 0) >= 1)
+                and item.get("capture_failures", 0) == 0
+                and item.get("replay_failures", 0) == 0,
+                "R06 VAE graph/overlap receipt does not match the case",
+            )
     evidence = dict(
         artifacts=str(run),
         output_sha256=hashes,
