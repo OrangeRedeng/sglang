@@ -115,7 +115,14 @@ Only after E1–E4 individually pass device quality gates. The pieces compose th
 PYTHONPATH=python python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_r05_port.py -q
 # capability probe (operator host)
 python3 test/manual/minimax_h3_realtime/research/r05_comm_probe.py
-# E1/E4 ablation flags (existing quality gate, no new flags added)
-#   exact default:        quality gate off  -> standalone BF16 chain, index_select
-#   numerical opt-in:     MINIMAX_H3_NORM_MODULATE enabled -> runs + npu_add_rms_norm
+# Independent launch controls
+#   E0 exact control:     quality=exact; SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0
+#   E1 contiguous runs:   quality=lossless; NPU activates block_combined_runs automatically
+#   E2 packed QKV:        quality=exact; NPU path uses the cat-pack fallback
+#   E3 Laser varlen:      quality=exact; Laser single-segment path activates automatically
+#   E4 residual/norm:     quality=lossless; MINIMAX_H3_NORM_MODULATE is a quality gate,
+#                         not an environment variable
+#   E5 head pipeline:     quality=exact; SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=-1
+#                         and global rows >= 8192
+#   E6/E7 probes:         python3 research/r05_comm_probe.py --json
 ```
