@@ -249,9 +249,7 @@ class DistributedWindowCoordinator:
             if dispatch.request_id != self.request_id or dispatch.step != step
         ]
         if invalid:
-            self.counters.rejected_request += sum(
-                dispatch.request_id != self.request_id for dispatch in invalid
-            )
+            self.counters.rejected_request += len(invalid)
             raise PredictionRejection(
                 f"step {step} dispatch identity does not match request {self.request_id!r}"
             )
