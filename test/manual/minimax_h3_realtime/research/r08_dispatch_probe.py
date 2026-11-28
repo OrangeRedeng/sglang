@@ -18,9 +18,12 @@ is reported with its full traceback for the operator campaign.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.metadata
 import json
+from pathlib import Path
+import subprocess
 import sys
 import traceback
 
@@ -52,40 +55,42 @@ def _signature_report(module_name: str, names: tuple[str, ...]) -> dict:
         try:
             import inspect
 
-            entry["signature"] = (
-                str(inspect.signature(function)) if function else None
-            )
+            entry["signature"] = str(inspect.signature(function)) if function else None
         except (TypeError, ValueError):
             entry["signature"] = "not introspectable"
         report["operators"][name] = entry
     return report
 
 
-def _minimal_call_report(label: str, callable_fn, kwargs: dict) -> dict:
-    """Run one minimal operator call; capture the complete traceback.
-
-    An error here is a *finding* (recorded with traceback), never a crash of
-    the probe. Run on the device host only; skipped when tensors cannot be
-    created.
-    """
-    try:
-        callable_fn(**kwargs)
-    except Exception as error:  # noqa: BLE001 - full capture is the point
-        return {
-            "label": label,
-            "status": "error",
-            "exception": f"{type(error).__name__}: {error}",
-            "traceback": traceback.format_exc(),
-        }
-    return {"label": label, "status": "ok"}
+CASES = (
+    "native_dense",
+    "laser_dense",
+    "mindiesd_import",
+    "quant_dense",
+    "rfv2",
+    "rfv3",
+)
 
 
-def collect(run_device_calls: bool) -> dict:
+def collect(
+    run_device_calls: bool,
+    *,
+    tokens=2048,
+    heads=28,
+    head_dim=128,
+    config=None,
+    case=None,
+) -> dict:
     result: dict = {
         "probe": "r08_dispatch_probe",
         "experiment_identity": {
             "model": "MiniMax-H3-FL2VA",
-            "shape": {"batch": 1, "tokens": 4, "heads": 4, "head_dim": 128},
+            "shape": {
+                "batch": 1,
+                "tokens": tokens,
+                "heads": heads,
+                "head_dim": head_dim,
+            },
             "dtype": "bfloat16",
             "layouts": {"native_dense": "BNSD", "mindiesd_sparse": "BSND"},
         },
@@ -133,83 +138,135 @@ def collect(run_device_calls: bool) -> dict:
     )
     result["layers"]["laser_dense_fallback"] = laser
 
+    root = Path(__file__).resolve().parents[4]
+    policy = (
+        config
+        if config is not None
+        else {"video_spans": [{"start": 0, "latent_shape": [1, 1, tokens]}]}
+    )
+    identity = result["experiment_identity"]
+    identity.update(
+        source_sha=subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        config_sha256=hashlib.sha256(
+            json.dumps(policy, sort_keys=True).encode()
+        ).hexdigest(),
+        geometry="operator input"
+        if config is not None
+        else "synthetic single video span",
+    )
+    selected = (case,) if case else CASES
+    receipts = result["capability_receipts"]
+    for name in selected:
+        receipts[name] = {"status": "device_pending", "experiment_identity": identity}
     if not run_device_calls:
         result["minimal_calls"] = [
             {"label": "skipped (host without device)", "status": "skipped"}
         ]
-        for case in ("native_dense", "laser_dense", "mindiesd_import", "quant_dense", "rfv2", "rfv3"):
-            result["capability_receipts"][case] = {"status": "device_pending"}
         return result
 
-    # Device-only minimal calls; every failure is captured with traceback.
-    try:
+    def probe(name):
         import torch
+        import torch_npu
 
-        import torch_npu  # noqa: F401
-
+        if name == "mindiesd_import":
+            module = importlib.import_module("mindiesd")
+            extensions = [
+                str(path.relative_to(Path(module.__file__).parent))
+                for path in Path(module.__file__).parent.rglob("*.so")
+            ]
+            return {
+                "package": module.__file__,
+                "extension_files": extensions,
+                "registered_ops": sorted(
+                    op
+                    for op in torch._C._dispatch_get_all_op_names()
+                    if "mindie" in op.lower()
+                ),
+            }
         if not torch.npu.is_available():
             raise RuntimeError("no NPU device visible")
-        device = "npu:0"
-        query = torch.randn(1, 4, 128, 128, device=device, dtype=torch.bfloat16)
-        key = torch.randn(1, 4, 128, 128, device=device, dtype=torch.bfloat16)
-        value = torch.randn(1, 4, 128, 128, device=device, dtype=torch.bfloat16)
-        score = torch.npu.npu_fused_infer_attention_score
-        result["minimal_calls"].append(
-            _minimal_call_report(
-                "layer1:npu_fused_infer_attention_score",
-                score,
-                dict(
-                    query=query.transpose(1, 2),
-                    key=key.transpose(1, 2),
-                    value=value.transpose(1, 2),
-                    num_heads=4,
-                    input_layout="BNSD",
-                    scale=1.0 / 8,
-                    inner_precise=0,
-                ),
-            )
+        shape = (1, tokens, heads, head_dim)
+        q, k, v = (
+            torch.randn(shape, device="npu", dtype=torch.bfloat16) for _ in range(3)
         )
-        from mindiesd import sparse_attention
+        scale = head_dim**-0.5
+        kwargs = dict(
+            num_heads=heads, head_size=head_dim, causal=False, softmax_scale=scale
+        )
+        if name == "native_dense":
+            q, k, v = (tensor.transpose(1, 2).contiguous() for tensor in (q, k, v))
+            output = torch_npu.npu_fused_infer_attention_score(
+                q, k, v, num_heads=heads, input_layout="BNSD", scale=scale
+            )[0]
+            path = "torch_npu.npu_fused_infer_attention_score"
+        elif name == "laser_dense":
+            from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                LaserAttentionImpl,
+            )
 
-        result["minimal_calls"].append(
-            _minimal_call_report(
-                "layer3:mindiesd.sparse_attention(bf16)",
-                sparse_attention,
-                dict(
-                    query=query,
-                    key=key,
-                    value=value,
-                    sparse_type="rf_v2",
-                    precision="bf16",
-                    block_size=128,
-                    inner_precise=0,
-                    sparsity=0.5,
-                    input_layout="BSND",
-                    head_num=4,
-                    scale=1.0 / 8,
-                    is_causal=False,
-                ),
+            impl = LaserAttentionImpl(**kwargs)
+            output = impl.forward(q, k, v, None, preserve_bf16_range=True)
+            path = (
+                "LaserAttentionImpl.SDPA"
+                if tokens < impl.min_seqlen
+                else "LaserAttentionImpl._laser_attention"
             )
-        )
-        result["capability_receipts"].update(
-            {
-                "native_dense": {"status": result["minimal_calls"][0]["status"], "shape": result["experiment_identity"]["shape"]},
-                "mindiesd_import": {"status": result["layers"]["mindiesd_sparse"]["status"]},
-                "rfv2": {"status": result["minimal_calls"][-1]["status"], "policy": "rf_v2"},
-                "rfv3": {"status": "unprobed", "requires": "installed MindIE-SD RFv3 support"},
-                "laser_dense": {"status": "signature_only", "layer": "laser_dense_fallback"},
-                "quant_dense": {"status": "signature_only", "layer": "mindiesd_quant"},
-            }
-        )
-    except Exception as error:  # noqa: BLE001
-        result["minimal_calls"].append(
-            {
-                "label": "device setup",
-                "status": "error",
-                "exception": f"{type(error).__name__}: {error}",
-                "traceback": traceback.format_exc(),
-            }
-        )
+        elif name == "quant_dense":
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                AscendFAImpl,
+                AscendFAMetadata,
+            )
+
+            metadata = AscendFAMetadata(
+                **policy.get("dense_kwargs", {"precision": "fp8"})
+            )
+            if metadata.precision in (None, "bf16"):
+                raise ValueError("quant_dense requires an explicit quantized precision")
+            output = AscendFAImpl(**kwargs).forward(q, k, v, metadata)
+            path = f"AscendFAImpl.{metadata.precision}"
+        else:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn import (
+                AscendSparseAttentionImpl,
+                AscendSparseAttentionMetadataBuilder,
+            )
+
+            options = dict(
+                policy,
+                sparse_type="rf_v2" if name == "rfv2" else "rf_v3",
+                skip_first_steps=0,
+                skip_last_steps=0,
+            )
+            metadata = AscendSparseAttentionMetadataBuilder().build(
+                current_timestep=0, **options
+            )
+            output = AscendSparseAttentionImpl(**kwargs).forward(q, k, v, metadata)
+            path = f"mindiesd.sparse_attention.{metadata.sparse_type}"
+        torch.npu.synchronize()
+        if output.shape != q.shape or not torch.isfinite(output).all().item():
+            raise ValueError(f"Invalid attention output from {path}")
+        return {
+            "path": path,
+            "input_shape": list(q.shape),
+            "strides": list(q.stride()),
+            "policy": policy,
+        }
+
+    for name in selected:
+        # A single-case invocation runs in its own process for device fault isolation.
+        try:
+            details = probe(name)
+            receipts[name].update(
+                status="imported" if name == "mindiesd_import" else "ok", **details
+            )
+        except Exception as error:
+            receipts[name].update(
+                status="error",
+                exception=f"{type(error).__name__}: {error}",
+                traceback=traceback.format_exc(),
+            )
+        result["minimal_calls"].append(dict(label=name, **receipts[name]))
     return result
 
 
@@ -221,11 +278,33 @@ def main() -> int:
         action="store_true",
         help="run the minimal operator calls (device host only)",
     )
+    parser.add_argument("--case", choices=CASES)
+    parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument("--heads", type=int, default=28)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="JSON sparse attention options including captured video_spans or latent grid",
+    )
     args = parser.parse_args()
-    result = collect(run_device_calls=args.device_calls)
+    if args.device_calls and not args.case:
+        parser.error("select one --case per device invocation for fault isolation")
+    if min(args.tokens, args.heads, args.head_dim) < 1:
+        parser.error("shape dimensions must be positive")
+    result = collect(
+        args.device_calls,
+        tokens=args.tokens,
+        heads=args.heads,
+        head_dim=args.head_dim,
+        config=json.loads(args.config.read_text()) if args.config else None,
+        case=args.case,
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
+        return int(
+            any(r["status"] == "error" for r in result["capability_receipts"].values())
+        )
     print("R08 attention dispatch probe")
     print(f"  packages: {json.dumps(result['packages'], sort_keys=True)}")
     for name, layer in sorted(result["layers"].items()):
@@ -237,7 +316,9 @@ def main() -> int:
     for step in result["h08_isolation_plan"]:
         print(f"  plan: {step}")
     print(f"\n{result['note']}")
-    return 0
+    return int(
+        any(r["status"] == "error" for r in result["capability_receipts"].values())
+    )
 
 
 if __name__ == "__main__":

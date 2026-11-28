@@ -244,8 +244,8 @@ def test_dispatch_probe_reports_without_device():
     assert report["minimal_calls"][0]["status"] == "skipped"
     assert report["experiment_identity"]["shape"] == {
         "batch": 1,
-        "tokens": 4,
-        "heads": 4,
+        "tokens": 2048,
+        "heads": 28,
         "head_dim": 128,
     }
     assert set(report["capability_receipts"]) == {

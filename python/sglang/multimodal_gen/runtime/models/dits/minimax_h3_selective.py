@@ -17,8 +17,15 @@ def selective_ffn_rows(
         raise ValueError("Selective FFN active fraction must be 0.5 or 0.75")
     if not video_spans:
         raise ValueError("Selective FFN requires explicit video spans")
+    if not 0 <= row_start <= row_stop <= seq_len:
+        raise ValueError("Invalid selective FFN rank-local row bounds")
+    if target_rows.ndim != 1 or target_rows.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Selective FFN target rows must be integer indices")
+    indices = target_rows.to(device="cpu", dtype=torch.long)
+    if indices.numel() and (indices.min() < 0 or indices.max() >= seq_len):
+        raise ValueError("Selective FFN target row outside packed sequence")
     target = torch.zeros(seq_len, dtype=torch.bool)
-    target[target_rows.to(device="cpu", dtype=torch.long)] = True
+    target[indices] = True
     groups = torch.full((seq_len,), -1, dtype=torch.long)
     previous_stop = 0
     for span in video_spans:
