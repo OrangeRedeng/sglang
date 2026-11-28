@@ -20,6 +20,7 @@ from contextlib import ExitStack, closing, contextmanager
 from importlib import metadata
 from pathlib import Path
 
+from checkpoint_contract import SCHEDULES
 from checkpoint_contract import digest as checkpoint_digest
 from checkpoint_contract import is_sha, load_verified, reject_runtime_lora
 from runner import digest, save
@@ -628,7 +629,21 @@ def results(directory, adapter, deadline):
         request_ids == matches.keys(),
         "Missing or duplicate denoise evidence",
     )
+    expected_steps = SCHEDULES[CASE_FAMILIES.get(adapter, "flashgen4")][0]
+    match = re.search(
+        r"\bscheduler_updates=(\d+) dit_evaluations=(\d+) request=(\S+) ",
+        matches[next(iter(request_ids))],
+    )
+    require(
+        match
+        and int(match[1]) == expected_steps
+        and int(match[2]) >= expected_steps
+        and match[3] in request_ids,
+        "Missing or inconsistent measured execution counters",
+    )
     profile = REGISTRY[adapter][1]
+    diagnostic = records[1]["diagnostic"]
+    require(type(diagnostic) is bool, "Missing diagnostic classification")
     frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []
     for index, row in enumerate(records):
@@ -660,8 +675,8 @@ def results(directory, adapter, deadline):
         artifacts=str(run),
         output_sha256=hashes,
         quality="review_required",
-        median_client_s=None if profile else elapsed,
-        p90_client_s=None if profile else elapsed,
+        median_client_s=None if profile or diagnostic else elapsed,
+        p90_client_s=None if profile or diagnostic else elapsed,
         request_ids=sorted(request_ids),
     )
 

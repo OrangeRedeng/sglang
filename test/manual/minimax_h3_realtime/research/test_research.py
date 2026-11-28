@@ -138,7 +138,7 @@ from pathlib import Path
 context=json.loads(Path(os.environ['H3_RESEARCH_CONTEXT']).read_text())
 result=Path(os.environ['H3_RESEARCH_RESULT'])
 media=result.with_suffix('.mp4'); media.write_bytes(b'host-fixture')
-result.write_text(json.dumps(dict(status='completed',actual_nfe=4,
+result.write_text(json.dumps(dict(status='completed',scheduler_updates=4,dit_evaluations=4,profiled=False,diagnostic=False,
 contract_hash=context['contract_hash'],workload_hash=context['workload_hash'],output_path=str(media),
 checkpoint_manifest_sha256=context['contract']['checkpoint_manifest_sha256'])))
 """)
@@ -207,11 +207,33 @@ def test_capability_gate_and_workload_mismatch(tmp_path):
     case = dict(suite["cases"][0], experiment="B05")
     assert len(runner.evidence_errors(suite, case)) == 2
     result = tmp_path / "sample.json"
+    for fields, expected in (
+        ({"actual_nfe": 4}, "scheduler updates"),
+        (
+            {"scheduler_updates": 4, "diagnostic": False, "profiled": False},
+            "DiT evaluations",
+        ),
+        (
+            {
+                "scheduler_updates": 4,
+                "dit_evaluations": 4,
+                "diagnostic": True,
+                "profiled": False,
+            },
+            "non-diagnostic",
+        ),
+    ):
+        result.write_text(json.dumps(dict(status="completed", **fields)))
+        with pytest.raises(ValueError, match=expected):
+            runner.verify_sample(result, suite["contract"], case)
     result.write_text(
         json.dumps(
             dict(
                 status="completed",
-                actual_nfe=4,
+                scheduler_updates=4,
+                dit_evaluations=4,
+                profiled=False,
+                diagnostic=False,
                 contract_hash=runner.digest(suite["contract"]),
                 workload_hash="wrong",
                 checkpoint_manifest_sha256=suite["contract"][
