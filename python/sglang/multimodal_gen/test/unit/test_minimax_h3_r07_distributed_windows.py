@@ -160,6 +160,20 @@ def test_empty_and_unknown_dispatch_rejected():
         assert "no window dispatches" in str(exc)
 
 
+def test_dispatch_identity_rejected_before_worker_execution():
+    calls = []
+
+    def forward(dispatch):
+        calls.append(dispatch)
+        return _identity(dispatch)
+
+    coordinator, _ = _make([LocalWindowWorker(forward)])
+    with pytest.raises(PredictionRejection, match="dispatch identity"):
+        coordinator.run_step(0, [_dispatch(1, 0)])
+    assert calls == []
+    assert coordinator.counters.rejected_request == 1
+
+
 def test_step_timeout_cancels_and_does_not_step():
     hang = threading.Event()
 

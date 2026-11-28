@@ -243,6 +243,18 @@ class DistributedWindowCoordinator:
             raise PredictionRejection(f"step {step} already completed")
         if not dispatches:
             raise PredictionRejection(f"step {step} has no window dispatches")
+        invalid = [
+            dispatch
+            for dispatch in dispatches
+            if dispatch.request_id != self.request_id or dispatch.step != step
+        ]
+        if invalid:
+            self.counters.rejected_request += sum(
+                dispatch.request_id != self.request_id for dispatch in invalid
+            )
+            raise PredictionRejection(
+                f"step {step} dispatch identity does not match request {self.request_id!r}"
+            )
         indexes = [dispatch.contract.index for dispatch in dispatches]
         if len(set(indexes)) != len(indexes):
             raise PredictionRejection(
