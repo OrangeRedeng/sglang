@@ -53,6 +53,7 @@ REGISTRY = {
     # it; on a checkout without the flag the env var is an inert no-op.
     "R05.NPUADALN.ON": ("B0", False, "r05_npu_adaln"),
     "R05.SP8PAD.L16": ("L16", False, "r05_sp8_pad"),
+    "R05.PIPELINE2.B0": ("B0", False, "r05_pipeline"),
     "R06.GRAPH.W0R": ("W0R", False, "r06_vae_graph"),
     "R08.SPARSE.H08": ("B0", False, "r08_sparse"),
     "R08.DISPATCHLOG": ("B0", True, None),
@@ -289,6 +290,8 @@ def validate(manifest):
             require(len(devices) == 8, "Historical controls require eight devices")
         if adapter == "R05.SP8PAD.L16":
             require(len(devices) == 16, "L16 head padding requires sixteen devices")
+        if adapter == "R05.PIPELINE2.B0":
+            require(len(devices) == 8, "Two-group head pipelining requires eight devices")
         if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
             require(family == "A5-TARGET", "Conservative A5 R02 cases require the A5 target family")
         if adapter == "R02.Q5":
@@ -884,6 +887,8 @@ def launch_environment(manifest, case, cases_dir=None):
         env["H3_LASER_CROP_BEFORE_CAST"] = str(int(adapter.endswith(".BEFORE")))
     if adapter == "R05.NPUADALN.ON":
         env["SGLANG_H3_NPU_ADALN_MEMO"] = "1"
+    if adapter == "R05.PIPELINE2.B0":
+        env["SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS"] = "2"
     if adapter == "R06.GRAPH.W0R":
         env["SGLANG_H3_VAE_NPU_GRAPH"] = "1"
         env["SGLANG_H3_VAE_AV_OVERLAP"] = "0"

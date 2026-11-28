@@ -496,3 +496,19 @@ def test_r04_workspace_flag_and_sync_requires_profile(manifest):
     # adapter profiled, so H3_PROFILE=1 must accompany the sync flag.
     assert env["H3_PROFILE"] == "1"
     assert "H3_DISPATCH_TRACE" not in env
+
+
+def test_r05_pipeline_ablation_registered_for_eight_devices(manifest):
+    from experiment_controller import launch_environment, validate
+
+    case = dict(id="pipeline2", adapter="R05.PIPELINE2.B0", after=[], repeat_of=None, samples=1)
+    env = launch_environment(manifest, case)
+    assert env["SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS"] == "2"
+
+    # Two head groups require the eight-device A3 allocation; sixteen is a
+    # valid family size that must still fail this adapter.
+    invalid = deepcopy(manifest)
+    invalid["contract"]["devices"] = list(range(16))
+    invalid["cases"].append(case)
+    with pytest.raises(ValueError, match="eight devices"):
+        validate(invalid)
