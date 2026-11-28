@@ -1025,6 +1025,10 @@ def _minimax_h3_group_attend(
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+# Minimum global sequence length for NPU LaserAttention 2-group collective
+# pipelining (below this threshold the extra attention launch outweighs
+# overlap). Candidate threshold from #53105, to be confirmed per topology.
+_NPU_LASER_PIPELINE_MIN_SEQ_LEN = 8192
 # packed kernels that return the softmax LSE the ring merge needs
 _RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
@@ -1051,14 +1055,23 @@ def _minimax_h3_collective_pipelined_attention(
     if groups < 0:
         groups = 2
     world_size, _ = get_ulysses_ctx()
+    is_npu_laser = (
+        current_platform.is_npu()
+        and attention._attention_backend_enum is AttentionBackendEnum.LASER_ATTN
+        and q.shape[0] * world_size >= _NPU_LASER_PIPELINE_MIN_SEQ_LEN
+        and not is_in_breakable_cuda_graph()
+    )
     if (
         envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
         or groups in (0, 1)
-        or attention._attention_backend_enum
-        not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+        or (
+            attention._attention_backend_enum
+            not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+            and not is_npu_laser
+        )
         or q.shape[1] % (world_size * groups)
         or torch.compiler.is_compiling()
-        or torch.cuda.is_current_stream_capturing()
+        or (not current_platform.is_npu() and torch.cuda.is_current_stream_capturing())
     ):
         return None
     impl = attention._attention_impl

@@ -503,6 +503,8 @@ def ulysses_head_group_pipelined_attention(
     bytes. Every input exchange is queued up front on the collective stream
     and group g's output exchange runs while group g + 1 attends.
     """
+    if prepacked_qkv is not None and prepacked_qkv.device.type != "npu":
+        raise ValueError("prepacked_qkv is only supported on NPU")
     group = get_sp_group().ulysses_group
     world_size = get_ulysses_parallel_world_size()
     if prepacked_qkv is not None:
