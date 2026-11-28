@@ -59,6 +59,13 @@ REGISTRY = {
     "R08.FFNLOG": ("B0", True, None),
     "R02.Q5_FFN": ("B0", False, "r02_q5_ffn"),
     "R02.Q5_ALLOWLIST": ("B0", False, "r02_q5_allowlist"),
+    **{f"R02.{case}": ("B0", False, f"r02_{case.lower()}") for case in ("Q0", "Q1", "Q2", "Q3", "Q4", "Q5")},
+    **{f"R03.{name.upper()}": ("W2", False, "r03_policy") for name in ("fixed", "shifted", "adaptive", "context", "cosine")},
+    "R04.D0.B0": ("B0", False, "r04_trace"),
+    "R04.D0.W1": ("W1", False, "r04_trace"),
+    "R04.D1.TRACE": ("B0", True, "r04_trace"),
+    "R04.D1.SYNC": ("B0", True, "r04_trace"),
+    "R04.D2": ("W1", False, "r04_trace"),
 }
 # Evidence identifiers that must never unlock a gate (invalid historical
 # comparisons; see R08/H02 audit in RESEARCH_STATE).
@@ -133,6 +140,14 @@ def absolute_path(value):
     return isinstance(value, str) and Path(value).is_absolute()
 
 
+def case_source(manifest, case):
+    return {
+        "source_root": case.get("source_root", manifest["source_root"]),
+        "source_sha": case.get("source_sha", manifest["source_sha"]),
+        "launcher": case.get("launcher", manifest["launcher"]),
+    }
+
+
 def validate(manifest):
     fields(
         manifest,
@@ -153,7 +168,7 @@ def validate(manifest):
     require(
         absolute_path(manifest["source_root"])
         and absolute_path(manifest["launcher"])
-        ,
+        and Path(manifest["launcher"]).is_relative_to(Path(manifest["source_root"])),
         "Pin the source worktree and its branch-specific launcher",
     )
 
@@ -236,12 +251,27 @@ def validate(manifest):
     require(isinstance(cases, list) and 0 < len(cases) <= 32, "Expected 1–32 cases")
     seen = {}
     for case in cases:
-        fields(case, "id adapter after repeat_of samples")
+        require(
+            isinstance(case, dict)
+            and set(case) in (
+                {"id", "adapter", "after", "repeat_of", "samples"},
+                {"id", "adapter", "after", "repeat_of", "samples", "source_root", "source_sha", "launcher"},
+            ),
+            "Invalid case fields",
+        )
         case_id, adapter = case["id"], case["adapter"]
         require(
             named(case_id) and case_id not in seen and adapter in REGISTRY,
             "Invalid case identity or adapter",
         )
+        if "source_root" in case:
+            require(
+                absolute_path(case["source_root"])
+                and absolute_path(case["launcher"])
+                and re.fullmatch(r"[0-9a-f]{40}", case["source_sha"] or "")
+                and Path(case["launcher"]).is_relative_to(Path(case["source_root"])),
+                "Branch launcher must be an absolute path contained by its source root",
+            )
         require(
             CHECKPOINT_FAMILIES[family] == CASE_FAMILIES.get(adapter, "flashgen4"),
             "Adapter and schedule must use the same deployment family",
@@ -252,6 +282,10 @@ def validate(manifest):
             require(len(devices) == 16, "L16 head padding requires sixteen devices")
         if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
             require(family == "A5-TARGET", "Conservative A5 R02 cases require the A5 target family")
+        if adapter == "R02.Q5":
+            require(family == "A5-TARGET", "R02 Q5 requires the A5 target family")
+        if adapter.startswith("R02.Q") and adapter not in ("R02.Q0", "R02.Q5", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+            require(family in ("A3-C4", "A3-T8"), "R02 Q1-Q4 require an A3 family")
         samples = case["samples"]
         require(
             type(samples) is int and 1 <= samples <= 12,
@@ -271,6 +305,11 @@ def validate(manifest):
         else:
             require(
                 repeat is None, "Repeat must name an earlier case of the same adapter"
+            )
+        if adapter in {"R02.Q2", "R02.Q3", "R02.Q4", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"}:
+            require(
+                sum(seen[dependency] == "R02.Q0" for dependency in after) == 1,
+                "Selective quantization requires exactly one R02.Q0 predecessor",
             )
         seen[case_id] = adapter
 
@@ -309,6 +348,12 @@ def validate_denoise_match(match, adapter):
         updates == expected_updates and evaluations > 0,
         "Invalid scheduler or logical DiT counters",
     )
+    if adapter.startswith("R03."):
+        policy = adapter.split(".", 1)[1].lower()
+        require(
+            re.search(rf"(?:policy|seam_policy)={re.escape(policy)}(?:\s|$)", match),
+            "Missing measured R03 window policy",
+        )
     return updates, evaluations
 
 
@@ -723,13 +768,14 @@ def reserve(stack, paths):
     return [stack.enter_context(exclusive(path)) for path in paths]
 
 
-def preflight(manifest, directory, deadline):
+def preflight(manifest, directory, deadline, case=None):
     contract = manifest["contract"]
     require(
         socket.gethostname() == contract["host"], "Host does not match the allocation"
     )
-    source_root = Path(manifest["source_root"])
-    require(source_root.is_dir() and Path(manifest["launcher"]).is_file(),
+    source_spec = case_source(manifest, case or {})
+    source_root = Path(source_spec["source_root"])
+    require(source_root.is_dir() and Path(source_spec["launcher"]).is_file(),
             "Pinned source worktree or launcher is missing")
     source = subprocess.check_output(
         ["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True
@@ -738,7 +784,7 @@ def preflight(manifest, directory, deadline):
         ["git", "-C", str(source_root), "status", "--porcelain"]
     )
     require(
-        source == manifest["source_sha"] and not dirty,
+        source == source_spec["source_sha"] and not dirty,
         "Use the approved clean checkout",
     )
     require(
@@ -787,9 +833,9 @@ def launch_environment(manifest, case):
         H3_CHECKPOINT_MANIFEST=contract["checkpoint_manifest"],
         H3_CHECKPOINT_RECEIPT=contract["checkpoint_receipt"],
         H3_EXPECTED_CHECKPOINT_SHA=contract["checkpoint_manifest_sha256"],
-        H3_SOURCE_SHA=manifest["source_sha"],
-        H3_SOURCE_ROOT=manifest["source_root"],
-        H3_LAUNCHER=manifest["launcher"],
+        H3_SOURCE_SHA=case_source(manifest, case)["source_sha"],
+        H3_SOURCE_ROOT=case_source(manifest, case)["source_root"],
+        H3_LAUNCHER=case_source(manifest, case)["launcher"],
         H3_PROMPT=contract["prompt"],
         H3_NUM_GPUS=str(len(contract["devices"])),
         H3_LASER16="1",
@@ -825,8 +871,21 @@ def launch_environment(manifest, case):
         # launcher requires; validation has already hash-pinned it.
         env["H3_ATTENTION_CONFIG"] = manifest["capabilities"]["r08_sparse"]["path"]
     if adapter in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
-        env["H3_QUANT_CASE"] = "Q6" if adapter.endswith("FFN") else "Q7"
+        env["H3_QUANT_CASE"] = adapter.split(".", 1)[1]
         env["H3_ATTENTION_BACKEND"] = "fa"
+    if adapter.startswith("R02.Q") and adapter not in ("R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+        env["H3_QUANT_CASE"] = adapter.split(".")[1]
+        env["H3_ATTENTION_BACKEND"] = "fa" if adapter == "R02.Q5" else env.get("H3_ATTENTION_BACKEND", "")
+    if adapter.startswith("R03."):
+        env["SGLANG_H3_WINDOW_MODE"] = "global-local"
+        env["SGLANG_H3_WINDOW_POLICY"] = adapter.split(".", 1)[1].lower()
+    if adapter == "R04.D1.TRACE":
+        env["H3_DISPATCH_TRACE"] = "1"
+    if adapter == "R04.D1.SYNC":
+        env["H3_DISPATCH_TRACE"] = "1"
+        env["H3_DISPATCH_SYNC"] = "1"
+    if adapter == "R04.D2":
+        env["H3_REQUEST_LOCAL_WORKSPACE"] = "1"
     return env
 
 
@@ -906,7 +965,7 @@ def run_launcher(argv, env, log, timeout, stop, lock_fds):
     return status or ("completed" if process.returncode == 0 else "failed")
 
 
-def results(directory, adapter, deadline, samples=1, source_sha=None):
+def results(directory, adapter, deadline, samples=1, source_sha=None, devices=None, checkpoint_sha=None):
     runs = list(directory.glob("run-*"))
     require(
         len(runs) == 1 and runs[0].is_dir(), "Expected one launcher artifact directory"
@@ -938,6 +997,21 @@ def results(directory, adapter, deadline, samples=1, source_sha=None):
     )
     for match in matches.values():
         validate_denoise_match(match, adapter)
+    if adapter.startswith("R02.Q") and devices is not None:
+        expected_method = "bf16" if adapter == "R02.Q0" else "w8a8_int"
+        if adapter in ("R02.Q5", "R02.Q5_FFN", "R02.Q5_ALLOWLIST"):
+            expected_method = "mxfp8"
+        for rank in range(len(devices)):
+            precision_path = run / f"precision-rank-{rank}.json"
+            require(precision_path.is_file(), f"Missing rank precision evidence: {rank}")
+            precision = json.loads(precision_path.read_text())
+            require(
+                precision.get("rank") == rank
+                and precision.get("method") == expected_method
+                and precision.get("checkpoint_manifest_sha256")
+                == checkpoint_sha,
+                f"Mismatched rank precision evidence: {rank}",
+            )
     profile = REGISTRY[adapter][1]
     frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []
@@ -966,6 +1040,16 @@ def results(directory, adapter, deadline, samples=1, source_sha=None):
         require(
             any(path.is_file() for path in (run / "profiles").rglob("*")),
             "Missing device profiler artifacts",
+        )
+    if adapter.startswith("R04.D1."):
+        require(
+            any(path.name in ("dispatch_trace.json", "trace.json") for path in run.rglob("*.json")),
+            "Blocked: R04 diagnostic artifact is missing",
+        )
+    if adapter == "R06.GRAPH.W0R":
+        require(
+            any("graph" in path.name.lower() for path in run.rglob("*.json")),
+            "Blocked: R06 graph capture/replay counters are missing",
         )
     evidence = dict(
         artifacts=str(run),
@@ -1152,6 +1236,7 @@ def campaign(manifest, directory, config=None):
                 evidence = dict(artifacts=str(output))
                 cleanup_confirmed = False
                 try:
+                    preflight(manifest, output, run_started + limits["run_timeout_s"], case)
                     visible = check_devices(env, manifest)
                     save(output / "device_preflight.json", visible)
                     timeout = limits["run_timeout_s"] - (time.monotonic() - run_started)
@@ -1164,7 +1249,9 @@ def campaign(manifest, directory, config=None):
                             case["adapter"],
                             run_started + limits["run_timeout_s"],
                             case["samples"],
-                            manifest["source_sha"],
+                            case_source(manifest, case)["source_sha"],
+                            manifest["contract"]["devices"],
+                            manifest["contract"]["checkpoint_manifest_sha256"],
                         )
                         status = (
                             "diagnostic" if REGISTRY[case["adapter"]][1] else "measured"

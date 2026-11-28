@@ -337,6 +337,10 @@ def test_a5_q6_q7_require_a5_family(manifest):
         validate(invalid)
     invalid["contract"]["family"] = "A5-TARGET"
     invalid["contract"]["devices"] = list(range(8))
+    invalid["cases"].insert(
+        1, dict(id="q0", adapter="R02.Q0", after=["b0"], repeat_of=None, samples=1)
+    )
+    invalid["cases"][-1]["after"] = ["q0"]
     validate(invalid)
 
 
