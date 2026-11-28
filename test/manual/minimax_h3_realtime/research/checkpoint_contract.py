@@ -161,9 +161,36 @@ def snapshot(manifest):
     return files, states
 
 
-def load_verified(manifest_path, receipt_path, *, verify=False):
+def load_verified(manifest_path, receipt_path, *, verify=False, expected_family=None):
     manifest = json.loads(Path(manifest_path).read_text())
     validate(manifest)
+    if expected_family is not None:
+        require(manifest["family"] == expected_family, "Incorrect reference family")
+    if manifest["family"] == "turbo8":
+        # Bind the merge input to the verified native inventory, independently of the merged output.
+        for family in ("native50", "flashgen4"):
+            reference = manifest["references"][family]
+            require(
+                absolute(reference["manifest"]) and absolute(reference["receipt"]),
+                "Pin absolute reference paths",
+            )
+            verified = load_verified(
+                reference["manifest"], reference["receipt"], expected_family=family
+            )
+            require(
+                verified["clean_base_sha256"] == manifest["clean_base_sha256"],
+                "Turbo8 and FlashGen4 must derive from the verified Native50 base",
+            )
+            require(
+                verified["checkpoint_sha256"] != manifest["checkpoint_sha256"],
+                "Turbo8 must have a distinct checkpoint inventory",
+            )
+            if family == "flashgen4":
+                require(
+                    verified["merge"]["adapter_sha256"]
+                    != manifest["merge"]["adapter_sha256"],
+                    "Turbo8 and FlashGen4 must use distinct adapters",
+                )
     files, states = snapshot(manifest)
     receipt = dict(manifest_sha256=digest(manifest), files=states)
     if verify:
