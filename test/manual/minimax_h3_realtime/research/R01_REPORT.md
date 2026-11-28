@@ -134,3 +134,9 @@ and parity evidence rejection. The sparse benchmark dry run, controller plan,
 Python compilation, repo-selected Ruff rules and Bash syntax checks passed.
 Device timing, physical Cache-DiT counts, latent and media parity, and quality
 acceptance require the operator's weights and A3 allocation.
+
+### Phase 2.1
+
+Turbo8 manifests now require a references object with native50 and flashgen4 entries, each containing absolute manifest and receipt paths. Verify the Native50 and FlashGen4 files before verifying Turbo8. The three content inventories must be distinct, both adapted releases must name the verified Native50 base, and their adapter hashes must differ. The offline merge recipe remains the operator's provenance record. Preserve the native FP32 islands during any subsequent online quantization.
+
+Timing adapters must explicitly report measured scheduler_updates, dit_evaluations, profiled=false and diagnostic=false. The launcher and controller exclude tensor parity and physical block-count instrumentation from unprofiled aggregates. The standalone warm-server sweep requires a distinct, unprofiled server execution record per client invocation. Intermediate parity and runtime LoRA guards remain active.
