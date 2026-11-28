@@ -1086,6 +1086,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         overlap=float(os.getenv("SGLANG_H3_WINDOW_OVERLAP", "0.08")),
                         device=device,
                         full_window=mode == "repack",
+                        reuse_workspace=os.getenv("SGLANG_H3_WINDOW_WORKSPACE") == "1",
                     )
                     for window in windows.windows:
                         _precompute_refined_prompt_embeds(
@@ -1229,6 +1230,22 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             sigmas_video,
                             ctx.sigmas["audio"],
                         )
+                if (
+                    not batch.is_warmup
+                    and windows is not None
+                    and windows.workspace is not None
+                    and get_world_rank() == 0
+                ):
+                    workspace = windows.workspace
+                    logger.info(
+                        "H3 window workspace request=%s allocations=%d logical_bytes=%d",
+                        batch.request_id,
+                        workspace.allocations,
+                        sum(
+                            t.numel() * t.element_size()
+                            for t in workspace.buffers or ()
+                        ),
+                    )
                 if count_blocks and get_world_rank() == 0:
                     logger.info(
                         "H3 block executions request=%s cfg_forwards=%d cache_mounted=%s blocks_per_forward=%s",
@@ -1380,6 +1397,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _profile_denoising_step(self, step_index: int, *, batch: Req):
         step_name = f"denoising_step_{step_index}"
         trace_npu = current_platform.is_npu() and batch.profile and not batch.is_warmup
+        sync = trace_npu and os.getenv("SGLANG_H3_DISPATCH_SYNC") == "1"
+        if sync:
+            torch.npu.synchronize()
         with (
             maybe_nvtx_range(step_name, self.current_use_nvtx),
             maybe_record_function(step_name, enabled=trace_npu),
@@ -1395,14 +1415,29 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 rank = get_world_rank()
                 before = capture_memory_snapshot().to_dict()
             yield
+            if sync:
+                torch.npu.synchronize()
             if trace_npu:
+                stats = torch.npu.memory_stats()
+                allocator = {
+                    key: stats[key]
+                    for key in (
+                        "allocation.all.current",
+                        "allocation.all.peak",
+                        "inactive_split_bytes.all.current",
+                        "num_alloc_retries",
+                        "num_ooms",
+                    )
+                    if key in stats
+                }
                 logger.info(
-                    "H3 NPU step memory request=%s rank=%d step=%d before=%s after=%s",
+                    "H3 NPU step memory request=%s rank=%d step=%d before=%s after=%s allocator=%s",
                     batch.request_id,
                     rank,
                     step_index + 1,
                     before,
                     capture_memory_snapshot().to_dict(),
+                    allocator,
                     main_process_only=False,
                     local_main_process_only=False,
                 )

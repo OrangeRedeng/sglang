@@ -28,6 +28,11 @@ ROOT = Path(__file__).resolve().parents[4]
 LAUNCHER = Path(__file__).with_name("run_a3_windowing.sh")
 PROMPT = Path(__file__).with_name("SUPERVISOR.md")
 REGISTRY = {
+    "R04.D0.B0": ("B0", False, None),
+    "R04.D0.W1": ("W1", False, None),
+    "R04.D1.TRACE": ("B0", True, None),
+    "R04.D1.SYNC": ("B0", True, None),
+    "R04.D2": ("W1", False, None),
     "H05.B0": ("B0", False, None),
     "H05.W0R": ("W0R", False, None),
     "H05.W1": ("W1", False, "h05_repack_parity"),
@@ -514,6 +519,10 @@ def launch_environment(manifest, case):
         SGLANG_H3_NPU_ADALN_MEMO="0",
     )
     adapter = case["adapter"]
+    if adapter == "R04.D1.SYNC":
+        env["H3_DISPATCH_SYNC"] = "1"
+    if adapter == "R04.D2":
+        env["H3_WINDOW_WORKSPACE"] = "1"
     if adapter in ("R01.PARITY.B0", "R01.PARITY.W0R"):
         env["H3_WINDOW_PARITY"] = "1"
     if adapter.startswith("R01.CROP."):

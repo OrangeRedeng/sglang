@@ -17,7 +17,7 @@ if [[ ${1:-} != --inside ]]; then
         H3_MERGED_FLASHGEN H3_LASER16 H3_WINDOW_POLICY SGLANG_PROFILE_RECORD_SHAPES \
         H3_NATIVE_REFERENCE H3_NATIVE_VAE H3_QUALITY H3_ATTENTION_BACKEND H3_ATTENTION_CONFIG \
         H3_FFN_ACTIVE_FRACTION SGLANG_H3_NPU_ADALN_MEMO \
-        H3_SERVE_ONLY H3_BIND_HOST H3_LASER_CROP_BEFORE_CAST H3_WINDOW_PARITY H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
+        H3_SERVE_ONLY H3_BIND_HOST H3_LASER_CROP_BEFORE_CAST H3_WINDOW_PARITY H3_WINDOW_WORKSPACE H3_DISPATCH_SYNC H3_GLOBAL_STEPS H3_PROMPT H3_SEED H3_REPEATS H3_PROFILE H3_PIN_CPU_MEMORY H3_NUM_GPUS H3_STARTUP_TIMEOUT H3_REQUEST_TIMEOUT \
         SGLANG_H3_DENOISE_RUNGS SGLANG_H3_WINDOW_OVERLAP ASCEND_RT_VISIBLE_DEVICES; do
         [[ ! -v "$key" ]] || env_args+=(-e "$key")
     done
@@ -143,6 +143,16 @@ if [[ ${H3_WINDOW_PARITY:-0} == 1 && ( "$family" != flashgen4 || ! "$case_id" =~
 fi
 export SGLANG_H3_LASER_CROP_BEFORE_CAST="${H3_LASER_CROP_BEFORE_CAST:-1}"
 export SGLANG_H3_WINDOW_PARITY="${H3_WINDOW_PARITY:-0}"
+if [[ ${H3_DISPATCH_SYNC:-0} == 1 && ${H3_PROFILE:-0} != 1 ]]; then
+    echo "Diagnostic synchronization requires H3_PROFILE=1." >&2
+    exit 2
+fi
+if [[ ${H3_WINDOW_WORKSPACE:-0} == 1 && ! "$case_id" =~ ^W[1-4]$ ]]; then
+    echo "Window workspace requires a two-window case." >&2
+    exit 2
+fi
+export SGLANG_H3_DISPATCH_SYNC="${H3_DISPATCH_SYNC:-0}"
+export SGLANG_H3_WINDOW_WORKSPACE="${H3_WINDOW_WORKSPACE:-0}"
 case ${H3_QUALITY:-lossless} in
     exact|lossless) ;;
     *) echo "H3_QUALITY must be exact or lossless." >&2; exit 2 ;;
@@ -272,6 +282,9 @@ done
 
 export H3_PROMPT="${H3_PROMPT:-$default_prompt}"
 export H3_LAUNCH_PLACEMENT="$visible:TP2:SP$sp:Ulysses$((sp / ring)):Ring$ring:$attention:pin=${H3_PIN_CPU_MEMORY:-true}:pad=${SGLANG_H3_LASER_SP8_PAD_HEADS:-0}"
+if [[ ${H3_PROFILE:-0} == 1 ]]; then
+    python3 "$research/dispatch_host.py" "$server" > "$output/host-before.json"
+fi
 echo "Server ready. Running $case_id requests."
 python3 -u - "$output" "$port" "$duration" "$steps" "$case_id" "$served_model" "$video_shift" "$audio_shift" <<'PY'
 import json
@@ -316,6 +329,8 @@ comparison = dict(
     crop_before_cast=os.environ["SGLANG_H3_LASER_CROP_BEFORE_CAST"],
     cache_dit=os.environ["SGLANG_CACHE_DIT_ENABLED"],
     profile=os.getenv("H3_PROFILE", "0"),
+    dispatch_sync=os.environ["SGLANG_H3_DISPATCH_SYNC"],
+    window_workspace=os.environ["SGLANG_H3_WINDOW_WORKSPACE"],
     ffn_active_fraction=os.getenv("H3_FFN_ACTIVE_FRACTION", "1"),
 )
 (out / "comparison.json").write_text(json.dumps(comparison, indent=2))
@@ -349,6 +364,9 @@ for index in range(repeats + 1):
         print(json.dumps(record), file=stream)
     print(f"{case} {label}: {elapsed:.2f}s, {frames} frames", flush=True)
 PY
+if [[ ${H3_PROFILE:-0} == 1 ]]; then
+    python3 "$research/dispatch_host.py" "$server" > "$output/host-after.json"
+fi
 if command -v npu-smi >/dev/null; then npu-smi info > "$output/npu-smi-after.txt"; fi
 python3 - "$output" "$steps" "$video_shift" "$audio_shift" <<'PYLOG'
 import ast

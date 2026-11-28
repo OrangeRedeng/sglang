@@ -31,6 +31,7 @@ def prepare_windows(
     overlap,
     device,
     full_window=False,
+    reuse_workspace=False,
 ):
     frames, height, width = latent_shape
     frame_rows = packed["img_pos"].numel() // frames
@@ -52,7 +53,9 @@ def prepare_windows(
         audio_start = int(torch.searchsorted(audio_times, video_times[right_start]))
         audio_stop = int(torch.searchsorted(audio_times, video_times[left_stop]))
         if not 0 < audio_start < audio_stop < audio_t:
-            raise ValueError("H3 window split does not produce overlapping audio ranges")
+            raise ValueError(
+                "H3 window split does not produce overlapping audio ranges"
+            )
         ranges = (
             (0, left_stop, 0, audio_stop),
             (right_start, frames, audio_start, audio_t),
@@ -97,7 +100,9 @@ def prepare_windows(
         )
         windows.append(Window(video, audio.to(device), branch, timesteps))
 
-    return WindowPredictions(tuple(windows), video_ramp, audio_ramp)
+    return WindowPredictions(
+        tuple(windows), video_ramp, audio_ramp, reuse_workspace=reuse_workspace
+    )
 
 
 def _ramp(length, device):
@@ -105,10 +110,13 @@ def _ramp(length, device):
 
 
 class WindowPredictions:
-    def __init__(self, windows, video_ramp, audio_ramp):
+    def __init__(self, windows, video_ramp, audio_ramp, *, reuse_workspace=False):
         self.windows = windows
         self.video_ramp = video_ramp
         self.audio_ramp = audio_ramp
+        self.workspace = (
+            WindowWorkspace() if reuse_workspace and len(windows) == 2 else None
+        )
 
     def predict(self, forward, model, video, audio, step, slot, *, profile=False):
         outputs = []
@@ -127,19 +135,74 @@ class WindowPredictions:
             return outputs[0]
         with maybe_record_function(f"h3_window_s{step}_fusion", enabled=profile):
             (left_video, left_audio), (right_video, right_audio) = outputs
-            video_prediction = _blend(left_video, right_video, self.video_ramp)
             channels = self.windows[0].audio.shape[0]
-            audio_prediction = _blend(
-                left_audio.reshape(channels, -1, left_audio.shape[-1]).transpose(0, 1),
-                right_audio.reshape(channels, -1, right_audio.shape[-1]).transpose(0, 1),
-                self.audio_ramp,
+            left = left_audio.reshape(channels, -1, left_audio.shape[-1]).transpose(
+                0, 1
             )
+            right = right_audio.reshape(channels, -1, right_audio.shape[-1]).transpose(
+                0, 1
+            )
+            if self.workspace is not None:
+                video_out, audio_out = self.workspace.outputs(video, audio)
+                _blend(left_video, right_video, self.video_ramp, out=video_out)
+                _blend(
+                    left,
+                    right,
+                    self.audio_ramp,
+                    out=audio_out.view(channels, -1, audio_out.shape[-1]).transpose(
+                        0, 1
+                    ),
+                )
+                return video_out, audio_out
+            video_prediction = _blend(left_video, right_video, self.video_ramp)
+            audio_prediction = _blend(left, right, self.audio_ramp)
             return video_prediction, audio_prediction.transpose(0, 1).flatten(0, 1)
 
 
-def _blend(left, right, ramp):
+class WindowWorkspace:
+    """Two FP32 prediction buffers owned by one eager request and stream."""
+
+    def __init__(self):
+        self.key = None
+        self.buffers = None
+        self.allocations = 0
+
+    def outputs(self, video, audio):
+        stream = (
+            torch.get_device_module(video.device).current_stream(video.device)
+            if video.device.type != "cpu"
+            else None
+        )
+        if self.key is not None and self.key[0] != stream:
+            raise RuntimeError("H3 window workspace requires one consumer stream")
+        key = (
+            stream,
+            tuple((t.shape, t.device, t.dtype, t.stride()) for t in (video, audio)),
+        )
+        if self.key != key:
+            self.buffers = tuple(
+                torch.empty(t.shape, dtype=torch.float32, device=t.device)
+                for t in (video, audio)
+            )
+            self.key = key
+            self.allocations += 2
+        return self.buffers
+
+
+def _blend(left, right, ramp, *, out=None):
     count = ramp.numel()
     weights = ramp.reshape(count, *([1] * (left.ndim - 1)))
     # Both velocities refer to the same x and sigma, so lerp commutes with x0 = x + sigma*v.
+    if out is not None:
+        start = left.shape[0] - count
+        out[:start].copy_(left[:-count])
+        torch.lerp(
+            left[-count:].float(),
+            right[:count].float(),
+            weights,
+            out=out[start : start + count],
+        )
+        out[start + count :].copy_(right[count:])
+        return out
     center = torch.lerp(left[-count:].float(), right[:count].float(), weights)
     return torch.cat((left[:-count].float(), center, right[count:].float()), dim=0)
