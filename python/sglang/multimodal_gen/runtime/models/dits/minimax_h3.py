@@ -2684,6 +2684,16 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         """
         max_entries = 32
         is_npu = adaln_input.device.type == "npu"
+        if "SGLANG_H3_ADALN_MEMO_STATS" in os.environ and "_adaln_memo_stats" not in self.__dict__:
+            # C0 cache instrumentation control: opt-in counters for the
+            # hit/miss story; zero overhead when unset.
+            self.__dict__["_adaln_memo_stats"] = {
+                "hits": 0,
+                "misses": 0,
+                "stores": 0,
+                "evictions": 0,
+                "entries": 0,
+            }
         if (
             timestep_bits is None
             or self.adaln_cache is not None
@@ -2733,6 +2743,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             adaln_input.device,
         )
         outputs = entries.pop(key, None)
+        stats = self.__dict__.get("_adaln_memo_stats")
+        if stats is not None:
+            # C0 instrumentation: the actual hit/miss counts behind any
+            # reuse claim (4-step warmup may leave no reuse at all).
+            if outputs is None:
+                stats["misses"] += 1
+            else:
+                stats["hits"] += 1
         profile_scope = nullcontext()
         if is_npu and torch.autograd.profiler._is_profiler_enabled:
             event = "h3_adaln_memo_miss" if outputs is None else "h3_adaln_memo_hit"
@@ -2744,7 +2762,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 ]
                 while len(entries) >= max_entries:
                     entries.pop(next(iter(entries)))
+                    if stats is not None:
+                        stats["evictions"] += 1
             entries[key] = outputs
+            if stats is not None:
+                stats["stores"] += 1
+                stats["entries"] = len(entries)
             return tuple(
                 block.adaln_proj.split_output(output)
                 for block, output in zip(self.blocks, outputs)

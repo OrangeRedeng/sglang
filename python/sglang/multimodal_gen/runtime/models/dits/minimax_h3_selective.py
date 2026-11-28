@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static video-only FFN row plans; all coordinates remain in the native layout."""
 
+import os
+
 import torch
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def selective_ffn_rows(
@@ -30,7 +36,23 @@ def selective_ffn_rows(
     groups = groups[row_start:row_stop]
     rows = torch.arange(row_stop - row_start)
     keep = int(active_fraction * 4)
-    return tuple(
+    plans = tuple(
         rows[(groups < 0) | ((groups - phase) % 4 < keep)].to(device)
         for phase in range(4)
     )
+    if os.getenv("SGLANG_H3_SELECTIVE_FFN_LOG") == "1":
+        # F0 diagnostic: the actual compacted GEMM row counts behind any
+        # speed claim (per-phase counts differ; protected layers excluded
+        # upstream by the eligible-layer band).
+        counts = [int(plan.numel()) for plan in plans]
+        total_rows = row_stop - row_start
+        logger.info(
+            "Selective FFN rows: fraction=%s seq=%d local_rows=%d "
+            "per_phase=%s compacted=%.3f",
+            active_fraction,
+            seq_len,
+            total_rows,
+            counts,
+            sum(counts) / (4 * max(total_rows, 1)),
+        )
+    return plans
