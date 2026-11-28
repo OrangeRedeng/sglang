@@ -468,12 +468,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
     def _overlaps_audio_decode(server_args: ServerArgs) -> bool:
         """Whether the audio decodes on a side stream alongside the video.
 
-        CUDA only, with other decode ranks to take over the audio rank's
+        CUDA or NPU, with other decode ranks to take over the audio rank's
         tiles, and only for a resident audio VAE: the decode runs on another
         thread, outside the residency manager's sequential uses.
         """
         return (
-            current_platform.is_cuda()
+            (current_platform.is_cuda() or current_platform.is_npu())
             and model_parallel_is_initialized()
             and get_decode_parallel_world_size() > 1
             and server_args.residency_mode("audio_vae") == RESIDENT
@@ -504,17 +504,22 @@ class MiniMaxH3DecodingStage(DecodingStage):
             self._audio_thread = ThreadPoolExecutor(
                 1, thread_name_prefix="sglang-audio-decode"
             )
-            self._audio_stream = torch.cuda.Stream(priority=-1)
+            # TorchNPU mirrors the CUDA stream API; the device module resolves
+            # from the latent's device type, so one code path serves both.
+            self._audio_stream = torch.get_device_module(
+                audio_latent.device.type
+            ).Stream(priority=-1)
+        device_module = torch.get_device_module(audio_latent.device.type)
         stream = self._audio_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(device_module.current_stream())
         audio_latent.record_stream(stream)
-        device = torch.cuda.current_device()
+        device = device_module.current_device()
         inference = torch.is_inference_mode_enabled()
 
         def run():
             with (
-                torch.cuda.device(device),
-                torch.cuda.stream(stream),
+                device_module.device(device),
+                device_module.stream(stream),
                 torch.inference_mode(inference),
                 torch.no_grad(),
             ):
@@ -535,7 +540,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
             payload, waveform, _ = job.result()
         except Exception as exc:
             return None, None, exc
-        current = torch.cuda.current_stream()
+        device_module = torch.get_device_module(payload["waveform"].device.type)
+        current = device_module.current_stream()
         current.wait_stream(self._audio_stream)
         payload["waveform"].record_stream(current)
         waveform.record_stream(current)
