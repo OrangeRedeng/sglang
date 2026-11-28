@@ -103,6 +103,9 @@ def pad_minimax_h3_prompt_kwargs(
     # request-local row lists have prompt-dependent shapes, so keep them out
     # of bucketed BCG signatures and rebuild the rows in the eager break
     out.pop("local_embedding_layout", None)
+    # Contiguous AdaLN run boundaries depend on prompt length and are only
+    # used outside captured graphs (captured regions keep index_select).
+    out.pop("block_combined_runs", None)
     # Request-static H3 denoising normally carries the live refined-text
     # length as a host integer to avoid a per-step device scalar read. Host
     # integers are baked into BCG signatures, however, so different prompt
