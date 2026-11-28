@@ -99,6 +99,7 @@ class TileDecodeGraphCache:
             enabled = os.getenv(VAE_NPU_GRAPH_ENV, "0") == "1"
         self._enabled = enabled
         self._entries: dict[tuple, _GraphEntry] = {}
+        self._unsupported: set[tuple] = set()
         self._pool = None
         self.stats = TileGraphStats()
 
@@ -116,6 +117,8 @@ class TileDecodeGraphCache:
                 len(self._entries),
             )
         self._entries.clear()
+        self._unsupported.clear()
+        self._pool = None
 
     def wrap(self, forward_fn: Callable[[torch.Tensor], torch.Tensor]):
         """Return ``forward_fn`` with graph replay for repeated buckets."""
@@ -154,14 +157,30 @@ class TileDecodeGraphCache:
             return forward_fn(x)
 
         key = self._bucket_key(x)
+        if key in self._unsupported:
+            self.stats.eager_calls += 1
+            return forward_fn(x)
         entry = self._entries.get(key)
         if entry is not None:
-            entry.static_input.copy_(x)
-            entry.graph.replay()
-            self.stats.replays += 1
-            # The static output is overwritten by the next replay, so every
-            # caller owns a private copy; the copy is cheaper than the decode.
-            return entry.static_output.clone()
+            try:
+                entry.static_input.copy_(x)
+                entry.graph.replay()
+                self.stats.replays += 1
+                # The static output is overwritten by the next replay, so every
+                # caller owns a private copy; the copy is cheaper than the decode.
+                return entry.static_output.clone()
+            except Exception as exc:  # noqa: BLE001 - invalidate recoverable replay failures
+                self.stats.invalidations += 1
+                self._entries.pop(key, None)
+                self.stats.entries.pop(key, None)
+                self._unsupported.add(key)
+                logger.warning_once(
+                    "MiniMax H3 VAE graph replay failed; invalidating bucket (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                )
+                self.stats.eager_calls += 1
+                return forward_fn(x)
 
         if len(self._entries) >= self._max_entries:
             self.stats.eager_calls += 1
@@ -171,6 +190,7 @@ class TileDecodeGraphCache:
             entry = self._capture(forward_fn, x)
         except Exception as exc:  # noqa: BLE001 - capture must fail closed
             self.stats.capture_failures += 1
+            self._unsupported.add(key)
             # The caller's decode ran the unwrapped forward; count it.
             self.stats.eager_calls += 1
             logger.warning_once(

@@ -161,7 +161,8 @@ def test_capture_failure_falls_back_and_stays_eager(monkeypatch):
     with torch.no_grad():
         assert torch.equal(wrapped(x), x * 2)
         assert torch.equal(wrapped(x), x * 2)
-    assert cache.stats.capture_failures == 2
+    # A failed bucket is remembered so every subsequent call stays eager.
+    assert cache.stats.capture_failures == 1
     assert cache.stats.eager_calls == 2 and not cache.stats.captures
 
 
