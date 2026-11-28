@@ -84,8 +84,19 @@ def test_adaptive_bucket_moves_away_from_large_temporal_change(windowing):
     plans = {0: plan(9, 12), 3: plan(12, 15), -3: plan(6, 9)}
     video = torch.cat((torch.zeros(11), torch.ones(10)))[:, None]
     audio = video.repeat(2, 1)
-    assert windowing.choose_boundary(plans, video, audio)[0] == 3
-    assert windowing.choose_boundary(plans, video * float("nan"), audio)[0] == 0
+    assert (
+        windowing.choose_boundary(
+            tuple(plans), windowing.boundary_costs(plans, video, audio).tolist()
+        )
+        == 3
+    )
+    assert (
+        windowing.choose_boundary(
+            tuple(plans),
+            windowing.boundary_costs(plans, video * float("nan"), audio).tolist(),
+        )
+        == 0
+    )
 
 
 def test_real_packer_preserves_global_positions_and_padding(windowing):

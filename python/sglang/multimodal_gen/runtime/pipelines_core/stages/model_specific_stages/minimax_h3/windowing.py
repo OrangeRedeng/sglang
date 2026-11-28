@@ -158,7 +158,7 @@ def boundary_offsets(frames, overlap):
     return (0, radius, -radius) if radius > 0 else (0,)
 
 
-def choose_boundary(plans, video, audio):
+def boundary_costs(plans, video, audio):
     """Use temporal changes in the last completed scheduler state."""
     frames = next(iter(plans.values())).latent_shape[0]
     v = video.reshape(frames, -1).float()
@@ -177,12 +177,13 @@ def choose_boundary(plans, video, audio):
             + 0.5 * (imbalance + audio_imbalance)
             + (audio_stop - audio_start) / a.shape[1]
         )
-    costs = torch.stack(scores).tolist()
-    offsets = tuple(plans)
-    best = min(range(len(costs)), key=lambda index: costs[index])
-    return offsets[best] if math.isfinite(costs[best]) and all(
-        map(math.isfinite, costs)
-    ) else 0, costs
+    return torch.stack(scores)
+
+
+def choose_boundary(offsets, costs):
+    if not all(map(math.isfinite, costs)):
+        return 0
+    return offsets[min(range(len(costs)), key=costs.__getitem__)]
 
 
 def _disagreement(left, right):

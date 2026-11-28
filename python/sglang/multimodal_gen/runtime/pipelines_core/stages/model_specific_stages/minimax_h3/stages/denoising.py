@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1056,6 +1057,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 if mode != "single":
                     from ..windowing import (
                         boundary_offsets,
+                        boundary_costs,
                         choose_boundary,
                         prepare_windows,
                     )
@@ -1129,6 +1131,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     def window_forward(model, video, audio, step, slot):
                         offset = 0
                         scores = None
+                        decision_ms = None
                         reason = "fixed"
                         if seam_policy == "shifted" and len(offsets) == 3:
                             offset = (0, offsets[1], offsets[2], 0)[step % 4]
@@ -1139,12 +1142,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             )
 
                             group = get_replica_group()
-                            decision = (
-                                choose_boundary(plans, video, audio)
+                            started = time.perf_counter() if batch.profile else None
+                            costs = (
+                                boundary_costs(plans, video, audio)
                                 if group.rank_in_group == 0
-                                else None
+                                else torch.empty(
+                                    len(offsets),
+                                    device=video.device,
+                                    dtype=torch.float32,
+                                )
                             )
-                            offset, scores = group.broadcast_object(decision)
+                            # The host needs the selected plan before launching either window.
+                            scores = group.broadcast(costs, src=0).tolist()
+                            offset = choose_boundary(offsets, scores)
+                            if started is not None:
+                                decision_ms = (time.perf_counter() - started) * 1000
                             reason = (
                                 "previous_state"
                                 if all(math.isfinite(score) for score in scores)
@@ -1179,6 +1191,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                                 offset=offset,
                                 scores=scores,
                                 reason=reason,
+                                adaptive_decision_host_ms=decision_ms,
+                                extra_context_tokens=sum(
+                                    w.context.numel()
+                                    for w in plan.windows
+                                    if w.context is not None
+                                ),
                                 video_rope_bounds=plan.video_times[
                                     [start, stop]
                                 ].tolist(),

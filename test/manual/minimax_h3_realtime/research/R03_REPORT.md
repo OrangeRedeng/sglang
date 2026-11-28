@@ -29,3 +29,7 @@ Repeat separately with H3_PROFILE=1. Join the H3 seam records to the sample requ
 ## Validation
 
 Four focused CPU tests exercised the actual packing, geometry, scoring and prediction fusion code with stubbed DiT execution. They check global positions, padding, odd-length video and channel-major audio coverage, anchor exclusion, fixed forward count and adaptive fallback. The R03 controller plan and source checks passed. Ascend dispatch, W0R device parity on this revision, media review and latency remain pending.
+
+### Phase 2.1
+
+The replica leader computes the bounded candidate score vector in FP32. Every replica receives it on its existing device group before selecting its next plan. One host read per rank supplies both the plan decision and diagnostic scores. A nonfinite score selects the centered fallback. Profiled records report adaptive_decision_host_ms through the required host read and the extra context token count across both forwards. Each plan references the same refined text tensor. RoPE and packed metadata depend on absolute window positions and retain distinct storage. Three-window execution remains pending. LLLL still requires seam repair and human AV review.
