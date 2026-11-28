@@ -104,7 +104,10 @@ The adapter must wait for **completed generation and final AV output** and write
 ```json
 {
   "status": "completed",
-  "actual_nfe": 4,
+  "scheduler_updates": 4,
+  "dit_evaluations": 4,
+  "profiled": false,
+  "diagnostic": false,
   "contract_hash": "copy from context after verifying deployed configuration",
   "workload_hash": "copy from context after verifying request inputs",
   "output_path": "/absolute/path/to/unique-output.mp4",

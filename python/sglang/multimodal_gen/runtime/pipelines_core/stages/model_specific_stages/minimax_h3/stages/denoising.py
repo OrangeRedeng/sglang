@@ -1346,7 +1346,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     if get_world_rank() == 0:
                         logger.info(
                             "H3 denoise mode=%s scheduler_updates=%d dit_evaluations=%d "
-                            "request=%s phase=%s policy=%s "
+                            "request=%s phase=%s policy=%s profiled=%d diagnostic=%d "
                             "video_rows=%d audio_rows=%d window_rows=%s sigma_video=%s sigma_audio=%s",
                             mode or "native",
                             updates,
@@ -1354,6 +1354,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             batch.request_id,
                             "server-warmup" if batch.is_warmup else "request",
                             window_policy or "-",
+                            int(bool(batch.profile)),
+                            int(parity or count_blocks),
                             video_rows.shape[0],
                             audio_rows.shape[0],
                             [

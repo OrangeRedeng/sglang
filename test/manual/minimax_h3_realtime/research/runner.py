@@ -219,15 +219,17 @@ def verify_sample(path, contract, case):
     sample = json.loads(path.read_text())
     if (
         sample.get("status") != "completed"
-        or sample.get("scheduler_updates", sample.get("actual_nfe"))
-        != contract["actual_nfe"]
+        or type(sample.get("scheduler_updates")) is not int
+        or sample["scheduler_updates"] != contract["actual_nfe"]
     ):
         raise ValueError(
             "Adapter must report completed generation and measured scheduler updates"
         )
-    if "dit_evaluations" in sample and (
-        type(sample["dit_evaluations"]) is not int or sample["dit_evaluations"] < 1
-    ):
+    if sample.get("profiled") is not False or sample.get("diagnostic") is not False:
+        raise ValueError(
+            "Timing requires explicitly unprofiled, non-diagnostic samples"
+        )
+    if type(sample.get("dit_evaluations")) is not int or sample["dit_evaluations"] < 1:
         raise ValueError(
             "DiT evaluations must count logical forwards, without TP/SP replication"
         )

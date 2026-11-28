@@ -317,6 +317,8 @@ git_state = dict(
     diff=(out / "source.diff").read_text(),
 )
 comparison = dict(
+    checkpoint_manifest_sha256=served_model.removeprefix("h3-research-"),
+    precision="bf16", diagnostic=any(os.getenv(key) == "1" for key in ("SGLANG_H3_WINDOW_PARITY","SGLANG_H3_COUNT_BLOCKS")),
     request=payload, source_sha=git_state["sha"], source_diff_sha256=digest(git_state["diff"]),
     placement=os.environ["H3_LAUNCH_PLACEMENT"],
     adaln_memo=os.getenv("SGLANG_H3_NPU_ADALN_MEMO", "default"),
@@ -353,7 +355,7 @@ for index in range(repeats + 1):
         perf = json.loads((out / f"sample-{index}.perf.json").read_text())
         if perf["request_id"] != response["id"] or not perf["steps"]:
             raise ValueError("Missing request-scoped server stage timings")
-    record = dict(case=case, warmup=index == 0, profiled=profiling and index > 0, e2e_s=elapsed, media=media, response=response, http_timings=http_timings)
+    record = dict(case=case, warmup=index == 0, diagnostic=comparison["diagnostic"], profiled=profiling and index > 0, e2e_s=elapsed, media=media, response=response, http_timings=http_timings)
     with (out / "samples.jsonl").open("a") as stream:
         print(json.dumps(record), file=stream)
     print(f"{case} {label}: {elapsed:.2f}s, {frames} frames", flush=True)
@@ -430,7 +432,7 @@ if missing := expected_ids - records.keys():
     raise RuntimeError(f"Missing denoising records for request IDs: {sorted(missing)}")
 (out / "denoise.txt").write_text("\n".join(records.values()) + "\n")
 (out / "denoise_matches.json").write_text(json.dumps(records, indent=2))
-times = [sample["e2e_s"] for sample in samples if not sample["warmup"] and not sample["profiled"]]
+times = [sample["e2e_s"] for sample in samples if not sample["warmup"] and not sample["profiled"] and not sample["diagnostic"]]
 if times:
     summary = dict(
         case=samples[0]["case"],
