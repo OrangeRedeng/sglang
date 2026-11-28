@@ -46,7 +46,8 @@
       "id": "b0",
       "adapter": "R01.CLEAN4.B0",
       "after": [],
-      "repeat_of": null
+      "repeat_of": null,
+      "samples": 1
     },
     {
       "id": "w0r",
@@ -54,7 +55,8 @@
       "after": [
         "b0"
       ],
-      "repeat_of": null
+      "repeat_of": null,
+      "samples": 1
     },
     {
       "id": "w1",
@@ -62,7 +64,8 @@
       "after": [
         "w0r"
       ],
-      "repeat_of": null
+      "repeat_of": null,
+      "samples": 1
     }
   ]
 }

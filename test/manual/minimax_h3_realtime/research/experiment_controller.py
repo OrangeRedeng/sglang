@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from contextlib import ExitStack, closing, contextmanager
 from importlib import metadata
 from pathlib import Path
@@ -45,7 +46,26 @@ REGISTRY = {
     "R01.QUALITY.TURBO": ("B0", False, None),
     "R01.HIST.OFF": ("HIST-OFF", False, None),
     "R01.HIST.ON": ("HIST-ON", False, None),
+    # R05-R08 adapters, registered only for features implemented on their
+    # branches. Each carries a capability gate so the case stays blocked
+    # until the operator supplies evidence from the branch that implements
+    # it; on a checkout without the flag the env var is an inert no-op.
+    "R05.NPUADALN.ON": ("B0", False, "r05_npu_adaln"),
+    "R05.SP8PAD.L16": ("L16", False, "r05_sp8_pad"),
+    "R06.GRAPH.W0R": ("W0R", False, "r06_vae_graph"),
+    "R08.SPARSE.H08": ("B0", False, "r08_sparse"),
+    "R08.DISPATCHLOG": ("B0", True, None),
+    "R08.MEMOSTATS": ("B0", True, None),
+    "R08.FFNLOG": ("B0", True, None),
 }
+# Evidence identifiers that must never unlock a gate (invalid historical
+# comparisons; see R08/H02 audit in RESEARCH_STATE).
+EVIDENCE_BLOCKLIST = ("H02",)
+# Consecutive supervisor-endpoint failures tolerated before the campaign
+# pauses instead of silently degrading to the deterministic queue forever.
+SUPERVISOR_FALLBACK_LIMIT = 3
+# Quality promotion requires at least this many matched repetitions.
+PROMOTION_MIN_SAMPLES = 10
 CHECKPOINT_FAMILIES = {
     "A3-C4": "flashgen4",
     "A3-T8": "turbo8",
@@ -205,7 +225,7 @@ def validate(manifest):
     require(isinstance(cases, list) and 0 < len(cases) <= 32, "Expected 1–32 cases")
     seen = {}
     for case in cases:
-        fields(case, "id adapter after repeat_of")
+        fields(case, "id adapter after repeat_of samples")
         case_id, adapter = case["id"], case["adapter"]
         require(
             named(case_id) and case_id not in seen and adapter in REGISTRY,
@@ -217,6 +237,13 @@ def validate(manifest):
         )
         if adapter.startswith("R01.HIST."):
             require(len(devices) == 8, "Historical controls require eight devices")
+        if adapter == "R05.SP8PAD.L16":
+            require(len(devices) == 16, "L16 head padding requires sixteen devices")
+        samples = case["samples"]
+        require(
+            type(samples) is int and 1 <= samples <= 12,
+            "Case samples must be 1-12 raw repetitions",
+        )
         after, repeat = case["after"], case["repeat_of"]
         require(
             isinstance(after, list) and all(item in seen for item in after),
@@ -233,6 +260,154 @@ def validate(manifest):
                 repeat is None, "Repeat must name an earlier case of the same adapter"
             )
         seen[case_id] = adapter
+
+
+def aggregate_samples(samples):
+    """Median and nearest-rank p90 over raw client samples.
+
+    Significance is ``screening`` below the promotion threshold: a p90 from
+    two or three samples is a screen, never promotion evidence.
+    """
+    require(bool(samples), "No samples to aggregate")
+    ordered = sorted(float(value) for value in samples)
+    count = len(ordered)
+
+    def nearest_rank(percent):
+        return ordered[math.ceil(percent / 100 * count) - 1]
+
+    return dict(
+        sample_count=count,
+        median_client_s=nearest_rank(50),
+        p90_client_s=nearest_rank(90),
+        significance="screening" if count < PROMOTION_MIN_SAMPLES else "promotable",
+    )
+
+
+def classify_failure(error_text, status):
+    """Bounded failure taxonomy for retry policy.
+
+    OOM and correctness/geometry failures block the track immediately; only
+    unclassified (transient) failures may retry, once.
+    """
+    if status == "cleanup_unverified":
+        return "cleanup"
+    text = (error_text or "").lower()
+    if "out of memory" in text or "oom" in text or "hbm" in text:
+        return "oom"
+    if "geometry" in text or "parity" in text or "expected" in text or "denoise" in text:
+        return "correctness"
+    return "transient"
+
+
+def review_receipt(
+    case_id, artifacts, output_hashes, prompt, policy, criteria, decision, at=None
+):
+    """A human quality receipt bound to the artifact hashes it judges."""
+    require(named(case_id), "Invalid receipt case id")
+    require(
+        policy in ("exact", "lossless", "approximate"),
+        "Receipt must name the quality policy",
+    )
+    require(
+        isinstance(criteria, str) and 0 < len(criteria) <= 2000,
+        "Receipt must state the acceptance criteria",
+    )
+    require(
+        all(re.fullmatch(r"[0-9a-f]{64}", item or "") for item in output_hashes),
+        "Receipt must cite concrete output hashes",
+    )
+    require(
+        decision in ("quality_accepted", "quality_rejected"),
+        "Receipt decision must be quality_accepted or quality_rejected",
+    )
+    body = dict(
+        kind="quality_review",
+        case_id=case_id,
+        at=time.time() if at is None else at,
+        artifacts=str(artifacts),
+        output_sha256=list(output_hashes),
+        prompt=prompt,
+        policy=policy,
+        criteria=criteria,
+        decision=decision,
+        receipt_sha256="",
+    )
+    body["receipt_sha256"] = digest(
+        {key: value for key, value in body.items() if key != "receipt_sha256"}
+    )
+    return body
+
+
+def apply_quality_receipt(database, receipt):
+    """Validate a human receipt against the ledger and record its verdict.
+
+    The receipt must hash-verify (stale/tampered receipts are rejected) and
+    must cite the output hashes the case actually recorded. ``quality_rejected``
+    never satisfies a dependency (readiness counts only measured/diagnostic),
+    and no receipt can cite blocklisted historical evidence (H02).
+    """
+    fields(
+        receipt,
+        "kind case_id at artifacts output_sha256 prompt policy criteria decision "
+        "receipt_sha256",
+    )
+    require(receipt["kind"] == "quality_review", "Not a quality review receipt")
+    body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    require(
+        digest(body) == receipt["receipt_sha256"],
+        "Receipt hash mismatch: stale or tampered",
+    )
+    case_id = receipt["case_id"]
+    require(
+        not any(case_id.startswith(prefix) for prefix in EVIDENCE_BLOCKLIST),
+        "Blocklisted historical comparison cannot unlock gates",
+    )
+    latest = latest_cases(history(database))
+    require(case_id in latest, "Receipt names an unknown case")
+    recorded = latest[case_id]
+    require(
+        recorded.get("artifacts") == receipt["artifacts"],
+        "Receipt artifacts differ from the recorded evidence",
+    )
+    require(
+        list(recorded.get("output_sha256", [])) == list(receipt["output_sha256"]),
+        "Receipt output hashes differ from the recorded evidence",
+    )
+    # The verdict is the human's word, typed: accepted/rejected must come in
+    # as an explicit decision field to stay auditable.
+    verdict = receipt["decision"]
+    require(
+        verdict in ("quality_accepted", "quality_rejected"),
+        "Receipt decision must be quality_accepted or quality_rejected",
+    )
+    record(
+        database,
+        "case",
+        case_id=case_id,
+        status=recorded["status"],
+        # Carry the evidence binding forward so a later receipt still
+        # validates against the latest record for this case.
+        artifacts=recorded.get("artifacts"),
+        output_sha256=list(recorded.get("output_sha256", [])),
+        run_id=recorded.get("run_id"),
+        fingerprint=recorded.get("fingerprint"),
+        quality=verdict,
+        review_receipt=body | {"receipt_sha256": receipt["receipt_sha256"]},
+    )
+    return verdict
+
+
+def ports_available(ports):
+    """Preflight: every reserved port must be bindable now."""
+    for port in ports:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+        except OSError as error:
+            raise ValueError(f"Port {port} is not available: {error}") from error
+        finally:
+            probe.close()
 
 
 def readiness(manifest, latest):
@@ -334,7 +509,18 @@ def select(decision, current):
     known = {item["case_id"] for item in current["evidence"]}
     evidence = decision["evidence_ids"]
     require(
-        isinstance(evidence, list) and all(item in known for item in evidence),
+        isinstance(evidence, list),
+        "Evidence IDs must be a list",
+    )
+    require(
+        all(
+            not any(item.startswith(prefix) for prefix in EVIDENCE_BLOCKLIST)
+            for item in evidence
+        ),
+        "Blocklisted historical comparison cannot unlock gates",
+    )
+    require(
+        all(item in known for item in evidence),
         "Unknown evidence ID",
     )
     eligible = {item["case_id"]: item for item in current["eligible_cases"]}
@@ -406,6 +592,10 @@ def supervisor(config, current):
 
 def journal(directory):
     database = sqlite3.connect(directory / "ledger.sqlite3", timeout=5)
+    # Durable transactions: a killed controller must not lose a reservation
+    # or a terminal case record, or the budget could be double-spent.
+    database.execute("PRAGMA journal_mode=WAL")
+    database.execute("PRAGMA synchronous=FULL")
     database.execute("CREATE TABLE IF NOT EXISTS events (body TEXT NOT NULL)")
     database.commit()
     return database
@@ -424,8 +614,70 @@ def history(database):
     ]
 
 
-def latest_cases(events):
-    return {item["case_id"]: item for item in events if item["kind"] == "case"}
+def fingerprint_case(manifest, case):
+    """Canonical identity of one case execution.
+
+    Covers source, weights, the full contract (seed/quality/software/geometry
+    family), the workload adapter, and the bounded time budget. Resume only
+    counts evidence with an identical fingerprint; anything else is stale.
+    """
+    return digest(
+        dict(
+            source_sha=manifest["source_sha"],
+            checkpoint=manifest["contract"]["checkpoint_manifest_sha256"],
+            contract=manifest["contract"],
+            adapter=case["adapter"],
+            repeat_of=case["repeat_of"],
+            samples=case["samples"],
+            run_timeout_s=manifest["limits"]["run_timeout_s"],
+        )
+    )
+
+
+def latest_cases(events, manifest=None):
+    """Latest record per case id, oldest-wins reversed.
+
+    With a manifest, completed evidence whose case fingerprint differs from
+    the current manifest is demoted to ``stale``: it can never satisfy a
+    dependency or a gate, and the case must re-run under the new identity.
+    """
+    latest = {item["case_id"]: item for item in events if item["kind"] == "case"}
+    if manifest is None:
+        return latest
+    by_id = {case["id"]: case for case in manifest["cases"]}
+    for case_id, record_item in latest.items():
+        case = by_id.get(case_id)
+        expected = fingerprint_case(manifest, case) if case else None
+        if (
+            record_item["status"] in ("measured", "diagnostic")
+            and record_item.get("fingerprint") != expected
+        ):
+            latest[case_id] = dict(record_item, status="stale")
+    return latest
+
+
+def outstanding_charges(events):
+    """Total device-seconds charged against the campaign budget.
+
+    Every launch reserves the worst case (devices × run timeout). A terminal
+    record reconciles the reservation down to the actual measured allocation
+    only when cleanup was confirmed (``actual_device_s`` present); unknown
+    cleanup or clock keeps the full worst-case charge.
+    """
+    total = 0
+    reservations = {}
+    for item in events:
+        if item.get("kind") != "case":
+            continue
+        run_id = item.get("run_id")
+        charge = item.get("charged_device_s")
+        if item["status"] == "running" and charge is not None:
+            reservations[run_id] = charge
+        elif run_id in reservations:
+            reserved = reservations.pop(run_id)
+            actual = item.get("actual_device_s")
+            total += reserved if actual is None else min(reserved, actual)
+    return total + sum(reservations.values())
 
 
 @contextmanager
@@ -509,7 +761,7 @@ def launch_environment(manifest, case):
         H3_SEED=str(contract["seed"]),
         H3_QUALITY=contract["quality"],
         H3_PROFILE=str(int(REGISTRY[case["adapter"]][1])),
-        H3_REPEATS="1",
+        H3_REPEATS=str(case["samples"]),
         SGLANG_PROFILE_RECORD_SHAPES="1",
         SGLANG_H3_NPU_ADALN_MEMO="0",
     )
@@ -518,6 +770,23 @@ def launch_environment(manifest, case):
         env["H3_WINDOW_PARITY"] = "1"
     if adapter.startswith("R01.CROP."):
         env["H3_LASER_CROP_BEFORE_CAST"] = str(int(adapter.endswith(".BEFORE")))
+    if adapter == "R05.NPUADALN.ON":
+        env["SGLANG_H3_NPU_ADALN_MEMO"] = "1"
+    if adapter == "R06.GRAPH.W0R":
+        env["SGLANG_H3_VAE_NPU_GRAPH"] = "1"
+    if adapter == "R08.DISPATCHLOG":
+        env["SGLANG_H3_ATTN_DISPATCH_LOG"] = "1"
+    if adapter == "R08.MEMOSTATS":
+        env["SGLANG_H3_ADALN_MEMO_STATS"] = "1"
+        env["SGLANG_H3_NPU_ADALN_MEMO"] = "1"
+    if adapter == "R08.FFNLOG":
+        env["SGLANG_H3_SELECTIVE_FFN_LOG"] = "1"
+        env["SGLANG_H3_SELECTIVE_FFN_FRACTION"] = "0.5"
+    if adapter == "R08.SPARSE.H08":
+        env["H3_ATTENTION_BACKEND"] = "ascend_sparse_attn"
+        # The pinned capability file doubles as the sparse policy config the
+        # launcher requires; validation has already hash-pinned it.
+        env["H3_ATTENTION_CONFIG"] = manifest["capabilities"]["r08_sparse"]["path"]
     return env
 
 
@@ -597,7 +866,7 @@ def run_launcher(argv, env, log, timeout, stop, lock_fds):
     return status or ("completed" if process.returncode == 0 else "failed")
 
 
-def results(directory, adapter, deadline):
+def results(directory, adapter, deadline, samples=1):
     runs = list(directory.glob("run-*"))
     require(
         len(runs) == 1 and runs[0].is_dir(), "Expected one launcher artifact directory"
@@ -608,17 +877,26 @@ def results(directory, adapter, deadline):
     ]
     matches = json.loads((run / "denoise_matches.json").read_text())
     require(
-        len(records) == 2
+        len(records) == samples + 1
         and records[0]["warmup"] is True
-        and records[1]["warmup"] is False
+        and all(row["warmup"] is False for row in records[1:])
         and all(row["response"]["status"] == "completed" for row in records),
-        "Expected one warmup and one completed sample",
+        "Expected one warmup and the requested completed samples",
     )
-    request_ids = {records[1]["response"]["id"]}
+    request_ids = {row["response"]["id"] for row in records[1:]}
     require(
         request_ids == matches.keys(),
         "Missing or duplicate denoise evidence",
     )
+    for match in matches.values():
+        # Validate the actual counters when the artifacts carry them; an
+        # expected work count is not a measured one, so absent stays absent.
+        for name in ("logical_forwards", "scheduler_updates", "block_calls"):
+            if name in match:
+                require(
+                    type(match[name]) is int and match[name] > 0,
+                    f"Invalid measured counter: {name}",
+                )
     profile = REGISTRY[adapter][1]
     frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []
@@ -637,9 +915,10 @@ def results(directory, adapter, deadline):
             "Invalid AV durations",
         )
         hashes.append(sha256_file(run / f"sample-{index}.mp4", deadline))
-    elapsed = records[1]["e2e_s"]
+    client_samples = [row["e2e_s"] for row in records[1:]]
     require(
-        records[1]["profiled"] == profile and math.isfinite(elapsed) and elapsed > 0,
+        records[1]["profiled"] == profile
+        and all(math.isfinite(value) and value > 0 for value in client_samples),
         "Invalid measured clock",
     )
     if profile:
@@ -647,14 +926,18 @@ def results(directory, adapter, deadline):
             any(path.is_file() for path in (run / "profiles").rglob("*")),
             "Missing device profiler artifacts",
         )
-    return dict(
+    evidence = dict(
         artifacts=str(run),
         output_sha256=hashes,
         quality="review_required",
-        median_client_s=None if profile else elapsed,
-        p90_client_s=None if profile else elapsed,
         request_ids=sorted(request_ids),
+        **aggregate_samples(client_samples),
     )
+    if profile:
+        # Diagnostics are scope-separated: no client-seconds claim at all.
+        evidence["median_client_s"] = None
+        evidence["p90_client_s"] = None
+    return evidence
 
 
 def campaign(manifest, directory, config=None):
@@ -688,7 +971,7 @@ def campaign(manifest, directory, config=None):
             return
         if not any(
             value == "ready"
-            for value in readiness(manifest, latest_cases(events)).values()
+            for value in readiness(manifest, latest_cases(events, manifest)).values()
         ):
             return
         limits = manifest["limits"]
@@ -708,15 +991,17 @@ def campaign(manifest, directory, config=None):
         ]
         lock_fds = campaign_fd + reserve(stack, paths)
         deadline = time.monotonic() + started_at + limits["max_wall_s"] - time.time()
+        ports_available((contract["port"], contract["port"] + 1))
         preflight(manifest, directory, deadline)
+        supervisor_failures = 0
         while not stop.exists():
             events = history(database)
-            latest = latest_cases(events)
-            charged = [item for item in events if item.get("charged_device_s")]
-            remaining = limits["max_device_s"] - sum(
-                item["charged_device_s"] for item in charged
+            latest = latest_cases(events, manifest)
+            remaining = limits["max_device_s"] - outstanding_charges(events)
+            runs_used = sum(
+                1 for item in events if item.get("kind") == "case" and item["status"] == "running"
             )
-            remaining_runs = limits["max_runs"] - len(charged)
+            remaining_runs = limits["max_runs"] - runs_used
             charge = len(contract["devices"]) * limits["run_timeout_s"]
             remaining_wall = max(
                 0, math.floor(started_at + limits["max_wall_s"] - time.time())
@@ -742,6 +1027,7 @@ def campaign(manifest, directory, config=None):
                 try:
                     proposal = supervisor(config, current)
                     action, case_id = select(proposal, current)
+                    supervisor_failures = 0
                     record(
                         database,
                         "decision",
@@ -758,14 +1044,25 @@ def campaign(manifest, directory, config=None):
                     IndexError,
                     AttributeError,
                 ) as error:
+                    supervisor_failures += 1
                     record(
                         database,
                         "decision",
                         accepted=False,
                         snapshot_id=current["snapshot_id"],
                         reason=type(error).__name__,
+                        fallback=True,
+                        consecutive_failures=supervisor_failures,
                     )
-                    return
+                    if supervisor_failures >= SUPERVISOR_FALLBACK_LIMIT:
+                        record(
+                            database,
+                            "pause",
+                            reason="supervisor endpoint unavailable",
+                        )
+                        return
+                    # Bounded fallback: run the deterministic queue head.
+                    action, case_id = chosen["action"], chosen["case_id"]
             if action in ("request_review", "stop_campaign"):
                 record(database, "pause", reason=action, case_id=case_id)
                 return
@@ -793,46 +1090,126 @@ def campaign(manifest, directory, config=None):
                 REGISTRY[case["adapter"]][0],
                 str(output / "run"),
             ]
-            record(
-                database,
-                "case",
-                case_id=case_id,
-                status="running",
-                charged_device_s=charge,
-                artifacts=str(output),
-                argv=argv,
-                action=action,
-            )
-            run_started = time.monotonic()
-            status = "blocked"
-            evidence = dict(artifacts=str(output))
-            try:
-                visible = check_devices(env, manifest)
-                save(output / "device_preflight.json", visible)
-                timeout = limits["run_timeout_s"] - (time.monotonic() - run_started)
-                status = run_launcher(
-                    argv, env, output / "launcher.log", timeout, stop, lock_fds
+            attempt = 0
+            while True:
+                run_id = uuid.uuid4().hex
+                record(
+                    database,
+                    "case",
+                    case_id=case_id,
+                    status="running",
+                    run_id=run_id,
+                    fingerprint=fingerprint_case(manifest, case),
+                    attempt=attempt,
+                    charged_device_s=charge,
+                    artifacts=str(output),
+                    argv=argv,
+                    action=action,
                 )
-                if status == "completed":
-                    evidence = results(
-                        output, case["adapter"], run_started + limits["run_timeout_s"]
+                run_started = time.monotonic()
+                status = "blocked"
+                evidence = dict(artifacts=str(output))
+                cleanup_confirmed = False
+                try:
+                    visible = check_devices(env, manifest)
+                    save(output / "device_preflight.json", visible)
+                    timeout = limits["run_timeout_s"] - (time.monotonic() - run_started)
+                    status = run_launcher(
+                        argv, env, output / "launcher.log", timeout, stop, lock_fds
                     )
-                    status = (
-                        "diagnostic" if REGISTRY[case["adapter"]][1] else "measured"
+                    if status == "completed":
+                        evidence = results(
+                            output,
+                            case["adapter"],
+                            run_started + limits["run_timeout_s"],
+                            case["samples"],
+                        )
+                        status = (
+                            "diagnostic" if REGISTRY[case["adapter"]][1] else "measured"
+                        )
+                    cleanup_confirmed = status in (
+                        "completed",
+                        "cancelled",
+                        "failed",
+                        "timed_out",
                     )
-            except (
-                ValueError,
-                OSError,
-                KeyError,
-                TypeError,
-                subprocess.SubprocessError,
-            ) as error:
-                evidence["error"] = str(error)
-                if status == "completed":
-                    status = "failed"
-            record(database, "case", case_id=case_id, status=status, **evidence)
-            if status not in ("measured", "diagnostic"):
-                return
+                except (
+                    ValueError,
+                    OSError,
+                    KeyError,
+                    TypeError,
+                    subprocess.SubprocessError,
+                ) as error:
+                    evidence["error"] = str(error)
+                    if status == "completed":
+                        status = "failed"
+                    cleanup_confirmed = status == "failed"
+                wall_s = time.monotonic() - run_started
+                terminal = dict(evidence)
+                terminal["run_id"] = run_id
+                terminal["fingerprint"] = fingerprint_case(manifest, case)
+                terminal["attempt"] = attempt
+                if cleanup_confirmed:
+                    # Confirmed termination: reconcile the worst-case
+                    # reservation down to the measured allocation.
+                    terminal["actual_device_s"] = math.ceil(
+                        len(contract["devices"]) * wall_s
+                    )
+                record(database, "case", case_id=case_id, status=status, **terminal)
+                if status in ("measured", "diagnostic"):
+                    break
+                failure = classify_failure(terminal.get("error"), status)
+                if failure == "cleanup":
+                    record(
+                        database,
+                        "pause",
+                        reason="cleanup unverified; operator must confirm the allocation",
+                        case_id=case_id,
+                    )
+                    return
+                if failure in ("oom", "correctness"):
+                    record(
+                        database,
+                        "case",
+                        case_id=case_id,
+                        status="blocked",
+                        run_id=run_id,
+                        fingerprint=fingerprint_case(manifest, case),
+                        blocked_reason=failure,
+                    )
+                    return
+                if (
+                    stop.exists()
+                    or time.time() + limits["run_timeout_s"]
+                    > started_at + limits["max_wall_s"]
+                ):
+                    record(
+                        database,
+                        "pause",
+                        reason="Stop requested or wall budget exhausted",
+                    )
+                    return
+                if attempt >= 1:
+                    record(
+                        database,
+                        "pause",
+                        reason=f"{case_id} failed twice; track exhausted",
+                        case_id=case_id,
+                    )
+                    return
+                remaining_after = limits["max_device_s"] - outstanding_charges(
+                    history(database)
+                )
+                if charge > remaining_after:
+                    record(
+                        database,
+                        "pause",
+                        reason="retry does not fit the remaining budget",
+                        case_id=case_id,
+                    )
+                    return
+                attempt += 1
+                record(database, "retry", case_id=case_id, attempt=attempt)
 
 
 def dashboard(directory, manifest, events):

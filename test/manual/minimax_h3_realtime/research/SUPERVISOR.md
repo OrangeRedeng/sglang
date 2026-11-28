@@ -46,6 +46,8 @@ Allowed actions: `run_case`, `repeat_case`, `request_diagnostics`, `mark_blocked
 - A native full-window parity check is ready and W2 depends on it: select parity case, not W2.
 - A graph replay case measured lower latency but quality/parity is pending: request the approved validation case or human review, not promotion.
 - Three RGB chunks have server ratio 1.48× but matched client baseline missing: select approved baseline recovery; do not call it E2E speedup.
+- A case is `quality_rejected` (e.g. an observed LLLL seam): treat that clip as rejected; a dependent case is blocked until policy resolves it. Do not re-propose the same rejected clip as a speedup.
+- An R05–R08 adapter case (e.g. `R06.GRAPH.W0R`, `R08.SPARSE.H08`) is offered only when its capability gate is satisfied; if everything eligible is exhausted, `stop_campaign` instead of inventing alternatives.
 - Budget exhausted or every remaining case blocked: stop, retaining existing evidence.
 
 Do not self-modify this prompt or the campaign manifest. The controller owns all enforcement; your output is only a proposal.
@@ -55,5 +57,21 @@ Do not self-modify this prompt or the campaign manifest. The controller owns all
 Use `case_id` as the evidence ID from `evidence`. The only registered variant
 is `default`. Use the action listed on each eligible case. A measured case
 with `quality="review_required"` has no quality approval. Budget fields are
-reserved device-seconds, wall-clock seconds and run count. The controller
-pauses on an invalid response or unavailable endpoint.
+reserved device-seconds, wall-clock seconds and run count.
+
+Evidence semantics (v2):
+
+- Evidence IDs starting `H02` are blocklisted (invalid historical
+  comparison); decisions citing them are rejected outright.
+- Metrics carry `sample_count` and `significance`: `screening` results
+  (fewer than 10 matched repetitions) can never justify promotion; median
+  and nearest-rank p90 are computed only from raw completed samples.
+- Stale evidence (its case fingerprint no longer matches the manifest) is
+  reported as `stale` and cannot satisfy a dependency.
+- OOM or correctness failures block their track after one bounded transient
+  retry; the controller pauses on unverified cleanup.
+
+On an invalid or unreachable supervisor endpoint the controller falls back
+to the deterministic queue head for at most a bounded number of consecutive
+failures, then pauses; a fallback is recorded in the ledger. Do not attempt
+to circumvent a fallback: send decisions only against a fresh snapshot.
