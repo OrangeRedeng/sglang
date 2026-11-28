@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from math import isfinite, prod
+import os
 
 import torch
 from mindiesd import sparse_attention
@@ -23,6 +24,30 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 logger = init_logger(__name__)
+
+# Opt-in dispatch recorder (SGLANG_H3_ATTN_DISPATCH_LOG=1): a capped ring of
+# the actual backend decision per attention call, so a run can prove which
+# path (dense backend or sparse type) served every step/layer instead of
+# inferring from profiler tags. Grows to _DISPATCH_LOG_CAP and wraps.
+_DISPATCH_LOG_CAP = 4096
+_dispatch_log: list[dict] = []
+
+
+def _record_dispatch(**event) -> None:
+    if os.getenv("SGLANG_H3_ATTN_DISPATCH_LOG") != "1":
+        return
+    if len(_dispatch_log) >= _DISPATCH_LOG_CAP:
+        del _dispatch_log[: len(_dispatch_log) // 2]
+    _dispatch_log.append(event)
+
+
+def dispatch_log_snapshot() -> tuple[dict, ...]:
+    """Recorded dispatch decisions since process start (diagnostics only)."""
+    return tuple(_dispatch_log)
+
+
+def clear_dispatch_log() -> None:
+    _dispatch_log.clear()
 
 
 class AscendSparseAttentionBackend(AttentionBackend):
@@ -342,6 +367,12 @@ class AscendSparseAttentionImpl(AttentionImpl):
             f"ascend_sparse_step_{metadata.current_timestep}_dense_"
             f"{self._dense_backend.__name__}_{config['precision']}"
         ):
+            _record_dispatch(
+                kind="dense",
+                backend=self._dense_backend.__name__,
+                precision=config["precision"],
+                step=metadata.current_timestep,
+            )
             if self._dense_uses_laser:
                 return self._dense_impl.forward(
                     query, key, value, self._dense_metadata, preserve_bf16_range=True
@@ -390,6 +421,14 @@ class AscendSparseAttentionImpl(AttentionImpl):
             f"ascend_sparse_step_{metadata.current_timestep}_"
             f"{metadata.sparse_type}_{metadata.precision}_block_{metadata.block_size}"
         ):
+            _record_dispatch(
+                kind="sparse",
+                sparse_type=metadata.sparse_type,
+                precision=metadata.precision,
+                block_size=metadata.block_size,
+                sparsity=metadata.sparsity,
+                step=metadata.current_timestep,
+            )
             return torch.cat(
                 [
                     sparse_attention(
