@@ -5,17 +5,17 @@ Recover H01 evidence first. Pin the merged FlashGen and LightVAE hashes, A3
 device IDs, TorchNPU/CANN, request and revision. B0 and all W cases must use
 the same backend and topology. Use a separate artifact prefix for each run.
 
-Inside the A3 container, from the H05 checkout:
+Inside the A3 container, use the R01 checkout for the merged-only launcher:
 
 ```bash
-: "${H3_MODEL:?Set the merged four-step FlashGen model directory}"
-: "${H3_LIGHTVAE:?Set the pinned LightVAE decoder path}"
+: "${H3_CHECKPOINT_MANIFEST:?Set the verified FlashGen4 manifest}"
+: "${H3_CHECKPOINT_RECEIPT:?Set the verification receipt}"
 : "${H3_PROMPT:?Set the saved matched baseline prompt}"
 : "${ASCEND_RT_VISIBLE_DEVICES:?Set the 16 approved A3 device IDs}"
 : "${H05_OUTPUT_PREFIX:?Set an artifact prefix on the shared filesystem}"
-export H3_MODEL H3_LIGHTVAE H3_PROMPT ASCEND_RT_VISIBLE_DEVICES
-export H3_MERGED_FLASHGEN=1 H3_LASER16=1 H3_NUM_GPUS=16 H3_PIN_CPU_MEMORY=false
-export H3_STEPS=4 H3_FLOW_SHIFT=12 H3_SEED=1101 H3_REPEATS=1
+export H3_CHECKPOINT_MANIFEST H3_CHECKPOINT_RECEIPT H3_PROMPT ASCEND_RT_VISIBLE_DEVICES
+export H3_LASER16=1 H3_NUM_GPUS=16 H3_PIN_CPU_MEMORY=false
+export H3_SEED=1101 H3_REPEATS=1
 unset H3_LORA H3_WINDOW_POLICY
 h3_case=W0R
 bash test/manual/minimax_h3_realtime/research/run_a3_windowing.sh \

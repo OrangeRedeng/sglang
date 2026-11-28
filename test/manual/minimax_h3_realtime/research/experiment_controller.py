@@ -20,6 +20,8 @@ from contextlib import ExitStack, closing, contextmanager
 from importlib import metadata
 from pathlib import Path
 
+from checkpoint_contract import digest as checkpoint_digest
+from checkpoint_contract import is_sha, load_verified, reject_runtime_lora
 from runner import digest, save
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -32,6 +34,30 @@ REGISTRY = {
     "H05.W2": ("W2", False, "h05_repack_parity"),
     "H03.STEP3_TRACE": ("B0", True, None),
     "H08.NATIVE50": ("B0", False, None),
+    "R01.CLEAN4.B0": ("B0", False, None),
+    "R01.CLEAN4.W0R": ("W0R", False, None),
+    "R01.PARITY.B0": ("B0", False, None),
+    "R01.PARITY.W0R": ("W0R", False, None),
+    "R01.CROP.BEFORE": ("B0", False, None),
+    "R01.CROP.AFTER": ("B0", False, None),
+    "R01.QUALITY.NATIVE": ("B0", False, None),
+    "R01.QUALITY.FLASHGEN": ("B0", False, None),
+    "R01.QUALITY.TURBO": ("B0", False, None),
+    "R01.HIST.OFF": ("HIST-OFF", False, None),
+    "R01.HIST.ON": ("HIST-ON", False, None),
+}
+CHECKPOINT_FAMILIES = {
+    "A3-C4": "flashgen4",
+    "A3-T8": "turbo8",
+    "A3-NATIVE50": "native50",
+    "A5-TARGET": "flashgen4",
+}
+CASE_FAMILIES = {
+    "H08.NATIVE50": "native50",
+    "R01.QUALITY.NATIVE": "native50",
+    "R01.QUALITY.TURBO": "turbo8",
+    "R01.HIST.OFF": "native50",
+    "R01.HIST.ON": "native50",
 }
 ACTIONS = {
     "run_case",
@@ -88,7 +114,7 @@ def validate(manifest):
         manifest, "version id approved source_sha contract limits capabilities cases"
     )
     require(
-        type(manifest["version"]) is int and manifest["version"] == 1,
+        type(manifest["version"]) is int and manifest["version"] == 2,
         "Unsupported manifest version",
     )
     require(
@@ -103,10 +129,15 @@ def validate(manifest):
     contract = manifest["contract"]
     fields(
         contract,
-        "family host devices soc_version port model decoder model_manifest_sha256 "
-        "decoder_sha256 software prompt seed quality flow_shift",
+        "family host devices soc_version port checkpoint_manifest checkpoint_receipt "
+        "checkpoint_manifest_sha256 software prompt seed quality",
     )
-    sizes = {"A3-C4": (8, 16), "A3-NATIVE50": (8, 16), "A5-TARGET": (8,)}
+    sizes = {
+        "A3-C4": (8, 16),
+        "A3-T8": (8, 16),
+        "A3-NATIVE50": (8, 16),
+        "A5-TARGET": (8,),
+    }
     family = contract["family"]
     require(family in sizes, "Unknown deployment family")
     devices = contract["devices"]
@@ -124,15 +155,11 @@ def validate(manifest):
     require(positive(contract["soc_version"]), "Pin the device runtime SoC version")
     require(
         named(contract["host"])
-        and absolute_path(contract["model"])
-        and absolute_path(contract["decoder"]),
-        "Pin the host and absolute weight paths",
+        and absolute_path(contract["checkpoint_manifest"])
+        and absolute_path(contract["checkpoint_receipt"])
+        and is_sha(contract["checkpoint_manifest_sha256"]),
+        "Pin the host, verified checkpoint manifest and receipt",
     )
-    for key in ("model_manifest_sha256", "decoder_sha256"):
-        require(
-            re.fullmatch(r"[0-9a-f]{64}", contract[key] or "") is not None,
-            f"Pin contract.{key}",
-        )
     software = contract["software"]
     fields(software, "torch torch_npu mindiesd cann_version_file cann_sha256")
     for name in ("torch", "torch_npu", "mindiesd"):
@@ -153,12 +180,6 @@ def validate(manifest):
         type(contract["seed"]) is int and contract["quality"] in ("exact", "lossless"),
         "Select a seed and an explicit quality tier",
     )
-    require(
-        type(contract["flow_shift"]) in (float, int)
-        and 0 < contract["flow_shift"] <= 100,
-        "Invalid video flow shift",
-    )
-
     limits = manifest["limits"]
     fields(
         limits,
@@ -191,9 +212,11 @@ def validate(manifest):
             "Invalid case identity or adapter",
         )
         require(
-            (family == "A3-NATIVE50") == (adapter == "H08.NATIVE50"),
+            CHECKPOINT_FAMILIES[family] == CASE_FAMILIES.get(adapter, "flashgen4"),
             "Adapter and schedule must use the same deployment family",
         )
+        if adapter.startswith("R01.HIST."):
+            require(len(devices) == 8, "Historical controls require eight devices")
         after, repeat = case["after"], case["repeat_of"]
         require(
             isinstance(after, list) and all(item in seen for item in after),
@@ -450,71 +473,51 @@ def preflight(manifest, directory, deadline):
         == software["cann_sha256"],
         "CANN fingerprint mismatch",
     )
-    require(
-        sha256_file(Path(contract["decoder"]), deadline) == contract["decoder_sha256"],
-        "Decoder fingerprint mismatch",
+    checkpoint = load_verified(
+        contract["checkpoint_manifest"], contract["checkpoint_receipt"]
     )
-    model = Path(contract["model"])
-    weights = model / "H09.weights.sha256"
     require(
-        sha256_file(weights, deadline) == contract["model_manifest_sha256"],
-        "Model inventory fingerprint mismatch",
+        checkpoint_digest(checkpoint) == contract["checkpoint_manifest_sha256"]
+        and checkpoint["family"] == CHECKPOINT_FAMILIES[contract["family"]],
+        "Checkpoint identity or schedule differs from the approved campaign",
     )
-    entries = {}
-    for line in weights.read_text().splitlines():
-        expected, name = line.split("  ", 1)
-        target = (model / name).resolve()
-        require(
-            not Path(name).is_absolute()
-            and target.is_relative_to(model.resolve())
-            and target not in entries
-            and re.fullmatch(r"[0-9a-f]{64}", expected),
-            "Invalid checkpoint inventory entry",
-        )
-        require(
-            sha256_file(target, deadline) == expected,
-            "Checkpoint file fingerprint mismatch",
-        )
-        entries[target] = expected
-    actual = {
-        path.resolve()
-        for path in model.rglob("*")
-        if path.is_file() and path != weights
-    }
     require(
-        actual and actual == entries.keys(),
-        "Inventory must cover every checkpoint file",
+        checkpoint["family"] != "native50" or checkpoint["decoder"]["kind"] == "native",
+        "Native50 requires the native decoder",
     )
 
 
 def launch_environment(manifest, case):
     contract = manifest["contract"]
+    reject_runtime_lora()
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("H3_", "SGLANG_"))
         and key not in ("PYTHONPATH", "BASH_ENV", "ENV")
     }
-    native = contract["family"] == "A3-NATIVE50"
     env.update(
         ASCEND_RT_VISIBLE_DEVICES=",".join(map(str, contract["devices"])),
-        H3_MODEL=contract["model"],
-        H3_LIGHTVAE=contract["decoder"],
-        H3_NATIVE_REFERENCE=str(int(native)),
-        H3_MERGED_FLASHGEN=str(int(not native)),
+        H3_CHECKPOINT_MANIFEST=contract["checkpoint_manifest"],
+        H3_CHECKPOINT_RECEIPT=contract["checkpoint_receipt"],
+        H3_EXPECTED_CHECKPOINT_SHA=contract["checkpoint_manifest_sha256"],
         H3_PROMPT=contract["prompt"],
         H3_NUM_GPUS=str(len(contract["devices"])),
         H3_LASER16="1",
         H3_PORT=str(contract["port"]),
         H3_PIN_CPU_MEMORY="false",
         H3_SEED=str(contract["seed"]),
-        H3_FLOW_SHIFT=str(contract["flow_shift"]),
         H3_QUALITY=contract["quality"],
         H3_PROFILE=str(int(REGISTRY[case["adapter"]][1])),
         H3_REPEATS="1",
         SGLANG_PROFILE_RECORD_SHAPES="1",
         SGLANG_H3_NPU_ADALN_MEMO="0",
     )
+    adapter = case["adapter"]
+    if adapter in ("R01.PARITY.B0", "R01.PARITY.W0R"):
+        env["H3_WINDOW_PARITY"] = "1"
+    if adapter.startswith("R01.CROP."):
+        env["H3_LASER_CROP_BEFORE_CAST"] = str(int(adapter.endswith(".BEFORE")))
     return env
 
 
@@ -611,23 +614,24 @@ def results(directory, adapter, deadline):
         and all(row["response"]["status"] == "completed" for row in records),
         "Expected one warmup and one completed sample",
     )
-    request_ids = {row["response"]["id"] for row in records}
+    request_ids = {records[1]["response"]["id"]}
     require(
-        len(request_ids) == 2 and request_ids == matches.keys(),
+        request_ids == matches.keys(),
         "Missing or duplicate denoise evidence",
     )
     profile = REGISTRY[adapter][1]
+    frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []
     for index, row in enumerate(records):
         media = row["media"]
         require(
             (media["width"], media["height"], media["fps"], media["frames"])
-            == (1344, 768, 24, 362),
+            == (1344, 768, 24, frames),
             "Unexpected output geometry",
         )
         require(
             all(
-                math.isfinite(media[name]) and abs(media[name] - 362 / 24) <= 0.1
+                math.isfinite(media[name]) and abs(media[name] - frames / 24) <= 0.1
                 for name in ("duration_s", "audio_duration_s")
             ),
             "Invalid AV durations",

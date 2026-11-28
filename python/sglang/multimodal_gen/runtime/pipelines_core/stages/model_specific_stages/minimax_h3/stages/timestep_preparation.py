@@ -228,7 +228,10 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             minimax_h3_time_shift_sigmas,
         )
 
+        family = os.getenv("SGLANG_H3_RESEARCH_FAMILY")
         if MINIMAX_H3_SIGMAS_EXTRA_KEY in batch.extra:
+            if family and not batch.is_warmup:
+                raise ValueError("Research requests cannot override the sigma grid")
             return
         requested_num_steps = getattr(batch, "num_inference_steps", None)
         if requested_num_steps is None:
@@ -303,6 +306,24 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                     "H3 denoise rungs conflict with model release metadata"
                 )
             dmd_steps = rungs
+        if family and not batch.is_warmup:
+            expected = (
+                int(os.environ["SGLANG_H3_RESEARCH_STEPS"]),
+                tuple(int(value) for value in explicit_rungs.split(","))
+                if explicit_rungs is not None
+                else None,
+                float(os.environ["SGLANG_H3_RESEARCH_VIDEO_SHIFT"]),
+                float(os.environ["SGLANG_H3_RESEARCH_AUDIO_SHIFT"]),
+            )
+            if (
+                requested_num_steps,
+                dmd_steps,
+                scales["video"],
+                scales["audio"],
+            ) != expected:
+                raise ValueError(
+                    "Resolved schedule conflicts with the research checkpoint"
+                )
         num_steps = requested_num_steps
         if dmd_steps is not None and batch.is_warmup:
             # warmup truncates the trained rungs instead of rescaling a shorter grid

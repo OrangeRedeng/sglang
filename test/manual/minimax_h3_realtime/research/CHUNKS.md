@@ -1,5 +1,12 @@
 # Native H3 chunk generation
 
+Launch each endpoint through [the R01 verified launcher](R01_REPORT.md) with
+`H3_SERVE_ONLY=1`. Use the manifest digest printed by verification in both
+deployment records and the request model ID. The client checks the served
+identity and empty runtime adapter state before submitting work. For the
+two four-device anchor servers, launch `B3` with distinct `H3_PORT` and
+`H3_B3_DEVICES` values.
+
 `h3_chunks.py` performs actual `/v1/videos` requests against existing H3 servers.
 It implements **RGB endpoint-conditioned continuation and parallel generation**.
 It does not implement AV latent-tail continuation, global temporal RoPE, or an
@@ -19,21 +26,19 @@ share that partition. Supply its actual immutable revisions in this JSON:
   "window_frames": 124,
   "overlap_frames": 1,
   "deployment": {
-    "model_revision": "YOUR_BASE_REVISION",
-    "adapter_revision": "YOUR_FLASHGEN_REVISION",
-    "decoder_revision": "YOUR_LIGHTVAE_REVISION"
+    "family": "flashgen4",
+    "manifest_sha256": "REPLACE_WITH_VERIFIED_MANIFEST_SHA256"
   },
   "endpoints": [{
     "url": "http://127.0.0.1:30010",
     "devices": [0,1,2,3,4,5,6,7],
     "deployment": {
-      "model_revision": "YOUR_BASE_REVISION",
-      "adapter_revision": "YOUR_FLASHGEN_REVISION",
-      "decoder_revision": "YOUR_LIGHTVAE_REVISION"
+      "family": "flashgen4",
+      "manifest_sha256": "REPLACE_WITH_VERIFIED_MANIFEST_SHA256"
     }
   }],
   "request": {
-    "model": "MiniMaxAI/MiniMax-H3",
+    "model": "h3-research-REPLACE_WITH_VERIFIED_MANIFEST_SHA256",
     "prompt": "An uninterrupted shot of a sailboat crossing a calm lake, with continuous natural sound.",
     "num_inference_steps": 4,
     "seed": 1101,

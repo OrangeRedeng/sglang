@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from checkpoint_contract import assert_endpoint, model_id, validate_request
 from prototypes import execute_chunks, windows
 from runner import probe_media, save
 
@@ -51,11 +52,13 @@ def plan(config):
     if config.get("first_frame") and not Path(config["first_frame"]).is_file():
         raise ValueError("first_frame must exist on the shared filesystem")
     deployment = config.get("deployment", {})
-    if any(
-        not deployment.get(key)
-        for key in ("model_revision", "adapter_revision", "decoder_revision")
-    ):
-        raise ValueError("Declare exact model, adapter, and decoder revisions")
+    if deployment.get("family") not in ("flashgen4", "turbo8"):
+        raise ValueError(
+            "Chunk endpoints require a verified merged research checkpoint"
+        )
+    validate_request(
+        config["request"], deployment["family"], model_id(deployment["manifest_sha256"])
+    )
     endpoints = config["endpoints"]
     if any(endpoint.get("deployment") != deployment for endpoint in endpoints):
         raise ValueError("All endpoints must declare the identical deployment")
@@ -189,7 +192,9 @@ class Client:
             ) from error
 
     def generate(self, request, destination, cancelled):
+        submitted_at = time.perf_counter()
         job = self.json("POST", "/v1/videos", request)
+        accepted_at = time.perf_counter()
         path = "/v1/videos/" + urllib.parse.quote(job["id"], safe="")
         deadline = time.monotonic() + self.timeout
         try:
@@ -201,11 +206,17 @@ class Client:
                 if cancelled.wait(0.1) or time.monotonic() > deadline:
                     raise TimeoutError("Chunk generation cancelled or timed out")
                 job = self.json("GET", path)
+            completed_at = time.perf_counter()
             with urllib.request.urlopen(
                 self.url + path + "/content", timeout=self.timeout
             ) as response:
                 with destination.open("wb") as output:
                     shutil.copyfileobj(response, output)
+            self.last_timing = dict(
+                submit_s=accepted_at - submitted_at,
+                completion_wait_s=completed_at - accepted_at,
+                download_s=time.perf_counter() - completed_at,
+            )
             return job
         except BaseException:
             try:
@@ -296,6 +307,11 @@ def generate(config, directory):
     by_group = {
         tuple(endpoint["devices"]): endpoint for endpoint in config["endpoints"]
     }
+    clients = {
+        group: Client(endpoint["url"], timeout) for group, endpoint in by_group.items()
+    }
+    for client in clients.values():
+        assert_endpoint(client, model_id(config["deployment"]["manifest_sha256"]))
     started = time.perf_counter()
 
     def adapter(task, group, dependencies, cancelled):
@@ -320,9 +336,7 @@ def generate(config, directory):
         save(directory / f"request-{task.index:04d}.json", request)
         raw = directory / f"raw-{task.index:04d}.mp4"
         begin = time.perf_counter()
-        response = Client(by_group[group]["url"], timeout).generate(
-            request, raw, cancelled
-        )
+        response = clients[group].generate(request, raw, cancelled)
         observed = probe_media(raw)
         if [observed["width"], observed["height"]] != config.get(
             "expected_canvas", [1344, 768]

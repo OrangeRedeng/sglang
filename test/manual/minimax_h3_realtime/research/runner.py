@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import statistics
 import subprocess
@@ -17,6 +18,15 @@ import sys
 import time
 
 from catalog import CATALOG
+from checkpoint_contract import SCHEDULES
+from checkpoint_contract import digest as checkpoint_digest
+from checkpoint_contract import (
+    is_sha,
+    load_verified,
+    model_id,
+    reject_runtime_lora,
+    require_launcher,
+)
 
 
 def digest(value):
@@ -36,6 +46,7 @@ def command(argv, *, env, log, timeout):
         or any(not isinstance(x, str) for x in argv)
     ):
         raise ValueError("Commands must be nonempty arrays of strings")
+    reject_runtime_lora(argv, env)
     with log.open("w") as output:
         process = subprocess.Popen(
             argv,
@@ -117,9 +128,9 @@ def validate(suite):
     for key in (
         "hardware",
         "npu_count",
-        "model_revision",
-        "adapter_revision",
-        "decoder_revision",
+        "checkpoint_manifest",
+        "checkpoint_receipt",
+        "checkpoint_manifest_sha256",
         "mode",
         "width",
         "height",
@@ -133,6 +144,9 @@ def validate(suite):
         raise ValueError(
             "Primary campaign requires four or eight scheduler updates and eight NPUs"
         )
+    if not is_sha(contract["checkpoint_manifest_sha256"]):
+        raise ValueError("Pin the verified checkpoint manifest hash")
+    reject_runtime_lora(environment=dict(os.environ, **suite.get("environment", {})))
     ids = [case["id"] for case in suite["cases"]]
     if len(set(ids)) != len(ids):
         raise ValueError("Case IDs must be unique")
@@ -217,6 +231,11 @@ def verify_sample(path, contract, case):
         raise ValueError(
             "DiT evaluations must count logical forwards, without TP/SP replication"
         )
+    if (
+        sample.get("checkpoint_manifest_sha256")
+        != contract["checkpoint_manifest_sha256"]
+    ):
+        raise ValueError("Adapter checkpoint identity does not match campaign")
     if sample.get("contract_hash") != digest(contract):
         raise ValueError("Adapter contract hash does not match campaign")
     if sample.get("workload_hash") != digest(case.get("workload")):
@@ -263,6 +282,20 @@ def run_case(suite, case, directory):
         **suite.get("environment", {}),
         H3_RESEARCH_CONTEXT=str((directory / "context.json").resolve()),
     )
+    checkpoint = load_verified(
+        contract["checkpoint_manifest"], contract["checkpoint_receipt"]
+    )
+    if (
+        checkpoint_digest(checkpoint) != contract["checkpoint_manifest_sha256"]
+        or SCHEDULES[checkpoint["family"]][0] != contract["actual_nfe"]
+    ):
+        raise ValueError("Checkpoint identity or schedule differs from the campaign")
+    env.update(
+        H3_CHECKPOINT_MANIFEST=contract["checkpoint_manifest"],
+        H3_CHECKPOINT_RECEIPT=contract["checkpoint_receipt"],
+        H3_EXPECTED_CHECKPOINT_SHA=contract["checkpoint_manifest_sha256"],
+        H3_RESEARCH_MODEL_ID=model_id(contract["checkpoint_manifest_sha256"]),
+    )
     samples = []
     warmups = case.get("warmups", suite.get("warmups", 3))
     repeats = case.get("repeats", suite.get("repeats", 5))
@@ -294,10 +327,16 @@ def run_case(suite, case, directory):
 
             if healthy():
                 raise ValueError("Health endpoint already occupied")
+            from checkpoint_contract import assert_endpoint
+            from h3_chunks import Client
+
+            argv = case["server_command"]
+            reject_runtime_lora(argv, env)
+            require_launcher(argv)
             server_log = (directory / "server.log").open("w")
             server = subprocess.Popen(
                 case["server_command"],
-                env=env,
+                env=dict(env, H3_SERVE_ONLY="1"),
                 stdout=server_log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -307,6 +346,10 @@ def run_case(suite, case, directory):
                 if server.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError("Server did not become ready")
                 time.sleep(1)
+            assert_endpoint(
+                Client(case["health_url"].removesuffix("/health"), timeout),
+                model_id(contract["checkpoint_manifest_sha256"]),
+            )
         for index in range(warmups + repeats):
             result = (directory / f"sample-{index}.json").resolve()
             run_env = dict(
@@ -474,9 +517,9 @@ def template():
     contract = dict(
         hardware="Ascend A5 (fill exact SoC)",
         npu_count=8,
-        model_revision=None,
-        adapter_revision=None,
-        decoder_revision=None,
+        checkpoint_manifest=None,
+        checkpoint_receipt=None,
+        checkpoint_manifest_sha256=None,
         mode="t2va",
         width=1344,
         height=768,
@@ -508,15 +551,135 @@ def template():
     )
 
 
+def verify_parity(root, candidate, *, decoder_only=False):
+    """Compare a matched B0/W0R pair using measured requests and decoded streams."""
+    manifest = json.loads((root / "checkpoint.json").read_text())
+    if manifest["family"] != "flashgen4":
+        raise ValueError("B0/W0R parity requires the merged FlashGen4 checkpoint")
+    identity = json.loads((root / "comparison.json").read_text())
+    candidate_identity = json.loads((candidate / "comparison.json").read_text())
+    candidate_manifest = json.loads((candidate / "checkpoint.json").read_text())
+    checkpoint = checkpoint_digest(manifest)
+    if decoder_only:
+        decoders = manifest.pop("decoder"), candidate_manifest.pop("decoder")
+        if {entry["kind"] for entry in decoders} != {"native", "lightvae"}:
+            raise ValueError("Decoder comparison requires native VAE and LightVAE")
+        identity["request"].pop("model")
+        candidate_identity["request"].pop("model")
+    if candidate_identity != identity or candidate_manifest != manifest:
+        raise ValueError("Parity launch contracts differ")
+    ranks = len(identity["placement"].split(":", 1)[0].split(","))
+
+    def evidence(run, case):
+        samples = [
+            row
+            for line in (run / "samples.jsonl").read_text().splitlines()
+            if not (row := json.loads(line))["warmup"] and row["case"] == case
+        ]
+        if len(samples) != 1:
+            raise ValueError("Use one measured request per parity launch")
+        request_id = samples[0]["response"]["id"]
+        denoise = json.loads((run / "denoise_matches.json").read_text())[request_id]
+        if "scheduler_updates=4 dit_evaluations=4" not in denoise:
+            raise ValueError(
+                "B0 and W0R must both execute four updates and four forwards"
+            )
+        pattern = re.compile(
+            rf"H3 window parity request={re.escape(request_id)} rank=(\d+) "
+            r"point=(\w+) step=(-?\d+) tensors=(\{.*\})"
+        )
+        observed = {}
+        for line in (run / "server.log").read_text().splitlines():
+            if match := pattern.search(line):
+                key = int(match[1]), match[2], int(match[3])
+                if key in observed:
+                    raise ValueError(f"Duplicate tensor record: {key}")
+                observed[key] = json.loads(match[4])
+        expected = {
+            (rank, point, step)
+            for rank in range(ranks)
+            for point, steps in {
+                "initial": (-1,),
+                "input": range(4),
+                "prediction": range(4),
+                "update": range(4),
+            }.items()
+            for step in steps
+        }
+        if set(observed) != expected:
+            raise ValueError(f"Missing or unexpected tensor records in {run}")
+        media = []
+        for stream, codec in (("v", "rawvideo"), ("a", "pcm_s32le")):
+            media.append(
+                subprocess.check_output(
+                    [
+                        "ffmpeg",
+                        "-v",
+                        "error",
+                        "-i",
+                        str(run / "sample-1.mp4"),
+                        "-map",
+                        f"0:{stream}:0",
+                        "-c",
+                        codec,
+                        "-threads",
+                        "1",
+                        "-f",
+                        "hash",
+                        "-hash",
+                        "sha256",
+                        "-",
+                    ],
+                    text=True,
+                    timeout=180,
+                ).strip()
+            )
+        return observed, media
+
+    b0_tensors, b0_media = evidence(root, "B0")
+    repack_tensors, repack_media = evidence(candidate, "B0" if decoder_only else "W0R")
+    differences = sorted(
+        key for key in b0_tensors if b0_tensors[key] != repack_tensors[key]
+    )
+    if differences or (not decoder_only and b0_media != repack_media):
+        raise ValueError(
+            f"B0/W0R parity failed. Tensor records: {differences}. Media: {b0_media} vs {repack_media}"
+        )
+    return dict(
+        checkpoint=checkpoint,
+        tensors=len(b0_tensors),
+        decoded_video=b0_media[0],
+        decoded_pcm=b0_media[1],
+        candidate_decoded_video=repack_media[0],
+        candidate_decoded_pcm=repack_media[1],
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("init", "plan", "run", "report"))
+    parser.add_argument("action", choices=("init", "plan", "run", "report", "parity"))
     parser.add_argument("suite", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--track", nargs="+")
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--decoder-only", action="store_true")
     args = parser.parse_args()
+    if args.action == "parity":
+        if args.candidate is None:
+            parser.error(
+                "parity requires --candidate pointing at the W0R artifact directory"
+            )
+        print(
+            json.dumps(
+                verify_parity(
+                    args.suite, args.candidate, decoder_only=args.decoder_only
+                ),
+                indent=2,
+            )
+        )
+        return
     if args.action == "init":
         with args.suite.open("x") as stream:
             stream.write(json.dumps(template(), indent=2) + "\n")

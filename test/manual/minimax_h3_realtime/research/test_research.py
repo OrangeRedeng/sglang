@@ -9,6 +9,7 @@ import torch
 
 import prototypes as proto
 import runner
+from test_checkpoint_contract import make_checkpoint
 
 
 @pytest.mark.parametrize("overlap", [0, 22, 56])
@@ -138,14 +139,16 @@ context=json.loads(Path(os.environ['H3_RESEARCH_CONTEXT']).read_text())
 result=Path(os.environ['H3_RESEARCH_RESULT'])
 media=result.with_suffix('.mp4'); media.write_bytes(b'host-fixture')
 result.write_text(json.dumps(dict(status='completed',actual_nfe=4,
-contract_hash=context['contract_hash'],workload_hash=context['workload_hash'],output_path=str(media))))
+contract_hash=context['contract_hash'],workload_hash=context['workload_hash'],output_path=str(media),
+checkpoint_manifest_sha256=context['contract']['checkpoint_manifest_sha256'])))
 """)
+    manifest, receipt, identity = make_checkpoint(tmp_path)
     suite = runner.template()
     suite["contract"].update(
         hardware="mock-A5",
-        model_revision="model",
-        adapter_revision="adapter",
-        decoder_revision="native",
+        checkpoint_manifest=str(manifest),
+        checkpoint_receipt=str(receipt),
+        checkpoint_manifest_sha256=identity,
         software={"test": True},
     )
     suite.update(warmups=1, repeats=2)
@@ -193,7 +196,7 @@ def test_campaign_rounds_resume_and_config_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", args + ["--resume"])
     runner.main()
     assert len((output / "results.jsonl").read_text().splitlines()) == 2
-    suite["contract"]["decoder_revision"] = "lightvae"
+    suite["contract"]["checkpoint_manifest_sha256"] = "f" * 64
     path.write_text(json.dumps(suite))
     with pytest.raises(ValueError, match="changed"):
         runner.main()
@@ -211,6 +214,9 @@ def test_capability_gate_and_workload_mismatch(tmp_path):
                 actual_nfe=4,
                 contract_hash=runner.digest(suite["contract"]),
                 workload_hash="wrong",
+                checkpoint_manifest_sha256=suite["contract"][
+                    "checkpoint_manifest_sha256"
+                ],
             )
         )
     )
@@ -258,3 +264,40 @@ def test_empty_softmax_branch_ignores_undefined_output():
         exact, torch.full((2,), -torch.inf), representative, torch.zeros(2)
     )
     assert torch.equal(merged, representative)
+
+
+def test_exact_repack_evidence_rejects_measured_tensor_difference(
+    tmp_path, monkeypatch
+):
+    runs = [tmp_path / name for name in ("B0", "W0R")]
+    for run in runs:
+        run.mkdir()
+        runner.save(run / "checkpoint.json", dict(family="flashgen4"))
+        runner.save(run / "comparison.json", dict(placement="0:TP1", request={}))
+        sample = dict(case=run.name, warmup=False, response=dict(id=run.name))
+        (run / "samples.jsonl").write_text(json.dumps(sample) + "\n")
+        runner.save(
+            run / "denoise_matches.json",
+            {run.name: "scheduler_updates=4 dit_evaluations=4"},
+        )
+        lines = [
+            f'H3 window parity request={run.name} rank=0 point={point} step={step} tensors={{"value":"same"}}'
+            for point, steps in (
+                ("initial", [-1]),
+                ("input", range(4)),
+                ("prediction", range(4)),
+                ("update", range(4)),
+            )
+            for step in steps
+        ]
+        (run / "server.log").write_text("\n".join(lines))
+    monkeypatch.setattr(
+        runner.subprocess, "check_output", lambda *_, **__: "SHA256=same"
+    )
+    assert runner.verify_parity(*runs)["tensors"] == 13
+    candidate_log = runs[1] / "server.log"
+    candidate_log.write_text(
+        candidate_log.read_text().replace('"same"', '"different"', 1)
+    )
+    with pytest.raises(ValueError, match="Tensor records"):
+        runner.verify_parity(*runs)

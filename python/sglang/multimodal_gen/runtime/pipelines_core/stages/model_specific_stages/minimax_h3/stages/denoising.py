@@ -5,6 +5,8 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from collections.abc import Callable, Mapping
@@ -67,6 +69,29 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 
 logger = init_logger(__name__)
+
+
+def _log_window_parity(batch, point, step, tensors):
+    """Record exact values without retaining device tensors across steps."""
+    fingerprints = {}
+    for name, tensor in tensors.items():
+        value = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        fingerprints[name] = (
+            str(tensor.dtype),
+            list(tensor.shape),
+            hashlib.sha256(value.numpy()).hexdigest(),
+        )
+    logger.info(
+        "H3 window parity request=%s rank=%d point=%s step=%d tensors=%s",
+        batch.request_id,
+        get_world_rank(),
+        point,
+        step,
+        json.dumps(fingerprints, sort_keys=True, separators=(",", ":")),
+        main_process_only=False,
+        local_main_process_only=False,
+    )
+
 
 _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
@@ -805,6 +830,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         if getattr(self.transformer, "hyperflow", None) is not None:
             if self._cache_dit_requested_for_batch(batch):
                 raise ValueError("HyperFlow currently requires Cache-DiT disabled")
+        count_blocks = os.getenv("SGLANG_H3_COUNT_BLOCKS") == "1"
+        if count_blocks and not hasattr(self, "_research_original_blocks"):
+            from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+                MiniMaxH3DiTBlock,
+            )
+
+            # Cache-DiT replaces the public block list during its first mount.
+            self._research_original_blocks = tuple(
+                block
+                for block in self.transformer.modules()
+                if isinstance(block, MiniMaxH3DiTBlock)
+            )
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
             batch,
@@ -863,6 +900,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             )
 
         transformer = self._begin_dit_use(ctx.is_ref2va, batch)
+        block_hooks = []
         placement_managed = self._component_residency_manager is not None
         try:
             model = _resolve_denoise_model(
@@ -921,12 +959,46 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             mode = None if batch.is_warmup else os.getenv("SGLANG_H3_WINDOW_MODE")
+            parity = (
+                not batch.is_warmup
+                and mode in (None, "repack")
+                and os.getenv("SGLANG_H3_WINDOW_PARITY") == "1"
+            )
             num_steps = len(sigmas_video) - 1
             evaluations = 0
             updates = 0
 
+            block_counts = []
+            count_blocks = count_blocks and not batch.is_warmup
+            block_total = 0
+
+            def count_block(_module, _args):
+                nonlocal block_total
+                block_total += 1
+
             def forward_dit(model, kwargs, step):
-                nonlocal evaluations
+                nonlocal evaluations, block_total
+                if parity:
+                    tensors = {
+                        key: kwargs[key]
+                        for key in (
+                            "x",
+                            "audio_x",
+                            "img_position_ids",
+                            "block_token_tags",
+                            "update_mask",
+                            "unique_timesteps",
+                            "inverse_indices",
+                            "block_combined_indices",
+                        )
+                    }
+                    for key in ("img_pos_info", "audio_pos_info", "text_pos_info"):
+                        tensors[key] = kwargs[key]["position_ids"]
+                    tensors["cu_seqlens_q"] = kwargs["packed_seq_params"][
+                        "cu_seqlens_q"
+                    ]
+                    _log_window_parity(batch, "input", step, tensors)
+                block_total = 0
                 result = self._forward_dit(
                     model,
                     kwargs,
@@ -936,6 +1008,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
                     num_steps=num_steps,
                 )
+                if count_blocks:
+                    block_counts.append(block_total)
+                if parity:
+                    _log_window_parity(
+                        batch,
+                        "prediction",
+                        step,
+                        dict(video=result[0], audio=result[1]),
+                    )
                 evaluations += 1
                 return result
 
@@ -1020,6 +1101,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         profile=current_platform.is_npu() and batch.profile,
                     )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if parity:
+                _log_window_parity(
+                    batch, "initial", -1, dict(video=initial_video, audio=initial_audio)
+                )
             if model.final_layer._pdd_heads is not None:
                 initial_video, initial_audio = _scale_pdd_initial_noise(
                     ctx, positive, initial_video, initial_audio
@@ -1070,6 +1155,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 # same value for the initial and condition noise.
                 seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
                 renoise_generator = torch.Generator(device=device).manual_seed(seed)
+            if count_blocks:
+                for block in self._research_original_blocks:
+                    block_hooks.append(block.register_forward_pre_hook(count_block))
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -1082,6 +1170,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 def on_step(_step, _video_rows, _audio_rows):
                     nonlocal updates
                     updates += 1
+                    if parity:
+                        _log_window_parity(
+                            batch,
+                            "update",
+                            _step,
+                            dict(video=_video_rows, audio=_audio_rows),
+                        )
                     self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
@@ -1134,11 +1229,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                             sigmas_video,
                             ctx.sigmas["audio"],
                         )
+                if count_blocks and get_world_rank() == 0:
+                    logger.info(
+                        "H3 block executions request=%s cfg_forwards=%d cache_mounted=%s blocks_per_forward=%s",
+                        batch.request_id,
+                        len(block_counts),
+                        self._cache_dit_enabled,
+                        block_counts,
+                    )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()
                     )
         finally:
+            for hook in block_hooks:
+                hook.remove()
             self._finish_active_component_use()
         _publish_full_loop_outputs(
             ctx,

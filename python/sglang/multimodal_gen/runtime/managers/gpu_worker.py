@@ -969,9 +969,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         deferred: bool,
     ) -> None:
         req_label = req.request_id[:8] if req.request_id else "unnamed"
+        research_metrics = (
+            output_batch.metrics
+            if self.is_output_rank
+            and req.perf_dump_path
+            and not req.is_warmup
+            and os.getenv("SGLANG_H3_RESEARCH_FAMILY")
+            else None
+        )
         try:
+            if research_metrics is not None:
+                output_started = time.perf_counter()
             with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
                 self._materialize_output_transport(output_batch, req, save_output_paths)
+            if research_metrics is not None:
+                research_metrics.record_stage(
+                    "OutputTransport", time.perf_counter() - output_started
+                )
+                research_metrics.record_memory_snapshot(
+                    "output_rank_allocator_after_transport", capture_memory_snapshot()
+                )
             if req.is_warmup and not current_platform.is_cpu():
                 # A warmup saves no output, so nothing waits for its device work;
                 # drain it here or the next request's first blocking op pays for it.

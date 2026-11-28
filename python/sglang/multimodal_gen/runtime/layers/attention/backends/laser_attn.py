@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -57,6 +59,7 @@ class LaserAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.softmax_scale = softmax_scale
+        self.crop_before_cast = os.getenv("SGLANG_H3_LASER_CROP_BEFORE_CAST") != "0"
 
         # After preprocess input layout should be BNSD.
         self.seqlen_base = 256
@@ -149,9 +152,13 @@ class LaserAttentionImpl(AttentionImpl):
         qseqlen: int,
         head_dim: int,
     ) -> torch.Tensor:
-        attention_out = attention_out[:, :, :qseqlen, :head_dim]
+        real_rows = (slice(None), slice(None), slice(qseqlen), slice(head_dim))
+        if self.crop_before_cast:
+            attention_out = attention_out[real_rows]
         if dtype != attention_out.dtype:
             attention_out = attention_out.to(dtype)
+        if not self.crop_before_cast:
+            attention_out = attention_out[real_rows]
 
         attention_out = attention_out.transpose(1, 2).contiguous()
         return attention_out

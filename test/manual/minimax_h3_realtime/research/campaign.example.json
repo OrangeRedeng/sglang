@@ -1,18 +1,23 @@
 {
-  "version": 1,
+  "version": 2,
   "id": "h09-a3-screen",
   "approved": false,
   "source_sha": "0000000000000000000000000000000000000000",
   "contract": {
     "family": "A3-C4",
     "host": "approved-a3-host",
-    "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "devices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
     "soc_version": 250,
     "port": 30088,
-    "model": "/absolute/path/to/merged-flashgen",
-    "decoder": "/absolute/path/to/lightvae.safetensors",
-    "model_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "decoder_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "software": {
       "torch": "fill",
       "torch_npu": "fill",
@@ -23,7 +28,9 @@
     "prompt": "An uninterrupted tracking shot follows a cyclist through a quiet park with matching ambient sound.",
     "seed": 1101,
     "quality": "lossless",
-    "flow_shift": 12.0
+    "checkpoint_manifest": "/absolute/path/to/flashgen4.json",
+    "checkpoint_receipt": "/absolute/path/to/flashgen4.receipt.json",
+    "checkpoint_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "limits": {
     "max_runs": 2,
@@ -35,8 +42,27 @@
   },
   "capabilities": {},
   "cases": [
-    {"id": "b0", "adapter": "H05.B0", "after": [], "repeat_of": null},
-    {"id": "w0r", "adapter": "H05.W0R", "after": ["b0"], "repeat_of": null},
-    {"id": "w1", "adapter": "H05.W1", "after": ["w0r"], "repeat_of": null}
+    {
+      "id": "b0",
+      "adapter": "R01.CLEAN4.B0",
+      "after": [],
+      "repeat_of": null
+    },
+    {
+      "id": "w0r",
+      "adapter": "R01.CLEAN4.W0R",
+      "after": [
+        "b0"
+      ],
+      "repeat_of": null
+    },
+    {
+      "id": "w1",
+      "adapter": "H05.W1",
+      "after": [
+        "w0r"
+      ],
+      "repeat_of": null
+    }
   ]
 }

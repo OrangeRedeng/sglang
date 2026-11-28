@@ -4,12 +4,11 @@ from pathlib import Path
 import pytest
 
 import h3_chunks as chunks
+from checkpoint_contract import model_id
 
 
 def config(tmp_path, mode="continuation"):
-    deployment = dict(
-        model_revision="base", adapter_revision="flashgen", decoder_revision="lightvae"
-    )
+    deployment = dict(family="flashgen4", manifest_sha256="a" * 64)
     result = dict(
         mode=mode,
         duration_s=15,
@@ -22,9 +21,11 @@ def config(tmp_path, mode="continuation"):
             )
         ],
         request=dict(
-            model="MiniMaxAI/MiniMax-H3",
+            model=model_id(deployment["manifest_sha256"]),
             prompt="Continuous motion",
             num_inference_steps=4,
+            flow_shift=12,
+            audio_flow_shift=3,
             seed=1101,
             target=dict(short_edge=768, aspect_ratio="16:9"),
         ),
@@ -36,6 +37,18 @@ def config(tmp_path, mode="continuation"):
             image.write_bytes(b"fixture")
             result["anchors"].append(str(image))
     return result
+
+
+@pytest.fixture
+def model_endpoints(monkeypatch):
+    def endpoint_json(self, method, path):
+        assert method == "GET"
+        if path == "/v1/models":
+            return {"data": [{"id": model_id("a" * 64)}]}
+        assert path == "/v1/list_loras"
+        return {"active": {}, "loaded_adapters": []}
+
+    monkeypatch.setattr(chunks.Client, "json", endpoint_json)
 
 
 def test_real_request_plan_and_native_minimum(tmp_path):
@@ -70,7 +83,7 @@ def test_parallel_windows_share_one_discarded_anchor_frame(tmp_path):
 
 @pytest.mark.parametrize("devices", [list(range(8, 16)), list(range(16))])
 def test_continuation_runs_native_jobs_and_reuses_generated_boundary(
-    tmp_path, monkeypatch, devices
+    tmp_path, monkeypatch, devices, model_endpoints
 ):
     cfg = config(tmp_path)
     cfg["endpoints"][0]["devices"] = devices
@@ -137,7 +150,7 @@ def test_trim_uses_matching_video_audio_intervals(tmp_path, monkeypatch):
 
 
 def test_parallel_jobs_use_two_endpoint_groups_and_shared_anchors(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, model_endpoints
 ):
     import time
     from threading import Lock

@@ -66,7 +66,12 @@ def test_disallowed_model_decisions(manifest, override):
 def test_no_unapproved_repeat_or_cross_family_adapter(manifest):
     invalid = deepcopy(manifest)
     invalid["cases"].append(
-        dict(id="repeat", adapter="H05.B0", after=["b0"], repeat_of=None)
+        dict(
+            id="repeat",
+            adapter=manifest["cases"][0]["adapter"],
+            after=["b0"],
+            repeat_of=None,
+        )
     )
     with pytest.raises(ValueError, match="explicit repeat"):
         validate(invalid)

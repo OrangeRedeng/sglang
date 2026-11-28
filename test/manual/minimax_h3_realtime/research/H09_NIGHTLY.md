@@ -9,16 +9,11 @@ requires a separate adapter. No schedule is installed.
 ## Prepare and inspect
 
 1. Copy [campaign.example.json](campaign.example.json) outside the checkout.
-   Fill the approved source SHA, actual hostname, allocated devices and SoC,
-   model, decoder and runtime hashes, prompt and budgets. Keep `approved=false`
-   until the operator approves the filled file. Use materialized checkpoint
-   files and provide `H09.weights.sha256` in the model directory. This is a
-   GNU sha256sum-style manifest covering every file except the inventory
-   itself. Hash the inventory and pin that hash in the campaign manifest.
-2. Keep the device and port lock paths on a shared mount if multiple
-   controllers use the same host. The locks coordinate this controller's
-   processes. Confirm the reservation with the hardware owner and check for
-   unrelated NPU workloads before launch.
+   Fill the approved source SHA, hostname, allocated devices, SoC, runtime,
+   prompt and budgets. Keep approval off during review.
+2. Prepare and verify the merged checkpoint using [R01](R01_REPORT.md).
+   Fill the campaign manifest with the checkpoint manifest, receipt and digest.
+   Use device and port lock paths shared by controllers on the same host.
 3. Inspect the plan and run the focused host checks before a device smoke.
 
 ```bash

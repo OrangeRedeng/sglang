@@ -33,7 +33,9 @@ Create a JSON configuration containing `server_command` and `client_command`
 (nonempty arrays of argv strings), `health_url`, and optional `environment`,
 `warmups` (default 3), `repeats` (default 5), `startup_timeout_s` (1800), and
 `request_timeout_s` (600). Commands are executed directly without a shell.
-Use the existing verified eight-device launch and fixed-seed request command.
+Set the checkpoint manifest and receipt in `environment` and point
+`server_command` to the [R01 launcher](research/R01_REPORT.md). Pass the
+verified server ID from `H3_RESEARCH_MODEL_ID` to the fixed-seed client.
 
 The client **must wait for generation completion and final audio-video download**,
 exit nonzero on failed requests, and preserve each output for quality review.

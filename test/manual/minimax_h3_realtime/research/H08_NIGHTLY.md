@@ -8,7 +8,7 @@ IDs, media, dispatch trace and per-request timings.
 
 ## Dense reference and adapters
 
-Set `H08_BASE_MODEL` to the undistilled checkpoint, `H08_FLASHGEN_MODEL` to
+Set `H08_BASE_MANIFEST` to the undistilled checkpoint, `H08_FLASHGEN_MANIFEST` to
 the independently verified merged four-step checkpoint, `H3_PROMPT` to the
 saved prompt and `H08_OUTPUT_PREFIX` to a shared artifact prefix. The reference
 uses native VAE and dense Ascend FA BF16. Use that same decoder and backend
@@ -16,30 +16,27 @@ when measuring adapter quality against the reference.
 
 ```bash
 : "${ASCEND_RT_VISIBLE_DEVICES:?Set the eight approved A3 device IDs}"
-: "${H08_BASE_MODEL:?Set the pinned undistilled checkpoint}"
-: "${H08_FLASHGEN_MODEL:?Set the pinned merged FlashGen checkpoint}"
+: "${H08_BASE_MANIFEST:?Set the pinned undistilled checkpoint}"
+: "${H08_FLASHGEN_MANIFEST:?Set the pinned merged FlashGen checkpoint}"
 : "${H08_OUTPUT_PREFIX:?Set the shared output prefix}"
 : "${H3_PROMPT:?Set the saved prompt}"
 unset H3_STEPS H3_LORA H3_MERGED_FLASHGEN H3_WINDOW_POLICY H3_FFN_ACTIVE_FRACTION
 unset SGLANG_H3_DENOISE_RUNGS
 export ASCEND_RT_VISIBLE_DEVICES H3_PROMPT
-export H3_NUM_GPUS=8 H3_PIN_CPU_MEMORY=false H3_NATIVE_VAE=1
-export H3_QUALITY=exact H3_SEED=1101 H3_FLOW_SHIFT=12 H3_REPEATS=1 H3_PROFILE=0
+: "${H08_BASE_RECEIPT:?Set the native checkpoint receipt}"
+: "${H08_FLASHGEN_RECEIPT:?Set the FlashGen checkpoint receipt}"
+export H3_NUM_GPUS=8 H3_PIN_CPU_MEMORY=false
+export H3_QUALITY=exact H3_SEED=1101 H3_REPEATS=1 H3_PROFILE=0
 export H3_ATTENTION_BACKEND=fa H3_ATTENTION_CONFIG='{"precision":"bf16"}'
 h08_launcher=test/manual/minimax_h3_realtime/research/run_a3_windowing.sh
-H3_MODEL="$H08_BASE_MODEL" H3_NATIVE_REFERENCE=1 \
+H3_CHECKPOINT_MANIFEST="$H08_BASE_MANIFEST" H3_CHECKPOINT_RECEIPT="$H08_BASE_RECEIPT" \
   bash "$h08_launcher" --inside "$PWD" B0 "$H08_OUTPUT_PREFIX-native50"
-H3_MODEL="$H08_FLASHGEN_MODEL" H3_MERGED_FLASHGEN=1 \
+H3_CHECKPOINT_MANIFEST="$H08_FLASHGEN_MANIFEST" H3_CHECKPOINT_RECEIPT="$H08_FLASHGEN_RECEIPT" \
   bash "$h08_launcher" --inside "$PWD" B0 "$H08_OUTPUT_PREFIX-flashgen4"
 ```
 
-Turbo is a separate adapter case. If its exact revision, compatible base and
-sampling manifest are available, set `H3_MODEL`, `H3_LORA`, `H3_LORA_ALPHA`,
-`H3_STEPS=8`, `H3_FLOW_SHIFT` and `SGLANG_H3_DENOISE_RUNGS` using that
-manifest, then run B0. The earlier A3 run used video/audio shifts 6/3 and
-1000,875,750,625,500,375,250,125. The public adapter listing alone does not
-establish those settings. The launcher uses audio shift 3 throughout.
-[Turbo release](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+Use a separately verified Turbo8 merge and TURBO manifest for the eight-step
+reference. See [R01 checkpoint preparation](R01_REPORT.md).
 
 ## RainFusion screen
 
@@ -53,7 +50,7 @@ or changing the number of dense steps.
 ```bash
 export H3_ATTENTION_BACKEND=ascend_sparse_attn
 for h08_sparsity in 0 0.75; do
-    H3_MODEL="$H08_FLASHGEN_MODEL" H3_MERGED_FLASHGEN=1 \
+    H3_CHECKPOINT_MANIFEST="$H08_FLASHGEN_MANIFEST" H3_CHECKPOINT_RECEIPT="$H08_FLASHGEN_RECEIPT" \
     H3_ATTENTION_CONFIG="{\"sparse_type\":\"rf_v2\",\"precision\":\"bf16\",\"sparsity\":$h08_sparsity,\"skip_first_steps\":1,\"skip_last_steps\":1,\"dense_kwargs\":{\"precision\":\"bf16\"}}" \
       bash "$h08_launcher" --inside "$PWD" B0 "$H08_OUTPUT_PREFIX-rfv2-$h08_sparsity"
 done

@@ -69,6 +69,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     sampling_params_cls = MiniMaxH3SamplingParams
 
     def set_lora(self, *args, **kwargs):
+        if getattr(self, "_research_merged_only", False):
+            raise ValueError("Research servers require offline-merged weights")
         if getattr(self, "_hyperflow_lora_locked", False):
             raise ValueError("HyperFlow is a fixed startup adapter; restart to change LoRA")
         return super().set_lora(*args, **kwargs)
@@ -106,6 +108,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     def __init__(self, *args, **kwargs):
         self.hyperflow = None
         self._hyperflow_lora_locked = False
+        self._research_merged_only = bool(os.getenv("SGLANG_H3_RESEARCH_FAMILY"))
         # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
         # image and CI dependency installer.
         if self.is_video_pipeline and not current_platform.is_rocm():
@@ -136,6 +139,10 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     lora_alpha=self.server_args.lora_alpha,
                     cache_merged=True,
                 )
+        if self._research_merged_only:
+            status = self.get_lora_status()
+            if status["active"] or status["loaded_adapters"]:
+                raise ValueError("Research servers must start without runtime adapters")
         self._hyperflow_lora_locked = self.hyperflow is not None
         if self.hyperflow is not None:
             logger.info(
@@ -207,6 +214,19 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
                 f"--model-variant {model_variant!r}"
+            )
+        if getattr(self, "_research_merged_only", False) and (
+            model_variant != "fl2va"
+            or self.release_metadata.lora_adapter is not None
+            or self.server_args.lora_path is not None
+            or self.server_args.lora_weight_name is not None
+            or self.server_args.lora_alpha is not None
+            or self.server_args.lora_scale != 1.0
+            or self.release_metadata.stochastic_sampling
+            or self._resolve_pdd_heads() is not None
+        ):
+            raise ValueError(
+                "Research servers require standard Euler weights without runtime LoRA"
             )
         if model_variant is not None and model_variant.strip().lower() == "hybrid":
             # merged checkpoints share the native graph across all three tasks

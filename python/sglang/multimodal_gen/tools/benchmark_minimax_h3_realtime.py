@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import statistics
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -62,6 +63,24 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--only", nargs="+")
     args = parser.parse_args()
+    research = (
+        Path(__file__).resolve().parents[4] / "test/manual/minimax_h3_realtime/research"
+    )
+    if not research.is_dir():
+        parser.error(
+            "Run from the source checkout with the MiniMax-H3 research launcher"
+        )
+    sys.path.insert(0, str(research))
+    from checkpoint_contract import (
+        assert_endpoint,
+        digest,
+        load_verified,
+        model_id,
+        reject_runtime_lora,
+        require_launcher,
+    )
+    from h3_chunks import Client
+
     config = json.loads(args.config.read_text())
     for key in ("server_command", "client_command"):
         command = config[key]
@@ -71,13 +90,22 @@ def main():
             or any(not isinstance(part, str) for part in command)
         ):
             parser.error(f"{key} must be a nonempty array of strings")
-    managed = (
-        "--attention-backend",
-        "--attention-backend-config",
-        "--minimax-h3-ffn-active-fraction",
+    environment = dict(os.environ, **config.get("environment", {}))
+    for key in ("server_command", "client_command"):
+        reject_runtime_lora(config[key], environment)
+    require_launcher(config["server_command"])
+    checkpoint = load_verified(
+        environment["H3_CHECKPOINT_MANIFEST"], environment["H3_CHECKPOINT_RECEIPT"]
     )
-    if any(part.split("=")[0] in managed for part in config["server_command"]):
-        parser.error("Remove managed attention/FFN flags from server_command")
+    if checkpoint["family"] not in ("flashgen4", "turbo8"):
+        parser.error("The sparse sweep requires a verified merged checkpoint")
+    checkpoint_sha = digest(checkpoint)
+    served_model = model_id(checkpoint_sha)
+    environment.update(
+        H3_SERVE_ONLY="1",
+        H3_RESEARCH_MODEL_ID=served_model,
+        H3_EXPECTED_CHECKPOINT_SHA=checkpoint_sha,
+    )
     warmups, repeats = config.get("warmups", 3), config.get("repeats", 5)
     if (
         type(warmups) is not int
@@ -93,20 +121,19 @@ def main():
         cases = [case for case in cases if case[0] in args.only]
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    environment = dict(os.environ, **config.get("environment", {}))
     for name, attention, fraction in cases:
-        command = config["server_command"] + [
-            "--attention-backend",
-            "ascend_sparse_attn",
-            "--attention-backend-config",
-            json.dumps(attention),
-            "--minimax-h3-ffn-active-fraction",
-            str(fraction),
-        ]
+        command = config["server_command"]
+        variant_env = dict(
+            environment,
+            H3_ATTENTION_BACKEND="ascend_sparse_attn",
+            H3_ATTENTION_CONFIG=json.dumps(attention),
+            H3_FFN_ACTIVE_FRACTION=str(fraction),
+        )
         record = {
             "variant": name,
             "server_command": command,
             "client_command": config["client_command"],
+            "checkpoint_manifest_sha256": checkpoint_sha,
             "attention": attention,
             "ffn_active_fraction": fraction,
             "status": "planned",
@@ -125,7 +152,7 @@ def main():
             with (args.output / f"{name}-server.log").open("w") as log:
                 process = subprocess.Popen(
                     command,
-                    env=environment,
+                    env=variant_env,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -136,6 +163,9 @@ def main():
                         if process.poll() is not None or time.monotonic() > deadline:
                             raise RuntimeError(f"{name}: server failed readiness")
                         time.sleep(1)
+                    assert_endpoint(
+                        Client(url.removesuffix("/health"), 30), served_model
+                    )
                     samples = []
                     for index in range(warmups + repeats):
                         with (args.output / f"{name}-client-{index}.log").open(

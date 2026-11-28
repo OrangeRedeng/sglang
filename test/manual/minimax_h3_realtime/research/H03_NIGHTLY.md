@@ -6,39 +6,15 @@ LightVAE, devices, Laser/FA, TP/Ulysses/Ring, cache-off policy and the four-step
 schedule fixed. Use the saved monolithic DEV-C4 request. Leave graph and compile
 disabled for this eager diagnostic.
 
-1. Recover the H01 data first. Record an unprofiled warmed control on H03 if
-   the allocation permits. Measure client E2E and server stages separately.
-2. Before starting the matched H03 server for profiling, export
-   `SGLANG_TORCH_PROFILER_DIR` to a fresh shared directory and set
-   `SGLANG_PROFILE_RECORD_SHAPES=1`. Save the server log, launch command,
-   device inventory and Torch/TorchNPU/CANN versions. Use a new HTTP, broker
-   and rendezvous port set when any existing service occupies the old ports.
-3. In the same container, set `H03_REQUEST` to the saved single-request JSON,
-   `H03_ENDPOINT` to the H03 server URL and `H03_OUT` to a new output path.
-   From the H03 checkout, submit one profiled request after server warmup.
+1. Recover H01 data and reproduce the matched unprofiled control first.
+2. Verify the checkpoint and decoder using [R01](R01_REPORT.md). Set the
+   matched prompt, seed and topology. Run B0 and then run the profile as a
+   separate launch on the same allocation.
 
 ```bash
-export H03_REQUEST H03_ENDPOINT H03_OUT
-PYTHONPATH=test/manual/minimax_h3_realtime/research python3 - <<'PY'
-import json
-import os
-from pathlib import Path
-from threading import Event
-
-from h3_chunks import Client
-
-request = json.loads(Path(os.environ["H03_REQUEST"]).read_text())
-if request["task"] != "t2va" or request["num_inference_steps"] != 4:
-    raise ValueError("Use the pinned four-step monolithic T2VA request")
-request.update(profile=True, profile_all_stages=True, num_profiled_timesteps=-1)
-out = Path(os.environ["H03_OUT"]).resolve()
-out.mkdir(parents=True)
-(out / "request.json").write_text(json.dumps(request, indent=2) + "\n")
-response = Client(os.environ["H03_ENDPOINT"], 1800).generate(
-    request, out / "profile.mp4", Event()
-)
-(out / "response.json").write_text(json.dumps(response, indent=2) + "\n")
-PY
+research=test/manual/minimax_h3_realtime/research
+H3_PROFILE=1 SGLANG_PROFILE_RECORD_SHAPES=1 \
+  bash "$research/run_a3_windowing.sh" --inside "$PWD" B0 "$H03_OUT"
 ```
 
 Confirm all expected ranks produced traces and four successful step records.
