@@ -77,8 +77,8 @@ case "$case_id" in
     W0) export SGLANG_H3_WINDOW_MODE=single ;;
     W0R) export SGLANG_H3_WINDOW_MODE=repack ;;
     W1) export SGLANG_H3_WINDOW_MODE=local ;;
-    W2) export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_GLOBAL_STEPS=1 ;;
-    W3) export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_GLOBAL_STEPS=2 ;;
+    W2) export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_GLOBAL_STEPS=${H3_GLOBAL_STEPS:-1} ;;
+    W3) export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_GLOBAL_STEPS=${H3_GLOBAL_STEPS:-2} ;;
     W4)
         export SGLANG_H3_WINDOW_MODE=global-local SGLANG_H3_WINDOW_OVERLAP=0.15
         export SGLANG_H3_WINDOW_GLOBAL_STEPS=${H3_GLOBAL_STEPS:-1}
