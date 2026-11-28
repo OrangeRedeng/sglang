@@ -111,6 +111,7 @@ def collect() -> dict:
                 "record T(A), T(B) and HBM per group member",
             ],
             "metric": "T(A) + T(B)",
+            "launcher": "r07_topology_screen.py R07.<SOC>.<N>.serial --groups <ids> --output receipt.json -- <short-window-command>",
         },
         {
             "case": "G1-concurrent",
@@ -122,6 +123,7 @@ def collect() -> dict:
             ],
             "metric": "max(T_A, T_B) + transfer + fusion + barrier",
             "blocked_on": "subgroup collective layout proof + per-group HBM fit",
+            "launcher": "r07_topology_screen.py R07.<SOC>.2x<N>.concurrent --groups <idsA>;<idsB> --output receipt.json -- <short-window-command>",
         },
     ]
     return result
