@@ -4,6 +4,7 @@
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.distributed_windows import (

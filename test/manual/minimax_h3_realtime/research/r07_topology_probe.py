@@ -44,6 +44,13 @@ def collect() -> dict:
         "transports": {},
         "device": {},
         "topologies": {},
+        "screen_cases": [
+            {"id": "R07.A3.16.serial", "soc": "A3", "devices": 16, "groups": [[16]], "status": "runnable_when_allocation_is_supplied"},
+            {"id": "R07.A3.8.serial", "soc": "A3", "devices": 8, "groups": [[8]], "status": "runnable_when_allocation_is_supplied"},
+            {"id": "R07.A3.2x8.concurrent", "soc": "A3", "devices": 16, "groups": [[8], [8]], "status": "blocked_until_subgroup_proof"},
+            {"id": "R07.A5.8.serial", "soc": "A5", "devices": 8, "groups": [[8]], "status": "runnable_when_allocation_is_supplied"},
+            {"id": "R07.A5.2x4.concurrent", "soc": "A5", "devices": 8, "groups": [[4], [4]], "status": "blocked_until_subgroup_proof"},
+        ],
         "g1_plan": [],
         "note": (
             "Transport import availability is necessary, not sufficient: no "
