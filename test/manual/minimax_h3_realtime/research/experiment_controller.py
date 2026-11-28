@@ -283,6 +283,22 @@ def aggregate_samples(samples):
     )
 
 
+def validate_denoise_match(match, adapter):
+    """Require measured scheduler and logical-forward counters from the launcher."""
+    require(isinstance(match, str), "Denoise evidence must be a server log line")
+    expected_updates = 50 if adapter == "H08.NATIVE50" else 4
+    pattern = re.search(
+        r"scheduler_updates=(\d+) dit_evaluations=(\d+)", match
+    )
+    require(pattern is not None, "Missing scheduler and logical DiT counters")
+    updates, evaluations = map(int, pattern.groups())
+    require(
+        updates == expected_updates and evaluations > 0,
+        "Invalid scheduler or logical DiT counters",
+    )
+    return updates, evaluations
+
+
 def classify_failure(error_text, status):
     """Bounded failure taxonomy for retry policy.
 
@@ -889,14 +905,7 @@ def results(directory, adapter, deadline, samples=1):
         "Missing or duplicate denoise evidence",
     )
     for match in matches.values():
-        # Validate the actual counters when the artifacts carry them; an
-        # expected work count is not a measured one, so absent stays absent.
-        for name in ("logical_forwards", "scheduler_updates", "block_calls"):
-            if name in match:
-                require(
-                    type(match[name]) is int and match[name] > 0,
-                    f"Invalid measured counter: {name}",
-                )
+        validate_denoise_match(match, adapter)
     profile = REGISTRY[adapter][1]
     frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []

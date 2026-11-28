@@ -23,6 +23,7 @@ from experiment_controller import (
     select,
     snapshot,
     validate,
+    validate_denoise_match,
 )
 
 
@@ -57,6 +58,22 @@ def test_aggregate_samples_nearest_rank_and_significance():
     assert aggregate_samples(big)["p90_client_s"] == 9.0  # ceil(0.9*10)=9th
     with pytest.raises(ValueError):
         aggregate_samples([])
+
+
+def test_denoise_evidence_requires_measured_execution_counters():
+    line = "mode=native scheduler_updates=4 dit_evaluations=4 request=req phase=request"
+    assert validate_denoise_match(line, "R01.CLEAN4.B0") == (4, 4)
+    with pytest.raises(ValueError, match="Missing scheduler"):
+        validate_denoise_match("completed request=req", "R01.CLEAN4.B0")
+    with pytest.raises(ValueError, match="Invalid scheduler"):
+        validate_denoise_match(
+            "mode=native scheduler_updates=3 dit_evaluations=4 request=req",
+            "R01.CLEAN4.B0",
+        )
+    assert validate_denoise_match(
+        "mode=native scheduler_updates=50 dit_evaluations=50 request=req",
+        "H08.NATIVE50",
+    ) == (50, 50)
 
 
 # --- failure taxonomy / bounded retry --------------------------------------
