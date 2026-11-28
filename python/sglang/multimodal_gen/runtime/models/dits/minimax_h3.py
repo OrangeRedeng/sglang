@@ -553,6 +553,20 @@ def _modulate_scale_shift(
     ).to(dtype)
 
 
+def _apply_indexed_gate_npu_inplace(
+    other: torch.Tensor,
+    gate: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    runs: tuple[tuple[int, int, int], ...] | None = None,
+) -> None:
+    """Scale ``other`` by the indexed gate in place, compactly when possible."""
+    if runs is not None and not is_in_breakable_cuda_graph():
+        _apply_indexed_gate_runs_inplace_(other, gate, runs)
+        return
+    other.mul_(gate.index_select(0, indices))
+
+
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -587,10 +601,7 @@ def _modulate_gate(
         and x.dtype == other.dtype == gate.dtype == dtype == _BF16_DTYPE
         and not torch.is_grad_enabled()
     ):
-        if runs is not None and not is_in_breakable_cuda_graph():
-            _apply_indexed_gate_runs_inplace_(other, gate, runs)
-        else:
-            other.mul_(gate.index_select(0, indices))
+        _apply_indexed_gate_npu_inplace(other, gate, indices, runs=runs)
         return x.add_(other) if allow_inplace else other.add_(x)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
@@ -2123,13 +2134,21 @@ class MiniMaxH3DiTBlock(nn.Module):
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
         selective_ffn_rows: tuple[torch.Tensor, ...] | None = None,
         combined_runs: tuple[tuple[int, int, int], ...] | None = None,
-    ) -> torch.Tensor:
+        pre_norm1_hidden: torch.Tensor | None = None,
+        next_norm1: RMSNorm | nn.RMSNorm | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
         Each block computes AdaLN parameters once, then applies
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
+
+        When the NPU fused path is active and ``next_norm1`` is given, the
+        MLP's gated residual and the next block's norm1 run as one
+        ``npu_add_rms_norm`` and the block returns ``(residual, next_normed)``;
+        the caller passes ``next_normed`` back as ``pre_norm1_hidden`` so the
+        next block only applies its own AdaLN modulation.
         """
         if adaln_params is None and block_adaln_params is not None:
             # Cache-DiT forwards the same kwargs to every wrapped block.
@@ -2162,6 +2181,18 @@ class MiniMaxH3DiTBlock(nn.Module):
                     dtype=_BF16_DTYPE,
                     runs=combined_runs,
                 )
+        elif pre_norm1_hidden is not None:
+            # Cross-block fusion already ran the previous MLP's gated residual
+            # and this norm1 as one npu_add_rms_norm; only the AdaLN
+            # modulation remains.
+            h = _modulate_scale_shift(
+                pre_norm1_hidden,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
         else:
             h = _modulate_rmsnorm_scale_shift(
                 x,
@@ -2217,6 +2248,56 @@ class MiniMaxH3DiTBlock(nn.Module):
                 residual,
                 gate_mlp,
                 self.mlp(h),
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
+        if active_rows is None and self._uses_npu_fused_gate_norm2(
+            residual, h, gate_msa, shift_mlp, scale_mlp
+        ):
+            # NPU: the attention's gated residual and norm2 run as one
+            # npu_add_rms_norm (numerical, quality-gated; the standalone BF16
+            # chain above stays the exact default). The MLP's gated residual
+            # and the next block's norm1 fuse the same way, returning the
+            # normed input the caller feeds back as ``pre_norm1_hidden``.
+            import torch_npu
+
+            _apply_indexed_gate_npu_inplace(
+                h, gate_msa, combined_indices, runs=combined_runs
+            )
+            normed_h, _, residual = torch_npu.npu_add_rms_norm(
+                residual, h, self.norm2.weight, self.norm2.variance_epsilon
+            )
+            h = _modulate_scale_shift(
+                normed_h,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
+            mlp_out = self.mlp(h)
+            if (
+                next_norm1 is not None
+                and mlp_out.dtype == gate_mlp.dtype == _BF16_DTYPE
+                and hasattr(next_norm1, "variance_epsilon")
+                and next_norm1.weight is not None
+                and next_norm1.weight.device == residual.device
+            ):
+                _apply_indexed_gate_npu_inplace(
+                    mlp_out, gate_mlp, combined_indices, runs=combined_runs
+                )
+                next_normed, _, residual = torch_npu.npu_add_rms_norm(
+                    residual,
+                    mlp_out,
+                    next_norm1.weight,
+                    next_norm1.variance_epsilon,
+                )
+                return residual, next_normed
+            return _modulate_gate(
+                residual,
+                gate_mlp,
+                mlp_out,
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 runs=combined_runs,
@@ -2294,6 +2375,8 @@ class MiniMaxH3DiTBlock(nn.Module):
     ) -> bool:
         """Whether the attention's gated residual (in place) and the fused
         norm2 modulation run as one kernel."""
+        # The fused kernel is CUDA-only; NPU's RMSNorm also exposes eps as
+        # variance_epsilon, so reading self.norm2.eps would fail there.
         return (
             not current_platform.is_npu()
             and not self.preserve_input_for_cache_dit
@@ -2304,6 +2387,32 @@ class MiniMaxH3DiTBlock(nn.Module):
             and can_use_indexed_gate_rmsnorm_scale_shift(
                 x, gate, other, self.norm2.weight, shift, scale, indices
             )
+        )
+
+    def _uses_npu_fused_gate_norm2(
+        self,
+        residual: torch.Tensor,
+        branch: torch.Tensor,
+        gate: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> bool:
+        """Whether attention's gated residual + norm2 runs via the NPU fused path."""
+        return (
+            current_platform.is_npu()
+            and not torch.is_grad_enabled()
+            and not self.preserve_input_for_cache_dit
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and residual.device.type == "npu"
+            and residual.dtype
+            == branch.dtype
+            == gate.dtype
+            == shift.dtype
+            == scale.dtype
+            == _BF16_DTYPE
+            and hasattr(self.norm2, "variance_epsilon")
+            and self.norm2.weight is not None
         )
 
 
@@ -3844,8 +3953,38 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for block in self.blocks:
-                hidden = block(
+            fuse_cross_block_norm1 = (
+                current_platform.is_npu()
+                and not torch.is_grad_enabled()
+                and not spectrum_on
+                and not is_layerwise_offloaded_module(self)
+                and len(self.blocks) > 1
+                and kwargs.get("selective_ffn_rows") is None
+                and all(
+                    isinstance(b, MiniMaxH3DiTBlock)
+                    and not b.preserve_input_for_cache_dit
+                    for b in self.blocks
+                )
+            )
+            pre_norm1_hidden: torch.Tensor | None = None
+            num_blocks = len(self.blocks)
+            for block_idx, block in enumerate(self.blocks):
+                next_block = (
+                    self.blocks[block_idx + 1]
+                    if fuse_cross_block_norm1 and block_idx + 1 < num_blocks
+                    else None
+                )
+                next_norm1 = (
+                    # A quantized next projection consumes its own input
+                    # format, so a pre-computed norm cannot feed it.
+                    None
+                    if next_block is not None
+                    and _accepts_mxfp8_input(next_block.attn.qkv_proj)
+                    else next_block.norm1
+                    if next_block is not None
+                    else None
+                )
+                block_out = block(
                     hidden,
                     adaln_input=adaln_input,
                     combined_indices=block_combined,
@@ -3859,7 +3998,16 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     block_adaln_params=block_adaln_params,
                     selective_ffn_rows=kwargs.get("selective_ffn_rows"),
                     combined_runs=block_combined_runs,
+                    pre_norm1_hidden=pre_norm1_hidden,
+                    next_norm1=next_norm1,
                 )
+                if isinstance(block_out, tuple):
+                    # The MLP's gated residual and the next block's norm1 ran
+                    # as one npu_add_rms_norm; feed the normed hidden forward.
+                    hidden, pre_norm1_hidden = block_out
+                else:
+                    hidden = block_out
+                    pre_norm1_hidden = None
             if spectrum_on:
                 self._h3_spectrum_record_targets(
                     hidden, audio_pos, infer_out_pos, row_start, row_stop
