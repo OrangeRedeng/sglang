@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import statistics
@@ -167,7 +168,10 @@ def main():
                         Client(url.removesuffix("/health"), 30), served_model
                     )
                     samples = []
+                    evidence = {}
+                    server_log = args.output / f"{name}-server.log"
                     for index in range(warmups + repeats):
+                        log_offset = server_log.stat().st_size
                         with (args.output / f"{name}-client-{index}.log").open(
                             "w"
                         ) as client_log:
@@ -181,11 +185,37 @@ def main():
                                 check=True,
                             )
                             elapsed = time.perf_counter() - started
+                        with server_log.open("rb") as trace:
+                            trace.seek(log_offset)
+                            matches = re.findall(
+                                rb"H3 denoise mode=\S+ scheduler_updates=(\d+) dit_evaluations=(\d+) request=(\S+) phase=request policy=\S+ profiled=0 diagnostic=0\b",
+                                trace.read(),
+                            )
+                        if len(matches) != 1:
+                            raise ValueError(
+                                "Expected one unprofiled request with measured execution counters"
+                            )
+                        updates, forwards, request = matches[0]
+                        request = request.decode()
+                        if (
+                            request in evidence
+                            or int(updates) != checkpoint["schedule"]["steps"]
+                            or int(forwards) < int(updates)
+                        ):
+                            raise ValueError(
+                                "Invalid request identity or measured execution counts"
+                            )
+                        evidence[request] = {
+                            "scheduler_updates": int(updates),
+                            "dit_evaluations": int(forwards),
+                            "warmup": index < warmups,
+                        }
                         if index >= warmups:
                             samples.append(elapsed)
                     ordered = sorted(samples)
                     record.update(
                         status="completed",
+                        execution=evidence,
                         latency_samples_s=samples,
                         median_s=statistics.median(samples),
                         p90_s=ordered[max(0, (9 * len(ordered) + 9) // 10 - 1)],

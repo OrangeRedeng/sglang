@@ -22,7 +22,7 @@ def make_checkpoint(root, family="flashgen4"):
     model = root / family
     weights = model / "FL2VA/transformer/model.safetensors"
     weights.parent.mkdir(parents=True)
-    weights.write_bytes(b"test-only synthetic checkpoint")
+    weights.write_bytes(f"synthetic {family} weights".encode())
     index = model / "FL2VA/model_index.json"
     index.write_text("{}")
     files = {
@@ -55,6 +55,20 @@ def make_checkpoint(root, family="flashgen4"):
             steps=steps, rungs=list(rungs), video_shift=video, audio_shift=audio
         ),
     )
+    if family == "turbo8":
+        refs = {}
+        for name in ("native50", "flashgen4"):
+            path, receipt, _ = make_checkpoint(root, name)
+            refs[name] = {"manifest": str(path), "receipt": str(receipt)}
+        base = json.loads(Path(refs["native50"]["manifest"]).read_text())[
+            "checkpoint_sha256"
+        ]
+        manifest.update(clean_base_sha256=base, references=refs)
+        manifest["merge"]["adapter_sha256"] = "c" * 64
+    if family == "flashgen4" and (root / "native50.json").exists():
+        manifest["clean_base_sha256"] = json.loads(
+            (root / "native50.json").read_text()
+        )["checkpoint_sha256"]
     spec = root / f"{family}.json"
     spec.write_text(json.dumps(manifest))
     receipt = root / f"{family}.receipt.json"
@@ -134,3 +148,13 @@ def test_endpoint_and_request_fail_closed():
         validate_request(request, "turbo8", identity)
     with pytest.raises(ValueError, match="Runtime LoRA"):
         validate_request(dict(request, lora_scale=0), "flashgen4", identity)
+
+
+def test_turbo_rejects_flashgen_as_merge_base(tmp_path):
+    spec, receipt, _ = make_checkpoint(tmp_path, "turbo8")
+    manifest = json.loads(spec.read_text())
+    flash = json.loads((tmp_path / "flashgen4.json").read_text())
+    manifest["clean_base_sha256"] = flash["checkpoint_sha256"]
+    spec.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="verified Native50"):
+        load_verified(spec, receipt)

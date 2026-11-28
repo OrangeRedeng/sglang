@@ -21,6 +21,7 @@ from contextlib import ExitStack, closing, contextmanager
 from importlib import metadata
 from pathlib import Path
 
+from checkpoint_contract import SCHEDULES
 from checkpoint_contract import digest as checkpoint_digest
 from checkpoint_contract import is_sha, load_verified, reject_runtime_lora
 from runner import digest, save
@@ -1020,7 +1021,10 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
                 == checkpoint_sha,
                 f"Mismatched rank precision evidence: {rank}",
             )
+||||||| parent of 1982bffa19 (Require verified H3 merge lineage and measured execution for timing)
     profile = REGISTRY[adapter][1]
+    diagnostic = records[1]["diagnostic"]
+    require(type(diagnostic) is bool, "Missing diagnostic classification")
     frames = 124 if adapter.startswith("R01.HIST.") else 362
     hashes = []
     for index, row in enumerate(records):
@@ -1038,7 +1042,9 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
             "Invalid AV durations",
         )
         hashes.append(sha256_file(run / f"sample-{index}.mp4", deadline))
-    client_samples = [row["e2e_s"] for row in records[1:]]
+    client_samples = [
+        row["e2e_s"] for row in records[1:] if not row["diagnostic"]
+    ]
     require(
         all(row["profiled"] == profile for row in records[1:])
         and all(math.isfinite(value) and value > 0 for value in client_samples),
@@ -1091,8 +1097,9 @@ def results(directory, adapter, deadline, samples=1, source_sha=None, devices=No
         request_ids=sorted(request_ids),
         **aggregate_samples(client_samples),
     )
-    if profile:
-        # Diagnostics are scope-separated: no client-seconds claim at all.
+    if profile or diagnostic:
+        # Profiled and diagnostic runs are scope-separated: no client-seconds
+        # claim at all, and diagnostics never enter the timing aggregate.
         evidence["median_client_s"] = None
         evidence["p90_client_s"] = None
     return evidence
