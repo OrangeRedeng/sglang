@@ -15,3 +15,9 @@ Export a clock-aligned JSON array with rank, event_id, kind, resource, start_us 
 D3 awaits the installed torch_npu feature and documentation audit. D4 awaits independent evidence for each candidate. No allocator or HCCL root cause is established.
 
 Three focused CPU tests check correlation across step boundaries, interval unions, bitwise fusion, channel-major audio, shape replacement and request isolation. Ascend parity, memory and performance remain pending.
+
+### Phase 2.1 trace input and interpretation
+
+Provide a normalized JSON array on one aligned microsecond clock per rank. Every event requires integer rank, rank-unique event_id, kind (host/enqueue/dispatch/compute/hccl/wait), resource, start_us and end_us. A root host event requires request and step. Other events require a rank-local producer event_id. A queue interval pairs enqueue end with direct dispatch start. Each step reports its request/rank peak over all observed pairs. Missing events reduce correlation coverage. Device occupation is the union of compute, wait and HCCL. These three unions may overlap. Host return and last observed device completion are reported independently.
+
+HCCL records require group, sequence, callsite and payload_bytes. Include ordered group_ranks for membership-validated comparisons. Missing or inconsistent participants or sequences suppress comparable counts. No raw hardware trace was supplied. The existing fusion workspace stays request-local. Gather, padding and scheduler buffers may remain live across asynchronous consumers. Further aliasing requires device lifetime evidence. Step-3 causality remains open.

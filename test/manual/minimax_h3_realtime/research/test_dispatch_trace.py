@@ -90,3 +90,62 @@ def test_channel_major_audio_workspace_matches_existing_fusion():
     torch.testing.assert_close(
         output, ns["_blend"](a, b, ramp).transpose(0, 1), rtol=0, atol=0
     )
+
+
+def test_request_queue_includes_overlapping_producers_from_different_steps():
+    records = []
+    for step in (0, 1):
+        base = step * 3
+        for index, kind, timestamp in (
+            (0, "host", step),
+            (1, "enqueue", step + 1),
+            (2, "dispatch", step + 5),
+        ):
+            row = dict(
+                rank=0,
+                event_id=base + index,
+                kind=kind,
+                resource="r",
+                start_us=timestamp,
+                end_us=timestamp,
+            )
+            if index:
+                row["producer"] = base + index - 1
+            else:
+                row.update(step=step, request="r")
+            records.append(row)
+    report = analyze(records)
+    assert [row["observed_queue_depth"] for row in report["steps"]] == [2, 2]
+    assert report["correlation_coverage"] == 1
+
+
+def test_collective_counts_require_matching_rank_sequences():
+    records = []
+    for rank in (0, 1):
+        host = dict(
+            rank=rank,
+            event_id=0,
+            kind="host",
+            resource="host",
+            start_us=0,
+            end_us=1,
+            request="r",
+            step=0,
+        )
+        records += [
+            host,
+            dict(
+                host,
+                event_id=1,
+                kind="hccl",
+                producer=0,
+                group="tp",
+                group_ranks=[0, 1],
+                sequence=0,
+                callsite="reduce",
+                payload_bytes=64,
+            ),
+        ]
+    assert analyze(records)["collective_groups"][0]["calls_per_rank"] == 1
+    records[-1]["sequence"] = 1
+    assert analyze(records)["collective_groups"][0]["calls_per_rank"] is None
