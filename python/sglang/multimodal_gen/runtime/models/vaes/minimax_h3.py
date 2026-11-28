@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import
     get_tile_parallel_state,
     tile_owners,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_npu_graph import (
+    TileDecodeGraphCache,
+    npu_graph_api_available,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -90,6 +94,19 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         # CUDA/ROCm register this gate in their fast-path installer. NPU only
         # opts into batching, without installing those platforms' fused ops.
         self._sgl_gate = VaeFastPathGate()
+        # Opt-in capture/replay of per-tile-group decoder forwards (R06).
+        # Enabled via SGLANG_H3_VAE_NPU_GRAPH=1; every miss/error runs eager.
+        self._graph_epoch = 0
+        self._tile_graph_cache = None
+        if current_platform.is_npu() and npu_graph_api_available():
+            self._tile_graph_cache = TileDecodeGraphCache(
+                revision=lambda: (self._graph_epoch, self._decode_dtype_cache_tag)
+            )
+            if self._tile_graph_cache.enabled:
+                logger.info(
+                    "MiniMax H3 VAE NPU graph capture enabled (opt-in, %s=1)",
+                    "SGLANG_H3_VAE_NPU_GRAPH",
+                )
         if current_platform.is_npu():
             self.decoder_tile_batch = (
                 min(config.decoder_tile_batch, 2) if config.decoder_tile_batch else 2
@@ -102,8 +119,34 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
                 self.decoder_tile_batch,
             )
 
+    def _run_tile_tasks(
+        self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch: int = 1
+    ):
+        # Opt-in graph replay for repeated per-group video tile decodes. Only
+        # the stateless group decode is captured; gathering, blending and the
+        # temporal state stay outside, and every miss/error path runs the
+        # unwrapped forward.
+        cache = self._tile_graph_cache
+        if (
+            cache is not None
+            and cache.enabled
+            and not self.training
+            and tiles
+            and tiles[0].device.type == "npu"
+            and forward_fn == self.decode
+        ):
+            forward_fn = cache.wrap(forward_fn)
+        return super()._run_tile_tasks(
+            tiles, tile_indices, forward_fn, cls_agg, tile_batch=tile_batch
+        )
+
     def prepare_decoder_autocast_weights(self, dtype) -> int:
-        return self.decoder.prepare_autocast_linear_weights(dtype)
+        stale = self.decoder.prepare_autocast_linear_weights(dtype)
+        if stale and self._tile_graph_cache is not None:
+            # Captured graphs hold references to the previous weight copies.
+            self._graph_epoch += 1
+            self._tile_graph_cache.clear(reason="decoder weights recast")
+        return stale
 
 
 class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):

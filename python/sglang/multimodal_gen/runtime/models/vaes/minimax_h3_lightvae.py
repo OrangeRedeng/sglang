@@ -155,6 +155,11 @@ def load_minimax_h3_lightvae_decoder(vae, path):
     vae.decoder.register_to_config(num_layers=len(kept))
     stat = os.stat(path)
     vae._decode_dtype_cache_tag = f"|lightvae:{path}:{stat.st_size}:{stat.st_mtime_ns}"
+    # Graphs captured against the previous decoder reference stale weights.
+    graph_cache = getattr(vae, "_tile_graph_cache", None)
+    if graph_cache is not None:
+        vae._graph_epoch += 1
+        graph_cache.clear(reason="LightVAE decoder loaded")
     logger.info(
         "MiniMax H3 LightVAE decoder loaded: %d -> %d blocks from %s; original encoder retained",
         depth,
