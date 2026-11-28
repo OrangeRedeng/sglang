@@ -283,6 +283,44 @@ class LaserAttentionImpl(AttentionImpl):
             and bounds[0] == 0
             and bounds[1] == padding_start
         ):
+            if padding_start >= self.min_seqlen and padding_start <= query.shape[0]:
+                # Direct single-call postprocessing: attend the real rows only
+                # and write just the valid region, instead of dispatching the
+                # dense path and materializing its padded cast/output. The
+                # value rescale stays in the operator's FP16 output before the
+                # BF16 cast, matching `_forward_dense` bit for bit; the
+                # NPU Triton fused pre/postprocess remains out of scope here
+                # (no new kernels in this port).
+                head_dim = query.shape[-1]
+                pre_tokens = self.max_token
+                if padding_start % self.seq_len_pad_base != 0:
+                    pre_tokens = (
+                        padding_start // self.seq_len_pad_base + 1
+                    ) * self.seq_len_pad_base - padding_start
+                q_la, k_la, v_la, qk_scale, value_scale = self._la_preprocess_input(
+                    query[:padding_start].unsqueeze(0),
+                    key[:padding_start].unsqueeze(0),
+                    value[:padding_start].unsqueeze(0),
+                    preserve_bf16_range=True,
+                )
+                _, la_output = self._laser_attention(
+                    q_la,
+                    k_la,
+                    v_la,
+                    q_la.shape[1],
+                    pre_tokens,
+                    self.softmax_scale * qk_scale,
+                )
+                if value_scale != 1.0:
+                    la_output.mul_(value_scale)
+                output = torch.empty_like(query)
+                output[:padding_start].copy_(
+                    la_output[0, :, :padding_start, :head_dim].transpose(0, 1)
+                )
+                if padding_start < query.shape[0]:
+                    output[padding_start:].zero_()
+                return output
+
             segment = self._forward_dense(
                 query[:padding_start].unsqueeze(0),
                 key[:padding_start].unsqueeze(0),
