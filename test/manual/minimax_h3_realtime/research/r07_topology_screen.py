@@ -54,10 +54,11 @@ def main() -> int:
     parser.add_argument("case")
     parser.add_argument("--groups", required=True, help="comma-separated groups, e.g. 0,1;2,3")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    args, command = parser.parse_known_args()
     groups = [group.split(",") for group in args.groups.split(";")]
-    run(args.case, groups, args.command, args.output)
+    if command and command[0] == "--":
+        command = command[1:]
+    run(args.case, groups, command, args.output)
     return 0
 
 
