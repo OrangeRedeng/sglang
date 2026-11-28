@@ -42,6 +42,12 @@ def collect() -> dict:
     result: dict = {
         "probe": "r06_vae_graph_probe",
         "subtasks": {},
+        "cases": {
+            "V0": {"graph": False, "av_overlap": False, "tile_batch": 1},
+            "V1": {"graph": True, "av_overlap": False, "tile_batch": 1},
+            "V2": {"graph": False, "av_overlap": True, "tile_batch": 1},
+            "V3": {"graph": True, "av_overlap": True, "tile_batch": 1},
+        },
         "note": (
             "API availability gates capture attempts at runtime; it never "
             "proves replay byte parity, capture time, or graph-pool memory. "

@@ -472,7 +472,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
         tiles, and only for a resident audio VAE: the decode runs on another
         thread, outside the residency manager's sequential uses.
         """
+        override = os.getenv("SGLANG_H3_VAE_AV_OVERLAP")
+        if override not in (None, "0", "1"):
+            raise ValueError("SGLANG_H3_VAE_AV_OVERLAP must be 0 or 1")
         return (
+            override != "0"
+            and
             (current_platform.is_cuda() or current_platform.is_npu())
             and model_parallel_is_initialized()
             and get_decode_parallel_world_size() > 1

@@ -80,6 +80,16 @@ class TileGraphStats:
             "entries": len(self.entries),
         }
 
+    def receipt(self, *, request_id: str, case: str) -> dict:
+        """Return a hashable per-request evidence record for campaign ledgers."""
+        if not request_id or not case:
+            raise ValueError("request_id and case are required for graph evidence")
+        return {
+            "request_id": request_id,
+            "case": case,
+            "counters": self.as_dict(),
+        }
+
 
 def npu_graph_api_available() -> bool:
     """Whether the installed TorchNPU exposes the capture APIs used here.

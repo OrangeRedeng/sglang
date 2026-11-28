@@ -120,6 +120,13 @@ def test_capture_once_replay_per_bucket(monkeypatch):
     assert torch.equal(third, torch.full((4, 8), 21.0))
 
 
+def test_graph_receipt_binds_request_and_case(monkeypatch):
+    cache = _make_cache(monkeypatch)
+    receipt = cache.stats.receipt(request_id="req-1", case="V1")
+    assert receipt["request_id"] == "req-1"
+    assert receipt["case"] == "V1"
+
+
 def test_bucket_key_tracks_shape_and_revision(monkeypatch):
     cache = _make_cache(monkeypatch)
     revision = {"epoch": 0}
