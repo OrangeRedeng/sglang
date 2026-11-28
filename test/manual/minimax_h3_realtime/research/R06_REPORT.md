@@ -6,7 +6,7 @@
 
 ## 0. Baseline audit
 
-- The NPU VAE already caps `decoder_tile_batch <= 2` and `window_batch == 1` with the fast-path gate registered (`MiniMaxH3VideoVAE.__init__`); exact quality keeps one tile. The R06 code does **not** change these caps (handoff item 1: "don't bypass exact-mode restrictions"; batch4/window2 was **not** added — memory/temporal evidence is pending).
+- The NPU VAE keeps `window_batch == 1`, while tile batching is explicitly selectable with `SGLANG_H3_VAE_TILE_BATCH=1|2|4`. The default remains the configured batch and exact quality keeps one tile. Batch4 remains device- and memory-pending.
 - `_overlaps_audio_decode` was CUDA-gated; H04's streamed-encoder callback guard remains CUDA-only (untouched).
 - The tile decode runs `forward_many(local, forward=forward_fn, capacity=...)`: one stateless `forward(x)` per stacked tile group; gather/blend/halo/temporal state live outside it — the safe capture unit.
 

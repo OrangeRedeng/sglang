@@ -35,6 +35,23 @@ VAE_NPU_GRAPH_ENV = "SGLANG_H3_VAE_NPU_GRAPH"
 DEFAULT_MAX_ENTRIES = 8
 
 
+def _is_fatal_device_error(error: BaseException) -> bool:
+    """Do not continue after TorchNPU has poisoned the device context."""
+    text = f"{type(error).__name__}: {error}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "aicore error",
+            "device error",
+            "device is unavailable",
+            "device has been reset",
+            "rt error",
+            "acl error",
+            "out of memory",
+        )
+    )
+
+
 @dataclass
 class _GraphEntry:
     graph: Any
@@ -170,6 +187,8 @@ class TileDecodeGraphCache:
                 # caller owns a private copy; the copy is cheaper than the decode.
                 return entry.static_output.clone()
             except Exception as exc:  # noqa: BLE001 - invalidate recoverable replay failures
+                if _is_fatal_device_error(exc):
+                    raise
                 self.stats.invalidations += 1
                 self._entries.pop(key, None)
                 self.stats.entries.pop(key, None)
@@ -189,6 +208,8 @@ class TileDecodeGraphCache:
         try:
             entry = self._capture(forward_fn, x)
         except Exception as exc:  # noqa: BLE001 - capture must fail closed
+            if _is_fatal_device_error(exc):
+                raise
             self.stats.capture_failures += 1
             self._unsupported.add(key)
             # The caller's decode ran the unwrapped forward; count it.

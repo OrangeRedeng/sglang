@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
@@ -108,9 +110,13 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
                     "SGLANG_H3_VAE_NPU_GRAPH",
                 )
         if current_platform.is_npu():
-            self.decoder_tile_batch = (
-                min(config.decoder_tile_batch, 2) if config.decoder_tile_batch else 2
-            )
+            requested_batch = int(os.getenv("SGLANG_H3_VAE_TILE_BATCH", "0"))
+            if requested_batch not in (0, 1, 2, 4):
+                raise ValueError("SGLANG_H3_VAE_TILE_BATCH must be one of 1, 2 or 4")
+            configured_batch = config.decoder_tile_batch or 2
+            self.decoder_tile_batch = requested_batch or configured_batch
+            if self.decoder_tile_batch not in (1, 2, 4):
+                raise ValueError("MiniMax H3 NPU tile batch must be one of 1, 2 or 4")
             self.window_batch = 1
             register_vae_fast_path_gate(self, self._sgl_gate)
             logger.info(
