@@ -57,6 +57,12 @@ Adaptive temporal density, interpolation auxiliaries, progressive resolution: fe
 
 ## 3. Tests and environment
 
+The dispatch probe emits a stable H3 experiment identity (batch 1, four tokens,
+four heads, head dimension 128, BF16, BNSD/BSND layouts) and separate capability
+receipts for native dense FA, Laser dense fallback, MindIE-SD import, quantized
+dense FA, RFv2 and RFv3. Host runs mark device-dependent receipts
+`device_pending`. Import or signature presence is not execution evidence.
+
 `test_minimax_h3_r08_prototypes.py` — 8 CPU tests: LSE-merge exactness vs full softmax (incl. empty-branch case), bounded-plan bounds/overflow errors, demand dedup, reference-row compaction, dispatch-recorder gate/ring/overwrite, selective-FFN exact per-phase counts + fraction validation, probe host-runnability. Environment: CPU torch 2.15.0+cpu, host-only triton shim; `mindiesd` stubbed at import for the recorder test (the real op is probed on device).
 
 Regression: combined `test_minimax_h3_dit_contract.py` + `test_ascend_sparse_attention.py` → **157 passed, 4 failed, 4 skipped — the 4 failures are the known pre-existing graph-replay cases, identical on pristine R01**. Zero regressions. Lint clean on all five touched files.

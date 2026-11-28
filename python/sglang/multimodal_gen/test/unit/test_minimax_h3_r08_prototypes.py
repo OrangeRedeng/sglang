@@ -242,4 +242,18 @@ def test_dispatch_probe_reports_without_device():
         "mindiesd_sparse",
     }
     assert report["minimal_calls"][0]["status"] == "skipped"
+    assert report["experiment_identity"]["shape"] == {
+        "batch": 1,
+        "tokens": 4,
+        "heads": 4,
+        "head_dim": 128,
+    }
+    assert set(report["capability_receipts"]) == {
+        "native_dense",
+        "laser_dense",
+        "mindiesd_import",
+        "quant_dense",
+        "rfv2",
+        "rfv3",
+    }
     assert report["packages"]["torch"] is None or isinstance(report["packages"]["torch"], str)

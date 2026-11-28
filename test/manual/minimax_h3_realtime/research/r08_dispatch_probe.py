@@ -83,11 +83,18 @@ def _minimal_call_report(label: str, callable_fn, kwargs: dict) -> dict:
 def collect(run_device_calls: bool) -> dict:
     result: dict = {
         "probe": "r08_dispatch_probe",
+        "experiment_identity": {
+            "model": "MiniMax-H3-FL2VA",
+            "shape": {"batch": 1, "tokens": 4, "heads": 4, "head_dim": 128},
+            "dtype": "bfloat16",
+            "layouts": {"native_dense": "BNSD", "mindiesd_sparse": "BSND"},
+        },
         "packages": _package_versions(
             ("torch", "torch-npu", "mindiesd", "sgl-kernel-npu", "sglang")
         ),
         "layers": {},
         "minimal_calls": [],
+        "capability_receipts": {},
         "h08_isolation_plan": [
             "1. probe native torch_npu fused attention alone (layer 1)",
             "2. probe the AscendFA dense path alone (layer 2, no MindIE import)",
@@ -117,6 +124,9 @@ def collect(run_device_calls: bool) -> dict:
     result["layers"]["mindiesd_sparse"] = _signature_report(
         "mindiesd", ("sparse_attention",)
     )
+    result["layers"]["mindiesd_quant"] = _signature_report(
+        "mindiesd", ("quant_attention",)
+    )
     laser = _signature_report(
         "sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn",
         ("LaserAttentionBackend",),
@@ -127,6 +137,8 @@ def collect(run_device_calls: bool) -> dict:
         result["minimal_calls"] = [
             {"label": "skipped (host without device)", "status": "skipped"}
         ]
+        for case in ("native_dense", "laser_dense", "mindiesd_import", "quant_dense", "rfv2", "rfv3"):
+            result["capability_receipts"][case] = {"status": "device_pending"}
         return result
 
     # Device-only minimal calls; every failure is captured with traceback.
@@ -178,6 +190,16 @@ def collect(run_device_calls: bool) -> dict:
                     is_causal=False,
                 ),
             )
+        )
+        result["capability_receipts"].update(
+            {
+                "native_dense": {"status": result["minimal_calls"][0]["status"], "shape": result["experiment_identity"]["shape"]},
+                "mindiesd_import": {"status": result["layers"]["mindiesd_sparse"]["status"]},
+                "rfv2": {"status": result["minimal_calls"][-1]["status"], "policy": "rf_v2"},
+                "rfv3": {"status": "unprobed", "requires": "installed MindIE-SD RFv3 support"},
+                "laser_dense": {"status": "signature_only", "layer": "laser_dense_fallback"},
+                "quant_dense": {"status": "signature_only", "layer": "mindiesd_quant"},
+            }
         )
     except Exception as error:  # noqa: BLE001
         result["minimal_calls"].append(
